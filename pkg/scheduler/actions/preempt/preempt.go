@@ -245,7 +245,15 @@ func (pmpt *Action) preempt(
 	allNodes := ssn.GetUnschedulableAndUnresolvableNodesForTask(preemptor)
 	predicateNodes, _ := predicateHelper.PredicateNodes(preemptor, allNodes, predicateFn, pmpt.enablePredicateErrorCache)
 
-	nodeScores := util.PrioritizeNodes(preemptor, predicateNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
+	// Use predicate-passing nodes for scoring when available, but fall back
+	// to all schedulable nodes so that victim selection still runs on fully-
+	// utilised nodes (where preemption is most needed).
+	candidateNodes := predicateNodes
+	if len(candidateNodes) == 0 {
+		candidateNodes = allNodes
+	}
+
+	nodeScores := util.PrioritizeNodes(preemptor, candidateNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
 
 	selectedNodes := util.SortNodes(nodeScores)
 
