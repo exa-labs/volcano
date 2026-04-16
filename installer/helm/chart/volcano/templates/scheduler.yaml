@@ -192,7 +192,11 @@ spec:
       {{- end }}
       containers:
         - name: {{ .Release.Name }}-scheduler
+          {{- if .Values.basic.scheduler_image_override }}
+          image: {{ .Values.basic.scheduler_image_override }}
+          {{- else }}
           image: {{ .Values.basic.image_registry }}/{{.Values.basic.scheduler_image_name}}:{{.Values.basic.image_tag_version}}
+          {{- end }}
           {{- if .Values.custom.scheduler_resources }}
           resources:
           {{- toYaml .Values.custom.scheduler_resources | nindent 12 }}
