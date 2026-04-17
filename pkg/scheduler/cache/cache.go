@@ -1485,6 +1485,15 @@ func (sc *SchedulerCache) Snapshot() *schedulingapi.ClusterInfo {
 			priName := value.PodGroup.Spec.PriorityClassName
 			if priorityClass, found := sc.PriorityClasses[priName]; found {
 				value.Priority = priorityClass.Value
+			} else if priName == "" {
+				// PodGroup has no priorityClassName — inherit the highest
+				// priority from the member pods so that inter-job preemption
+				// decisions respect pod-level PriorityClass settings.
+				for _, task := range value.Tasks {
+					if task.Priority > value.Priority {
+						value.Priority = task.Priority
+					}
+				}
 			}
 
 			klog.V(4).Infof("The priority of job <%s/%s> is <%s/%d>",

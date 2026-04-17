@@ -28,11 +28,13 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 
+	"volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
@@ -411,6 +413,114 @@ func TestExecutePreBinds(t *testing.T) {
 			if !reflect.DeepEqual(result, tt.expectBindContexts) {
 				t.Errorf("case %s: expected bind contexts %v, but got %v",
 					tt.name, tt.expectBindContexts, result)
+			}
+		})
+	}
+}
+
+func TestSnapshotJobPriorityInheritance(t *testing.T) {
+	tests := []struct {
+		name             string
+		pgPriorityClass  string // PodGroup-level priorityClassName
+		taskPriorities   []int32
+		priorityClasses  map[string]int32 // name → value
+		expectedPriority int32
+	}{
+		{
+			name:            "PodGroup has priorityClassName, should use it",
+			pgPriorityClass: "high",
+			taskPriorities:  []int32{100, 200},
+			priorityClasses: map[string]int32{"high": 1000},
+			// PodGroup explicitly sets "high" (value 1000), task priorities ignored
+			expectedPriority: 1000,
+		},
+		{
+			name:            "PodGroup has no priorityClassName, inherit max task priority",
+			pgPriorityClass: "",
+			taskPriorities:  []int32{100, 500, 200},
+			priorityClasses: map[string]int32{},
+			// No PodGroup priority → fall back to max(100, 500, 200) = 500
+			expectedPriority: 500,
+		},
+		{
+			name:            "PodGroup has no priorityClassName and no tasks, use default",
+			pgPriorityClass: "",
+			taskPriorities:  []int32{},
+			priorityClasses: map[string]int32{},
+			expectedPriority: 0,
+		},
+		{
+			name:            "PodGroup has unknown priorityClassName, use default",
+			pgPriorityClass: "nonexistent",
+			taskPriorities:  []int32{100, 200},
+			priorityClasses: map[string]int32{},
+			// priName is non-empty but not found → neither branch fires → defaultPriority
+			expectedPriority: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sc := NewDefaultMockSchedulerCache("volcano")
+			sc.defaultPriority = 0
+
+			// Register priority classes
+			for name, val := range tt.priorityClasses {
+				sc.PriorityClasses[name] = &schedulingv1.PriorityClass{
+					ObjectMeta: metav1.ObjectMeta{Name: name},
+					Value:      val,
+				}
+			}
+
+			// Create a queue so Snapshot doesn't skip the job
+			queueID := api.QueueID("default")
+			sc.Queues[queueID] = &api.QueueInfo{
+				UID:  queueID,
+				Name: "default",
+				Queue: &scheduling.Queue{
+					ObjectMeta: metav1.ObjectMeta{Name: "default", UID: "default"},
+					Spec:       scheduling.QueueSpec{Weight: 1},
+				},
+			}
+
+			// Build the job with PodGroup and tasks
+			jobID := api.JobID("test-ns/test-job")
+			job := api.NewJobInfo(jobID)
+			job.Namespace = "test-ns"
+			job.Queue = queueID
+
+			pg := &api.PodGroup{}
+			pg.Name = "test-job"
+			pg.Namespace = "test-ns"
+			pg.Spec.MinMember = 1
+			pg.Spec.Queue = "default"
+			pg.Spec.PriorityClassName = tt.pgPriorityClass
+			job.SetPodGroup(pg)
+
+			for i, pri := range tt.taskPriorities {
+				taskPri := pri
+				pod := buildPod("test-ns", fmt.Sprintf("p%d", i), "n1", v1.PodRunning,
+					api.BuildResourceList("1000m", "1G"), nil, nil)
+				pod.Spec.Priority = &taskPri
+				task := api.NewTaskInfo(pod)
+				task.Job = jobID
+				job.AddTaskInfo(task)
+			}
+
+			sc.Jobs[jobID] = job
+
+			// Add a ready node so Snapshot succeeds
+			node := buildNode("n1", api.BuildResourceList("8000m", "16G"))
+			sc.AddOrUpdateNode(node)
+
+			snapshot := sc.Snapshot()
+
+			snapshotJob, found := snapshot.Jobs[jobID]
+			if !found {
+				t.Fatalf("job %s not found in snapshot", jobID)
+			}
+			if snapshotJob.Priority != tt.expectedPriority {
+				t.Errorf("expected priority %d, got %d", tt.expectedPriority, snapshotJob.Priority)
 			}
 		})
 	}
