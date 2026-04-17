@@ -29,6 +29,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/plugins/conformance"
 	"volcano.sh/volcano/pkg/scheduler/plugins/gang"
+	"volcano.sh/volcano/pkg/scheduler/plugins/predicates"
 	"volcano.sh/volcano/pkg/scheduler/plugins/priority"
 	"volcano.sh/volcano/pkg/scheduler/plugins/proportion"
 	"volcano.sh/volcano/pkg/scheduler/uthelper"
@@ -290,6 +291,183 @@ func TestPreempt(t *testing.T) {
 	for i, test := range tests {
 		test.Plugins = plugins
 		test.PriClass = []*schedulingv1.PriorityClass{highPrio, lowPrio}
+		t.Run(test.Name, func(t *testing.T) {
+			test.RegisterSession(tiers, nil)
+			defer test.Close()
+			test.Run(actions)
+			if err := test.CheckAll(i); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestPreemptWithNodeSelector tests that the allNodes fallback in the preempt
+// action correctly filters out structurally incompatible nodes (e.g. nodes
+// whose labels don't match the preemptor's nodeSelector). This validates the
+// fix for the bug where, when all predicate-passing nodes were empty, the
+// fallback used ALL cluster nodes — including ones that could never run the
+// pod — causing incorrect nominations.
+func TestPreemptWithNodeSelector(t *testing.T) {
+	plugins := map[string]framework.PluginBuilder{
+		conformance.PluginName:  conformance.New,
+		gang.PluginName:         gang.New,
+		priority.PluginName:     priority.New,
+		proportion.PluginName:   proportion.New,
+		predicates.PluginName:   predicates.New,
+	}
+	trueValue := true
+	tiers := []conf.Tier{
+		{
+			Plugins: []conf.PluginOption{
+				{
+					Name:               conformance.PluginName,
+					EnabledPreemptable: &trueValue,
+				},
+				{
+					Name:                gang.PluginName,
+					EnabledPreemptable:  &trueValue,
+					EnabledJobPipelined: &trueValue,
+					EnabledJobStarving:  &trueValue,
+				},
+				{
+					Name:                priority.PluginName,
+					EnabledTaskOrder:    &trueValue,
+					EnabledJobOrder:     &trueValue,
+					EnabledPreemptable:  &trueValue,
+					EnabledJobPipelined: &trueValue,
+					EnabledJobStarving:  &trueValue,
+				},
+				{
+					Name:               proportion.PluginName,
+					EnabledOverused:    &trueValue,
+					EnabledAllocatable: &trueValue,
+					EnabledQueueOrder:  &trueValue,
+				},
+				{
+					Name:             predicates.PluginName,
+					EnabledPredicate: &trueValue,
+					Arguments: map[string]interface{}{
+						"predicate.VolumeBindingEnable": false,
+					},
+				},
+			},
+		},
+	}
+
+	tests := []uthelper.TestCommonStruct{
+		{
+			// Matching node is full with low-priority tasks. The preemptor has
+			// a nodeSelector that matches n1 but not n2. Because n1 is fully
+			// utilised, PredicateNodes returns empty, triggering the fallback.
+			// The fallback must include n1 (resource-constrained but
+			// structurally compatible) and exclude n2 (nodeSelector mismatch =
+			// UnschedulableAndUnresolvable). Preemption should succeed on n1.
+			Name: "preempt on full node with matching nodeSelector, skip non-matching node",
+			Plugins: plugins,
+			PriClass: []*schedulingv1.PriorityClass{
+				util.BuildPriorityClass("low-priority", 10),
+				util.BuildPriorityClass("high-priority", 100000),
+			},
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 0, map[string]int32{}, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q1", 1, map[string]int32{"": 1}, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			Pods: []*v1.Pod{
+				// Low-priority preemptable task running on the matching node n1
+				util.BuildPod("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1",
+					map[string]string{schedulingv1beta1.PodPreemptable: "true"}, map[string]string{"nodepool": "gpu"}),
+				// High-priority pending preemptor with nodeSelector targeting n1
+				util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg2",
+					make(map[string]string), map[string]string{"nodepool": "gpu"}),
+			},
+			Nodes: []*v1.Node{
+				// n1: matching node, fully utilised (1 CPU total, 1 CPU used)
+				util.BuildNode("n1", api.BuildResourceList("1", "1Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"nodepool": "gpu"}),
+				// n2: non-matching node (no "nodepool" label), also fully utilised
+				util.BuildNode("n2", api.BuildResourceList("1", "1Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"nodepool": "cpu"}),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, api.BuildResourceList("2", "2G")),
+			},
+			ExpectEvicted:  []string{"c1/preemptee1"},
+			ExpectEvictNum: 1,
+		},
+		{
+			// Only non-matching nodes exist (all nodes have labels that don't
+			// match the preemptor's nodeSelector). Even though nodes are full,
+			// the fallback should filter ALL of them out as
+			// UnschedulableAndUnresolvable → candidateNodes is empty →
+			// no preemption occurs.
+			Name: "no preemption when all nodes are structurally incompatible with nodeSelector",
+			Plugins: plugins,
+			PriClass: []*schedulingv1.PriorityClass{
+				util.BuildPriorityClass("low-priority", 10),
+				util.BuildPriorityClass("high-priority", 100000),
+			},
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 0, map[string]int32{}, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q1", 1, map[string]int32{"": 1}, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			Pods: []*v1.Pod{
+				// Low-priority task on n1 (which doesn't match preemptor's nodeSelector)
+				util.BuildPod("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1",
+					map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				// High-priority preemptor with nodeSelector that no node satisfies
+				util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg2",
+					make(map[string]string), map[string]string{"nodepool": "gpu"}),
+			},
+			Nodes: []*v1.Node{
+				// n1: no matching label for preemptor's nodeSelector
+				util.BuildNode("n1", api.BuildResourceList("1", "1Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"nodepool": "cpu"}),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, api.BuildResourceList("2", "2G")),
+			},
+			ExpectEvictNum: 0,
+			ExpectEvicted:  []string{},
+		},
+		{
+			// Mixed scenario: two nodes, one matching and one not matching.
+			// The matching node n1 is full. The non-matching node n2 is also
+			// full. Preemption should only happen on n1 (the matching node).
+			// Without the fix, Volcano would consider n2 as a candidate and
+			// potentially nominate the pod there, violating nodeSelector.
+			Name: "preempt only on matching node when mixed matching and non-matching nodes are full",
+			Plugins: plugins,
+			PriClass: []*schedulingv1.PriorityClass{
+				util.BuildPriorityClass("low-priority", 10),
+				util.BuildPriorityClass("high-priority", 100000),
+			},
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 0, map[string]int32{}, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q1", 1, map[string]int32{"": 1}, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			Pods: []*v1.Pod{
+				// Preemptable task on matching node n1
+				util.BuildPod("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("2", "2G"), "pg1",
+					map[string]string{schedulingv1beta1.PodPreemptable: "true"}, map[string]string{"nodepool": "gpu"}),
+				// Non-preemptable task on non-matching node n2
+				util.BuildPod("c1", "preemptee2", "n2", v1.PodRunning, api.BuildResourceList("2", "2G"), "pg1",
+					map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				// High-priority preemptor targeting gpu nodepool
+				util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("2", "2G"), "pg2",
+					make(map[string]string), map[string]string{"nodepool": "gpu"}),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("2", "2Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"nodepool": "gpu"}),
+				util.BuildNode("n2", api.BuildResourceList("2", "2Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"nodepool": "cpu"}),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, api.BuildResourceList("4", "4G")),
+			},
+			ExpectEvicted:  []string{"c1/preemptee1"},
+			ExpectEvictNum: 1,
+		},
+	}
+
+	actions := []framework.Action{New()}
+	for i, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
 			test.RegisterSession(tiers, nil)
 			defer test.Close()
