@@ -139,13 +139,22 @@ func (ra *Action) Execute(ssn *framework.Session) {
 		// we should filter out those nodes that are UnschedulableAndUnresolvable status got in allocate action
 		totalNodes := ssn.GetUnschedulableAndUnresolvableNodesForTask(task)
 
-		// Use predicate-passing nodes when available, but fall back to all
-		// schedulable nodes so that victim selection still runs on fully-
-		// utilised nodes (where reclaim is most needed).
+		// Use predicate-passing nodes when available, but fall back to nodes
+		// that are merely resource-constrained (Unschedulable) so that victim
+		// selection still runs on fully-utilised nodes (where reclaim is most
+		// needed). Nodes that are structurally incompatible
+		// (UnschedulableAndUnresolvable, e.g. nodeSelector mismatch) are
+		// excluded because preemption can never fix them.
 		var predicateNodes []*api.NodeInfo
+		var unresolvableNodes = make(map[string]struct{})
 		for _, n := range totalNodes {
 			if err := ssn.PredicateForPreemptAction(task, n); err != nil {
 				klog.V(4).Infof("Reclaim predicate for task %s/%s on node %s return error %v ", task.Namespace, task.Name, n.Name, err)
+				// Track structurally incompatible nodes so the fallback
+				// only includes resource-constrained nodes.
+				if fitErr, ok := err.(*api.FitError); ok && fitErr.Status.ContainsUnschedulableAndUnresolvable() {
+					unresolvableNodes[n.Name] = struct{}{}
+				}
 				continue
 			}
 			predicateNodes = append(predicateNodes, n)
@@ -153,7 +162,11 @@ func (ra *Action) Execute(ssn *framework.Session) {
 
 		candidateNodes := predicateNodes
 		if len(candidateNodes) == 0 {
-			candidateNodes = totalNodes
+			for _, n := range totalNodes {
+				if _, skip := unresolvableNodes[n.Name]; !skip {
+					candidateNodes = append(candidateNodes, n)
+				}
+			}
 		}
 
 		for _, n := range candidateNodes {

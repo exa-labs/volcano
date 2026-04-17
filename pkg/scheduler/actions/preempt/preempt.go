@@ -243,14 +243,22 @@ func (pmpt *Action) preempt(
 	predicateFn := ssn.PredicateForPreemptAction
 	// we should filter out those nodes that are UnschedulableAndUnresolvable status got in allocate action
 	allNodes := ssn.GetUnschedulableAndUnresolvableNodesForTask(preemptor)
-	predicateNodes, _ := predicateHelper.PredicateNodes(preemptor, allNodes, predicateFn, pmpt.enablePredicateErrorCache)
+	predicateNodes, fitErrors := predicateHelper.PredicateNodes(preemptor, allNodes, predicateFn, pmpt.enablePredicateErrorCache)
 
 	// Use predicate-passing nodes for scoring when available, but fall back
-	// to all schedulable nodes so that victim selection still runs on fully-
-	// utilised nodes (where preemption is most needed).
+	// to nodes that are merely resource-constrained (Unschedulable) so that
+	// victim selection still runs on fully-utilised nodes (where preemption
+	// is most needed). Nodes that are structurally incompatible
+	// (UnschedulableAndUnresolvable, e.g. nodeSelector mismatch) are excluded
+	// from the fallback because preemption can never fix them.
 	candidateNodes := predicateNodes
 	if len(candidateNodes) == 0 {
-		candidateNodes = allNodes
+		unresolvable := fitErrors.GetUnschedulableAndUnresolvableNodes()
+		for _, n := range allNodes {
+			if _, skip := unresolvable[n.Name]; !skip {
+				candidateNodes = append(candidateNodes, n)
+			}
+		}
 	}
 
 	nodeScores := util.PrioritizeNodes(preemptor, candidateNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
