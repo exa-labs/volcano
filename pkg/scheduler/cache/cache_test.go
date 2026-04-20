@@ -481,6 +481,20 @@ func TestSnapshotJobPriorityInheritance(t *testing.T) {
 			priorityClasses: map[string]int32{},
 			expectedPriority: 7,
 		},
+		{
+			name:            "PodGroup has no priorityClassName, flyte-launcher shape (0 + negative)",
+			pgPriorityClass: "",
+			taskPriorities:  []int32{0, -2},
+			priorityClasses: map[string]int32{},
+			// Documents a known limitation: when a PodGroup contains a
+			// task with priority 0 (e.g. a flyte elastic launcher pod
+			// that has no priorityClassName) alongside negative-priority
+			// worker tasks, max() inheritance is dominated by 0 and the
+			// negative workers' class is not reflected in the PodGroup
+			// priority. To fix this case the launcher also needs a
+			// priorityClassName (e.g. at or below the worker's value).
+			expectedPriority: 0,
+		},
 	}
 
 	for _, tt := range tests {
