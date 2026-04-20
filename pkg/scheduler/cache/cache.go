@@ -1386,13 +1386,22 @@ func (sc *SchedulerCache) Snapshot() *schedulingapi.ClusterInfo {
 			priName := value.PodGroup.Spec.PriorityClassName
 			if priorityClass, found := sc.PriorityClasses[priName]; found {
 				value.Priority = priorityClass.Value
-			} else if priName == "" {
+			} else if priName == "" && len(value.Tasks) > 0 {
 				// PodGroup has no priorityClassName — inherit the highest
 				// priority from the member pods so that inter-job preemption
 				// decisions respect pod-level PriorityClass settings.
+				//
+				// Seed from the first task rather than sc.defaultPriority (0)
+				// so jobs whose tasks use a negative PriorityClass (e.g. a
+				// "low-priority" class with value -1) still get a distinct
+				// inherited priority. Seeding at 0 would make max(0, -1) = 0
+				// and max(0, -2) = 0, collapsing distinct negative classes
+				// into the default and defeating preemption between them.
+				first := true
 				for _, task := range value.Tasks {
-					if task.Priority > value.Priority {
+					if first || task.Priority > value.Priority {
 						value.Priority = task.Priority
+						first = false
 					}
 				}
 			}

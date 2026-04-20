@@ -451,6 +451,30 @@ func TestSnapshotJobPriorityInheritance(t *testing.T) {
 			// priName is non-empty but not found → neither branch fires → defaultPriority
 			expectedPriority: 0,
 		},
+		{
+			name:            "PodGroup has no priorityClassName, inherit single negative task priority",
+			pgPriorityClass: "",
+			taskPriorities:  []int32{-2},
+			priorityClasses: map[string]int32{},
+			// Seeding from first task rather than defaultPriority=0 lets
+			// negative inherited priorities survive.
+			expectedPriority: -2,
+		},
+		{
+			name:            "PodGroup has no priorityClassName, inherit max of negative task priorities",
+			pgPriorityClass: "",
+			taskPriorities:  []int32{-1, -2, -3},
+			priorityClasses: map[string]int32{},
+			// max(-1, -2, -3) = -1
+			expectedPriority: -1,
+		},
+		{
+			name:            "PodGroup has no priorityClassName, mixed-sign task priorities",
+			pgPriorityClass: "",
+			taskPriorities:  []int32{-5, 7, -3},
+			priorityClasses: map[string]int32{},
+			expectedPriority: 7,
+		},
 	}
 
 	for _, tt := range tests {
