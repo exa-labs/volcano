@@ -1660,7 +1660,7 @@ func TestAddPodGroup_NonGangOwnerProducesDistinctPodGroups(t *testing.T) {
 
 	makePod := func(name string, uid types.UID) *v1.Pod {
 		return &v1.Pod{
-			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
 				Namespace: namespace,
