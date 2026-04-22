@@ -437,10 +437,10 @@ func TestSnapshotJobPriorityInheritance(t *testing.T) {
 			expectedPriority: 500,
 		},
 		{
-			name:            "PodGroup has no priorityClassName and no tasks, use default",
-			pgPriorityClass: "",
-			taskPriorities:  []int32{},
-			priorityClasses: map[string]int32{},
+			name:             "PodGroup has no priorityClassName and no tasks, use default",
+			pgPriorityClass:  "",
+			taskPriorities:   []int32{},
+			priorityClasses:  map[string]int32{},
 			expectedPriority: 0,
 		},
 		{
@@ -469,10 +469,10 @@ func TestSnapshotJobPriorityInheritance(t *testing.T) {
 			expectedPriority: -1,
 		},
 		{
-			name:            "PodGroup has no priorityClassName, mixed-sign task priorities",
-			pgPriorityClass: "",
-			taskPriorities:  []int32{-5, 7, -3},
-			priorityClasses: map[string]int32{},
+			name:             "PodGroup has no priorityClassName, mixed-sign task priorities",
+			pgPriorityClass:  "",
+			taskPriorities:   []int32{-5, 7, -3},
+			priorityClasses:  map[string]int32{},
 			expectedPriority: 7,
 		},
 		{
