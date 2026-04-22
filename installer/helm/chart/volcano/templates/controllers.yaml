@@ -159,7 +159,11 @@ spec:
           resources:
             {{- toYaml .Values.custom.controller_resources | nindent 14 }}
             {{- end }}
+          {{- if .Values.basic.controller_image_override }}
+          image: {{ .Values.basic.controller_image_override }}
+          {{- else }}
           image: {{ .Values.basic.image_registry }}/{{.Values.basic.controller_image_name}}:{{.Values.basic.image_tag_version}}
+          {{- end }}
           args:
             - --logtostderr
             - --enable-healthz=true
