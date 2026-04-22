@@ -170,6 +170,237 @@ func TestAddPodGroup(t *testing.T) {
 			},
 		},
 		{
+			name: "AddPodGroup: pod owned by StatefulSet is keyed on owner UID",
+			pods: []*v1.Pod{
+				{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "v1",
+						Kind:       "Pod",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod1",
+						Namespace: namespace,
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "StatefulSet",
+								Name:       "ss1",
+								UID:        "11111111-1111-1111-1111-111111111111",
+								Controller: &isController,
+							},
+						},
+					},
+				},
+			},
+			expectedPodGroup: &scheduling.PodGroup{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "scheduling.volcano.sh/v1beta1",
+					Kind:       "PodGroup",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "podgroup-11111111-1111-1111-1111-111111111111",
+					Namespace: namespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "StatefulSet",
+							Name:       "ss1",
+							UID:        "11111111-1111-1111-1111-111111111111",
+							Controller: &isController,
+						},
+					},
+				},
+				Spec: scheduling.PodGroupSpec{MinMember: 1},
+			},
+		},
+		{
+			name: "AddPodGroup: pod owned by DaemonSet is keyed on owner UID",
+			pods: []*v1.Pod{
+				{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "v1",
+						Kind:       "Pod",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod1",
+						Namespace: namespace,
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "DaemonSet",
+								Name:       "ds1",
+								UID:        "22222222-2222-2222-2222-222222222222",
+								Controller: &isController,
+							},
+						},
+					},
+				},
+			},
+			expectedPodGroup: &scheduling.PodGroup{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "scheduling.volcano.sh/v1beta1",
+					Kind:       "PodGroup",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "podgroup-22222222-2222-2222-2222-222222222222",
+					Namespace: namespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "DaemonSet",
+							Name:       "ds1",
+							UID:        "22222222-2222-2222-2222-222222222222",
+							Controller: &isController,
+						},
+					},
+				},
+				Spec: scheduling.PodGroupSpec{MinMember: 1},
+			},
+		},
+		{
+			name: "AddPodGroup: pod owned by Job is keyed on owner UID",
+			pods: []*v1.Pod{
+				{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "v1",
+						Kind:       "Pod",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod1",
+						Namespace: namespace,
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "batch/v1",
+								Kind:       "Job",
+								Name:       "job1",
+								UID:        "33333333-3333-3333-3333-333333333333",
+								Controller: &isController,
+							},
+						},
+					},
+				},
+			},
+			expectedPodGroup: &scheduling.PodGroup{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "scheduling.volcano.sh/v1beta1",
+					Kind:       "PodGroup",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "podgroup-33333333-3333-3333-3333-333333333333",
+					Namespace: namespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "batch/v1",
+							Kind:       "Job",
+							Name:       "job1",
+							UID:        "33333333-3333-3333-3333-333333333333",
+							Controller: &isController,
+						},
+					},
+				},
+				Spec: scheduling.PodGroupSpec{MinMember: 1},
+			},
+		},
+		{
+			// FlyteWorkflow (a DAG-style CR owning heterogeneous tasks) must not
+			// collapse its pods into one PodGroup keyed on the workflow UID. The
+			// PG name falls back to the pod's own UID and the PG is owned by the
+			// pod itself so it is garbage collected with the pod.
+			name: "AddPodGroup: pod owned by non-gang CR (FlyteWorkflow) is keyed on pod UID",
+			pods: []*v1.Pod{
+				{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "v1",
+						Kind:       "Pod",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "flyte-task-pod",
+						Namespace: namespace,
+						UID:       types.UID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "flyte.lyft.com/v1alpha1",
+								Kind:       "FlyteWorkflow",
+								Name:       "wf-1",
+								UID:        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+								Controller: &isController,
+							},
+						},
+					},
+				},
+			},
+			expectedPodGroup: &scheduling.PodGroup{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "scheduling.volcano.sh/v1beta1",
+					Kind:       "PodGroup",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "podgroup-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+					Namespace: namespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "v1",
+							Kind:               "Pod",
+							Name:               "flyte-task-pod",
+							UID:                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+							Controller:         &isController,
+							BlockOwnerDeletion: &blockOwnerDeletion,
+						},
+					},
+				},
+				Spec: scheduling.PodGroupSpec{MinMember: 1},
+			},
+		},
+		{
+			// A non-controller OwnerReference (Controller=false) is ignored by
+			// the gang-kind check; the pod is treated as bare and gets its own
+			// per-pod PG.
+			name: "AddPodGroup: non-controller gang-kind owner is ignored, per-pod PG",
+			pods: []*v1.Pod{
+				{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: "v1",
+						Kind:       "Pod",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod1",
+						Namespace: namespace,
+						UID:       types.UID("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "ReplicaSet",
+								Name:       "rs1",
+								UID:        "dddddddd-dddd-dddd-dddd-dddddddddddd",
+								// Controller unset → treat as non-controller.
+							},
+						},
+					},
+				},
+			},
+			expectedPodGroup: &scheduling.PodGroup{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "scheduling.volcano.sh/v1beta1",
+					Kind:       "PodGroup",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "podgroup-cccccccc-cccc-cccc-cccc-cccccccccccc",
+					Namespace: namespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "v1",
+							Kind:               "Pod",
+							Name:               "pod1",
+							UID:                "cccccccc-cccc-cccc-cccc-cccccccccccc",
+							Controller:         &isController,
+							BlockOwnerDeletion: &blockOwnerDeletion,
+						},
+					},
+				},
+				Spec: scheduling.PodGroupSpec{MinMember: 1},
+			},
+		},
+		{
 			name: "AddPodGroup: pod owners with group-min-member annotation",
 			rs: &appsv1.ReplicaSet{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1414,4 +1645,64 @@ func TestNoPodGroupCreatedForWhenKubeGroupNameAnnotationExists(t *testing.T) {
 		}
 		assert.Equal(t, 1, len(pgList.Items), "Expected 1 PodGroup, found %d: %v", len(pgList.Items), names)
 	})
+}
+
+// Two pods owned by the same non-gang CR (e.g. a FlyteWorkflow) must land in
+// two distinct PodGroups. This is the core behavior that prevents a DAG-style
+// workflow's launcher and worker pods from sharing a single PG and tripping
+// volcano's minMember/phase-Completed logic.
+func TestAddPodGroup_NonGangOwnerProducesDistinctPodGroups(t *testing.T) {
+	namespace := "test"
+	isController := true
+	workflowUID := types.UID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+	c := newFakeController()
+
+	makePod := func(name string, uid types.UID) *v1.Pod {
+		return &v1.Pod{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				UID:       uid,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "flyte.lyft.com/v1alpha1",
+						Kind:       "FlyteWorkflow",
+						Name:       "wf-1",
+						UID:        workflowUID,
+						Controller: &isController,
+					},
+				},
+			},
+		}
+	}
+
+	launcher := makePod("wf-1-launcher", types.UID("aaaaaaaa-0000-0000-0000-000000000001"))
+	worker := makePod("wf-1-worker", types.UID("aaaaaaaa-0000-0000-0000-000000000002"))
+
+	for _, pod := range []*v1.Pod{launcher, worker} {
+		created, err := c.kubeClient.CoreV1().Pods(pod.Namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("failed to create pod %s: %v", pod.Name, err)
+		}
+		if err := c.createNormalPodPGIfNotExist(created); err != nil {
+			t.Fatalf("failed to create PG for pod %s: %v", pod.Name, err)
+		}
+	}
+
+	pgs, err := c.vcClient.SchedulingV1beta1().PodGroups(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list podgroups: %v", err)
+	}
+	if len(pgs.Items) != 2 {
+		t.Fatalf("expected 2 distinct PodGroups for 2 pods owned by the same FlyteWorkflow, got %d", len(pgs.Items))
+	}
+
+	workflowPGName := "podgroup-" + string(workflowUID)
+	for _, pg := range pgs.Items {
+		if pg.Name == workflowPGName {
+			t.Errorf("pg %q was keyed on the FlyteWorkflow UID; per-pod keying expected", pg.Name)
+		}
+	}
 }
