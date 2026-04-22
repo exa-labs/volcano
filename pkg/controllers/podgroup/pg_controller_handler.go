@@ -369,7 +369,7 @@ func (pg *pgcontroller) createNormalPodPGIfNotExist(pod *v1.Pod) error {
 // When statefulSet is updated, its associated pod template may change.
 // In such cases, we need to update the corresponding PodGroup simultaneously.
 func (pg *pgcontroller) createOrUpdateNormalPodPG(pod *v1.Pod) error {
-	pgName := helpers.GeneratePodgroupName(pod)
+	pgName := generatePodGroupName(pod)
 
 	if podGroup, err := pg.pgLister.PodGroups(pod.Namespace).Get(pgName); err != nil {
 		if !apierrors.IsNotFound(err) {
