@@ -33,7 +33,6 @@ import (
 	"k8s.io/klog/v2"
 
 	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
-	"volcano.sh/apis/pkg/apis/helpers"
 	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/controllers/util"
 )
@@ -41,6 +40,46 @@ import (
 const (
 	controllerRevisionHashLabelKey = "controller-revision-hash"
 )
+
+// knownGangWorkloadKinds enumerates the native Kubernetes workload controllers
+// that volcano treats as a gang: multiple identical pod replicas that share a
+// single PodGroup keyed on the controller's UID. Volcano's upper-resource
+// annotation inheritance in getAnnotationsFromUpperRes only understands these
+// four kinds, so owner-UID keying is only meaningful for them. For any other
+// controller kind (e.g. FlyteWorkflow, ArgoWorkflow, Tekton PipelineRun, user
+// CRDs) the owner represents a DAG of heterogeneous tasks, not replicas, and
+// collapsing those pods into one PG is incorrect — each pod gets its own PG.
+var knownGangWorkloadKinds = map[string]struct{}{
+	"ReplicaSet":  {},
+	"DaemonSet":   {},
+	"StatefulSet": {},
+	"Job":         {},
+}
+
+// gangControllerOwnerRef returns the first controller OwnerReference on the pod
+// whose Kind is a known gang workload kind, or nil if none exists.
+func gangControllerOwnerRef(pod *v1.Pod) *metav1.OwnerReference {
+	for i, ref := range pod.OwnerReferences {
+		if ref.Controller == nil || !*ref.Controller {
+			continue
+		}
+		if _, ok := knownGangWorkloadKinds[ref.Kind]; ok {
+			return &pod.OwnerReferences[i]
+		}
+	}
+	return nil
+}
+
+// generatePodGroupName derives the PodGroup name for a pod. Pods owned by a
+// known gang workload controller share a PodGroup keyed on the controller's
+// UID; pods with any other (or no) controller OwnerReference get a per-pod
+// PodGroup keyed on the pod's own UID.
+func generatePodGroupName(pod *v1.Pod) string {
+	if ref := gangControllerOwnerRef(pod); ref != nil {
+		return batchv1alpha1.PodgroupNamePrefix + string(ref.UID)
+	}
+	return batchv1alpha1.PodgroupNamePrefix + string(pod.UID)
+}
 
 type podRequest struct {
 	podName      string
@@ -283,7 +322,7 @@ func (pg *pgcontroller) inheritUpperAnnotations(upperAnnotations map[string]stri
 }
 
 func (pg *pgcontroller) createNormalPodPGIfNotExist(pod *v1.Pod) error {
-	pgName := helpers.GeneratePodgroupName(pod)
+	pgName := generatePodGroupName(pod)
 
 	if _, err := pg.pgLister.PodGroups(pod.Namespace).Get(pgName); err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -432,14 +471,14 @@ func (pg *pgcontroller) shouldUpdateExistingPodGroup(podGroup *scheduling.PodGro
 }
 
 func newPGOwnerReferences(pod *v1.Pod) []metav1.OwnerReference {
-	if len(pod.OwnerReferences) != 0 {
-		for _, ownerReference := range pod.OwnerReferences {
-			if ownerReference.Controller != nil && *ownerReference.Controller {
-				return pod.OwnerReferences
-			}
-		}
+	// Known gang workloads keep the pod's controller OwnerReferences so the PG
+	// is owned by the gang controller and survives individual pod restarts.
+	if gangControllerOwnerRef(pod) != nil {
+		return pod.OwnerReferences
 	}
 
+	// For non-gang owners (arbitrary CRs such as FlyteWorkflow) and for bare
+	// pods, the PG is per-pod and should be garbage collected with the pod.
 	gvk := schema.GroupVersionKind{
 		Group:   v1.SchemeGroupVersion.Group,
 		Version: v1.SchemeGroupVersion.Version,
