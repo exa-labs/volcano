@@ -299,7 +299,23 @@ func (pmpt *Action) preempt(
 
 	// we should filter out those nodes that are UnschedulableAndUnresolvable status got in allocate action
 	allNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(preemptor)
-	predicateNodes, _ := predicateHelper.PredicateNodes(preemptor, allNodes, ssn.PredicateForPreemptAction, pmpt.enablePredicateErrorCache, ssn.NodesInShard)
+	predicateNodes, fitErrors := predicateHelper.PredicateNodes(preemptor, allNodes, ssn.PredicateForPreemptAction, pmpt.enablePredicateErrorCache, ssn.NodesInShard)
+
+	// When predicate filtering returns no candidates the cluster is effectively
+	// fully utilised — exactly when preemption is most needed. Fall back to the
+	// resource-constrained subset of allNodes (i.e. exclude nodes newly marked
+	// UnschedulableAndUnresolvable by predicate plugins, e.g. nodeSelector or
+	// affinity mismatches discovered at predicate time) so victim selection can
+	// still run. Structurally incompatible nodes are skipped because preemption
+	// can never make them schedulable for this task.
+	if len(predicateNodes) == 0 && fitErrors != nil {
+		unresolvable := fitErrors.GetUnschedulableAndUnresolvableNodes()
+		for _, n := range allNodes {
+			if _, skip := unresolvable[n.Name]; !skip {
+				predicateNodes = append(predicateNodes, n)
+			}
+		}
+	}
 
 	candidateNodes := util.GetPredicatedNodeByShard(predicateNodes, ssn.NodesInShard)
 	var preemptSuccess bool

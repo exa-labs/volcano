@@ -175,7 +175,24 @@ func (ra *Action) Execute(ssn *framework.Session) {
 func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Statement, task *api.TaskInfo, job *api.JobInfo) {
 	totalNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(task)
 	predicateHelper := util.NewPredicateHelper()
-	predicateNodes, _ := predicateHelper.PredicateNodes(task, totalNodes, ssn.PredicateForPreemptAction, ra.enablePredicateErrorCache, ssn.NodesInShard)
+	predicateNodes, fitErrors := predicateHelper.PredicateNodes(task, totalNodes, ssn.PredicateForPreemptAction, ra.enablePredicateErrorCache, ssn.NodesInShard)
+
+	// When predicate filtering returns no candidates the cluster is effectively
+	// fully utilised — exactly when reclaim is most needed. Fall back to the
+	// resource-constrained subset of totalNodes (i.e. exclude nodes newly marked
+	// UnschedulableAndUnresolvable by predicate plugins, e.g. nodeSelector or
+	// affinity mismatches discovered at predicate time) so victim selection can
+	// still run. Structurally incompatible nodes are skipped because reclaim
+	// can never make them schedulable for this task.
+	if len(predicateNodes) == 0 && fitErrors != nil {
+		unresolvable := fitErrors.GetUnschedulableAndUnresolvableNodes()
+		for _, n := range totalNodes {
+			if _, skip := unresolvable[n.Name]; !skip {
+				predicateNodes = append(predicateNodes, n)
+			}
+		}
+	}
+
 	predicateNodesByShard := util.GetPredicatedNodeByShard(predicateNodes, ssn.NodesInShard)
 	var predicateNodesByShardFlattened []*api.NodeInfo
 	for _, nodes := range predicateNodesByShard {
