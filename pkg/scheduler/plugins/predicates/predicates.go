@@ -114,6 +114,14 @@ type PredicatesPlugin struct {
 	ScoreWeights        map[string]int // Weight for each score plugin
 	PredicateCache      *predicateCache
 	Handle              k8sframework.Handle
+
+	// gangAffinityBootstrap, when set, reports whether a task is the bootstrap
+	// member of a gang whose required pod affinity is self-referential and may
+	// therefore be relaxed for the InterPodAffinity filter (see
+	// isGangAffinityBootstrap). It is wired up per session in OnSessionOpen and
+	// is nil for schedulers that drive the plugin without a volcano Session, in
+	// which case the relaxation is skipped.
+	gangAffinityBootstrap func(task *api.TaskInfo) bool
 }
 
 // New return predicate plugin
@@ -197,6 +205,9 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 		k8s.WithInformerFactory(ssn.InformerFactory()),
 	)
 	pp.Handle = handle
+	pp.gangAffinityBootstrap = func(task *api.TaskInfo) bool {
+		return isGangAffinityBootstrap(ssn, task)
+	}
 
 	pp.InitPlugin()
 
@@ -302,7 +313,7 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 
 	ssn.AddPredicateFn(pp.Name(), func(task *api.TaskInfo, node *api.NodeInfo) error {
 		state := ssn.GetCycleState(task.UID)
-		return pp.Predicate(ssn, task, node, state)
+		return pp.Predicate(task, node, state)
 	})
 
 	// TODO: Need to unify the plugins in nodeorder to predicates.
@@ -565,7 +576,7 @@ func (pp *PredicatesPlugin) InitPlugin() {
 }
 
 // Predicate runs all Filter plugins for the given task and node.
-func (pp *PredicatesPlugin) Predicate(ssn *framework.Session, task *api.TaskInfo, node *api.NodeInfo, state *k8sframework.CycleState) error {
+func (pp *PredicatesPlugin) Predicate(task *api.TaskInfo, node *api.NodeInfo, state *k8sframework.CycleState) error {
 	predicateStatus := make([]*api.Status, 0)
 	nodeInfo, err := pp.Handle.SnapshotSharedLister().NodeInfos().Get(node.Name)
 	if err != nil {
@@ -662,7 +673,7 @@ func (pp *PredicatesPlugin) Predicate(ssn *framework.Session, task *api.TaskInfo
 			// relaxed. See https://github.com/volcano-sh/volcano/issues/3845
 			if name == interpodaffinity.Name &&
 				filterStatus.Reason == interpodaffinity.ErrReasonAffinityRulesNotMatch &&
-				isGangAffinityBootstrap(ssn, task) {
+				pp.gangAffinityBootstrap != nil && pp.gangAffinityBootstrap(task) {
 				klog.V(3).Infof("predicates, allowing gang bootstrap task <%s/%s> on node <%s> past self-referential pod affinity",
 					task.Namespace, task.Name, node.Name)
 				continue
