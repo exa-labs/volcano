@@ -425,7 +425,7 @@ func (ji *JobInfo) SetPodGroup(pg *PodGroup) {
 	ji.Queue = QueueID(pg.Spec.Queue)
 	ji.CreationTimestamp = pg.GetCreationTimestamp()
 
-	ji.WaitingTime = ji.resolveWaitingTime(pg)
+	ji.WaitingTime = extractWaitingTime(pg.Annotations, fmt.Sprintf("podgroup <%s/%s>", pg.Namespace, pg.Name))
 
 	ji.Preemptable = ji.extractPreemptable(pg)
 	ji.RevocableZone = ji.extractRevocableZone(pg)
@@ -454,23 +454,34 @@ func (ji *JobInfo) SetPodGroup(pg *PodGroup) {
 	}
 }
 
-// resolveWaitingTime returns the sla waiting time declared on the podgroup, or,
-// when the podgroup does not declare one, on any of the job's member pods.
-func (ji *JobInfo) resolveWaitingTime(pg *PodGroup) *time.Duration {
-	if waitingTime := extractWaitingTime(pg.Annotations, fmt.Sprintf("podgroup <%s/%s>", pg.Namespace, pg.Name)); waitingTime != nil {
-		return waitingTime
+// GetWaitingTime returns the sla waiting time in effect for the job: the one
+// declared on its PodGroup, or, when the PodGroup declares none, the shortest
+// one declared by a member pod.
+//
+// Pods are consulted because gang operators that create their own PodGroup (the
+// kubeflow training-operator, and anything else implementing gang scheduling
+// itself) do not necessarily carry volcano's annotations over from the pod
+// template, which would leave such a workload no way to declare a waiting time.
+// The value is resolved on read so that it tracks pod annotation updates, and
+// the shortest is taken so that it does not depend on task iteration order when
+// members disagree.
+func (ji *JobInfo) GetWaitingTime() *time.Duration {
+	if ji.WaitingTime != nil {
+		return ji.WaitingTime
 	}
 
+	var shortest *time.Duration
 	for _, task := range ji.Tasks {
 		if task.Pod == nil {
 			continue
 		}
-		if waitingTime := extractWaitingTime(task.Pod.Annotations, fmt.Sprintf("pod <%s/%s>", task.Namespace, task.Name)); waitingTime != nil {
-			return waitingTime
+		waitingTime := extractWaitingTime(task.Pod.Annotations, fmt.Sprintf("pod <%s/%s>", task.Namespace, task.Name))
+		if waitingTime != nil && (shortest == nil || *waitingTime < *shortest) {
+			shortest = waitingTime
 		}
 	}
 
-	return nil
+	return shortest
 }
 
 // extractWaitingTime reads the sla waiting time from a set of annotations,
@@ -643,14 +654,6 @@ func (ji *JobInfo) addTaskIndex(ti *TaskInfo) {
 
 // AddTaskInfo is used to add a task to a job
 func (ji *JobInfo) AddTaskInfo(ti *TaskInfo) {
-	// Gang operators that manage PodGroups themselves (e.g. the Kubeflow
-	// training-operator) do not necessarily copy volcano's annotations onto the
-	// PodGroup, so the pod template is the only place such a workload can
-	// declare a waiting time. The PodGroup annotation stays authoritative.
-	if ji.WaitingTime == nil && ti.Pod != nil {
-		ji.WaitingTime = extractWaitingTime(ti.Pod.Annotations, fmt.Sprintf("pod <%s/%s>", ti.Namespace, ti.Name))
-	}
-
 	ji.Tasks[ti.UID] = ti
 	ji.addTaskIndex(ti)
 	ji.TotalRequest.Add(ti.Resreq)

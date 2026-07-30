@@ -27,6 +27,8 @@ import (
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 )
 
+// TestJobInfoWaitingTime covers GetWaitingTime: the podgroup annotation when it
+// has one, otherwise the shortest one declared by a member pod.
 func TestJobInfoWaitingTime(t *testing.T) {
 	podWithAnnotations := func(name string, annotations map[string]string) *TaskInfo {
 		return NewTaskInfo(&v1.Pod{
@@ -59,7 +61,10 @@ func TestJobInfoWaitingTime(t *testing.T) {
 		// podGroupLast adds the pods before the podgroup, as happens when a
 		// job's pods reach the cache first.
 		podGroupLast bool
-		expected     *time.Duration
+		// extraPodAnnotations is a second waiting time carried by one member
+		// pod only, to pin down which one wins.
+		extraPodAnnotations map[string]string
+		expected            *time.Duration
 	}{
 		{
 			name:     "no waiting time anywhere",
@@ -97,6 +102,12 @@ func TestJobInfoWaitingTime(t *testing.T) {
 			expected:       &minute,
 		},
 		{
+			name:                "the shortest pod annotation wins, whatever the iteration order",
+			podAnnotations:      map[string]string{schedulingv1beta1.JobWaitingTime: "1h"},
+			extraPodAnnotations: map[string]string{schedulingv1beta1.JobWaitingTime: "1m"},
+			expected:            &minute,
+		},
+		{
 			name:                "podgroup annotation wins over the pods",
 			podGroupAnnotations: map[string]string{schedulingv1beta1.JobWaitingTime: "1h"},
 			podAnnotations:      map[string]string{schedulingv1beta1.JobWaitingTime: "1m"},
@@ -109,7 +120,11 @@ func TestJobInfoWaitingTime(t *testing.T) {
 			job := NewJobInfo("default/pg")
 			addPods := func() {
 				job.AddTaskInfo(podWithAnnotations("pod-0", testCase.podAnnotations))
-				job.AddTaskInfo(podWithAnnotations("pod-1", testCase.podAnnotations))
+				annotations := testCase.podAnnotations
+				if testCase.extraPodAnnotations != nil {
+					annotations = testCase.extraPodAnnotations
+				}
+				job.AddTaskInfo(podWithAnnotations("pod-1", annotations))
 			}
 
 			if !testCase.podGroupLast {
@@ -120,13 +135,14 @@ func TestJobInfoWaitingTime(t *testing.T) {
 				job.SetPodGroup(podGroupWithAnnotations(testCase.podGroupAnnotations))
 			}
 
+			waitingTime := job.GetWaitingTime()
 			switch {
-			case testCase.expected == nil && job.WaitingTime != nil:
-				t.Errorf("waiting time is %v, want none", *job.WaitingTime)
-			case testCase.expected != nil && job.WaitingTime == nil:
+			case testCase.expected == nil && waitingTime != nil:
+				t.Errorf("waiting time is %v, want none", *waitingTime)
+			case testCase.expected != nil && waitingTime == nil:
 				t.Errorf("waiting time is unset, want %v", *testCase.expected)
-			case testCase.expected != nil && *job.WaitingTime != *testCase.expected:
-				t.Errorf("waiting time is %v, want %v", *job.WaitingTime, *testCase.expected)
+			case testCase.expected != nil && *waitingTime != *testCase.expected:
+				t.Errorf("waiting time is %v, want %v", *waitingTime, *testCase.expected)
 			}
 		})
 	}
