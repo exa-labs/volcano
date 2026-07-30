@@ -24,7 +24,6 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"maps"
 	"sort"
@@ -426,21 +425,7 @@ func (ji *JobInfo) SetPodGroup(pg *PodGroup) {
 	ji.Queue = QueueID(pg.Spec.Queue)
 	ji.CreationTimestamp = pg.GetCreationTimestamp()
 
-	var err error
-	ji.WaitingTime, err = ji.extractWaitingTime(pg, v1beta1.JobWaitingTime)
-	if err != nil {
-		klog.Warningf("Error occurs in parsing waiting time for job <%s/%s>, err: %s.",
-			pg.Namespace, pg.Name, err.Error())
-		ji.WaitingTime = nil
-	}
-	if ji.WaitingTime == nil {
-		ji.WaitingTime, err = ji.extractWaitingTime(pg, JobWaitingTime)
-		if err != nil {
-			klog.Warningf("Error occurs in parsing waiting time for job <%s/%s>, err: %s.",
-				pg.Namespace, pg.Name, err.Error())
-			ji.WaitingTime = nil
-		}
-	}
+	ji.WaitingTime = ji.resolveWaitingTime(pg)
 
 	ji.Preemptable = ji.extractPreemptable(pg)
 	ji.RevocableZone = ji.extractRevocableZone(pg)
@@ -469,23 +454,50 @@ func (ji *JobInfo) SetPodGroup(pg *PodGroup) {
 	}
 }
 
-// extractWaitingTime reads sla waiting time for job from podgroup annotations
+// resolveWaitingTime returns the sla waiting time declared on the podgroup, or,
+// when the podgroup does not declare one, on any of the job's member pods.
+func (ji *JobInfo) resolveWaitingTime(pg *PodGroup) *time.Duration {
+	if waitingTime := extractWaitingTime(pg.Annotations, fmt.Sprintf("podgroup <%s/%s>", pg.Namespace, pg.Name)); waitingTime != nil {
+		return waitingTime
+	}
+
+	for _, task := range ji.Tasks {
+		if task.Pod == nil {
+			continue
+		}
+		if waitingTime := extractWaitingTime(task.Pod.Annotations, fmt.Sprintf("pod <%s/%s>", task.Namespace, task.Name)); waitingTime != nil {
+			return waitingTime
+		}
+	}
+
+	return nil
+}
+
+// extractWaitingTime reads the sla waiting time from a set of annotations,
+// preferring the prefixed key over the bare one. owner names the annotated
+// object for logging. It returns nil when the value is absent or unusable.
 // TODO: should also read from given field in volcano job spec
-func (ji *JobInfo) extractWaitingTime(pg *PodGroup, waitingTimeKey string) (*time.Duration, error) {
-	if _, exist := pg.Annotations[waitingTimeKey]; !exist {
-		return nil, nil
+func extractWaitingTime(annotations map[string]string, owner string) *time.Duration {
+	for _, key := range []string{v1beta1.JobWaitingTime, JobWaitingTime} {
+		value, exist := annotations[key]
+		if !exist {
+			continue
+		}
+
+		waitingTime, err := time.ParseDuration(value)
+		if err != nil {
+			klog.Warningf("Error occurs in parsing waiting time %s=%s of %s, err: %s.", key, value, owner, err.Error())
+			continue
+		}
+		if waitingTime <= 0 {
+			klog.Warningf("Invalid sla waiting time %s=%s of %s.", key, value, owner)
+			continue
+		}
+
+		return &waitingTime
 	}
 
-	jobWaitingTime, err := time.ParseDuration(pg.Annotations[waitingTimeKey])
-	if err != nil {
-		return nil, err
-	}
-
-	if jobWaitingTime <= 0 {
-		return nil, errors.New("invalid sla waiting time")
-	}
-
-	return &jobWaitingTime, nil
+	return nil
 }
 
 // extractPreemptable return volcano.sh/preemptable value for job
@@ -631,6 +643,14 @@ func (ji *JobInfo) addTaskIndex(ti *TaskInfo) {
 
 // AddTaskInfo is used to add a task to a job
 func (ji *JobInfo) AddTaskInfo(ti *TaskInfo) {
+	// Gang operators that manage PodGroups themselves (e.g. the Kubeflow
+	// training-operator) do not necessarily copy volcano's annotations onto the
+	// PodGroup, so the pod template is the only place such a workload can
+	// declare a waiting time. The PodGroup annotation stays authoritative.
+	if ji.WaitingTime == nil && ti.Pod != nil {
+		ji.WaitingTime = extractWaitingTime(ti.Pod.Annotations, fmt.Sprintf("pod <%s/%s>", ti.Namespace, ti.Name))
+	}
+
 	ji.Tasks[ti.UID] = ti
 	ji.addTaskIndex(ti)
 	ji.TotalRequest.Add(ti.Resreq)
