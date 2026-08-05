@@ -26,10 +26,10 @@ jobs:
 
       - name: Install musl
         run: |
-          wget http://musl.libc.org/releases/musl-1.2.1.tar.gz
-          tar -xf musl-1.2.1.tar.gz && cd musl-1.2.1
-          ./configure
-          make && sudo make install
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          sudo mkdir -p /usr/local/musl/bin
+          sudo ln -sf /usr/bin/musl-gcc /usr/local/musl/bin/musl-gcc
 
       - name: Checkout code
         uses: actions/checkout@v3
