@@ -23,6 +23,7 @@ package preempt
 
 import (
 	"flag"
+	"math"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -691,6 +692,76 @@ func TestTopologyAwarePreempt(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+type fractionalNodeOrderPlugin struct{}
+
+func (p *fractionalNodeOrderPlugin) Name() string {
+	return "fractional-node-order"
+}
+
+func (p *fractionalNodeOrderPlugin) OnSessionOpen(ssn *framework.Session) {
+	ssn.AddNodeOrderFn(p.Name(), func(_ *api.TaskInfo, node *api.NodeInfo) (float64, error) {
+		if node.Name == "n1" {
+			return 10.1, nil
+		}
+		return 10.9, nil
+	})
+}
+
+func (p *fractionalNodeOrderPlugin) OnSessionClose(_ *framework.Session) {}
+
+func TestNodeOrderScorePreservesFractionalScores(t *testing.T) {
+	trueValue := true
+	test := &uthelper.TestCommonStruct{
+		Plugins: map[string]framework.PluginBuilder{
+			"fractional-node-order": func(framework.Arguments) framework.Plugin {
+				return &fractionalNodeOrderPlugin{}
+			},
+		},
+		PodGroups: []*schedulingv1beta1.PodGroup{
+			util.BuildPodGroup("pg1", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue),
+		},
+		Pods: []*v1.Pod{
+			util.BuildPod("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1", nil, nil),
+			util.BuildPod("c1", "preemptee2", "n2", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1", nil, nil),
+		},
+		Nodes: []*v1.Node{
+			util.BuildNode("n1", api.BuildResourceList("2", "2G"), nil),
+			util.BuildNode("n2", api.BuildResourceList("2", "2G"), nil),
+		},
+		Queues: []*schedulingv1beta1.Queue{
+			util.BuildQueue("q1", 1, nil),
+		},
+	}
+	ssn := test.RegisterSession([]conf.Tier{{
+		Plugins: []conf.PluginOption{{
+			Name:             "fractional-node-order",
+			EnabledNodeOrder: &trueValue,
+		}},
+	}}, nil)
+	defer test.Close()
+
+	nodesToVictims := map[string][]*api.TaskInfo{
+		"n1": {ssn.Nodes["n1"].Tasks["c1/preemptee1"]},
+		"n2": {ssn.Nodes["n2"].Tasks["c1/preemptee2"]},
+	}
+	score := nodeOrderScoreFunc(ssn, &api.TaskInfo{}, nodesToVictims)
+
+	if score("n2") <= score("n1") {
+		t.Fatalf("expected fractional node-order scores to distinguish n2 from n1, got n1=%d n2=%d", score("n1"), score("n2"))
+	}
+	if got := score("missing"); got != math.MinInt64 {
+		t.Fatalf("expected missing node score %d, got %d", math.MinInt64, got)
+	}
+
+	scoreFuncs := []func(node string) int64{
+		func(string) int64 { return 0 },
+		score,
+	}
+	if got := pickOneNodeForPreemption(nodesToVictims, scoreFuncs); got != "n2" {
+		t.Fatalf("expected n2 to win fractional node-order tie-breaker, got %s", got)
 	}
 }
 

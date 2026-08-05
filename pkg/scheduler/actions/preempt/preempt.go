@@ -55,6 +55,9 @@ const (
 	// This setting has no effect unless topology-aware preemption is enabled.
 	EnableNodeOrderScoreInPreemptionKey = "enableNodeOrderScoreInPreemption"
 
+	// Scale float node-order scores for the int64 candidate comparator.
+	nodeOrderScorePrecision = 1000
+
 	TopologyAwarePreemptWorkerNumKey = "topologyAwarePreemptWorkerNum"
 
 	MinCandidateNodesPercentageKey = "minCandidateNodesPercentage"
@@ -984,11 +987,15 @@ func nodeOrderScoreFunc(
 	nodeOrderScores := make(map[string]int64, len(nodes))
 	for score, scoredNodes := range nodeScores {
 		for _, node := range scoredNodes {
-			nodeOrderScores[node.Name] = int64(score)
+			nodeOrderScores[node.Name] = int64(math.Round(score * nodeOrderScorePrecision))
 		}
 	}
 	return func(node string) int64 {
-		return nodeOrderScores[node]
+		score, found := nodeOrderScores[node]
+		if !found {
+			return math.MinInt64
+		}
+		return score
 	}
 }
 
