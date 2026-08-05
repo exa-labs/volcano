@@ -35,6 +35,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
+	"volcano.sh/volcano/pkg/scheduler/plugins/binpack"
 	"volcano.sh/volcano/pkg/scheduler/plugins/conformance"
 	"volcano.sh/volcano/pkg/scheduler/plugins/gang"
 	"volcano.sh/volcano/pkg/scheduler/plugins/predicates"
@@ -320,12 +321,14 @@ func TestTopologyAwarePreempt(t *testing.T) {
 	plugins := map[string]framework.PluginBuilder{
 		conformance.PluginName: conformance.New,
 		gang.PluginName:        gang.New,
+		binpack.PluginName:     binpack.New,
 		priority.PluginName:    priority.New,
 		proportion.PluginName:  proportion.New,
 		predicates.PluginName:  predicates.New,
 	}
 	highPrio := util.BuildPriorityClass("high-priority", 100000)
 	lowPrio := util.BuildPriorityClass("low-priority", 10)
+	mediumPrio := util.BuildPriorityClass("medium-priority", 20)
 
 	tests := []uthelper.TestCommonStruct{
 		{
@@ -556,6 +559,72 @@ func TestTopologyAwarePreempt(t *testing.T) {
 			ExpectEvictNum: 1,
 			ExpectEvicted:  []string{"c1/preemptee2"},
 		},
+		{
+			Name: "prefer binpack node when highest-priority victims tie",
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q1", 1, map[string]int32{"": 1}, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			Pods: []*v1.Pod{
+				util.BuildPod("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G", api.ScalarResource{Name: "nvidia.com/gpu", Value: "1"}), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptee2", "n2", v1.PodRunning, api.BuildResourceList("1", "1G", api.ScalarResource{Name: "nvidia.com/gpu", Value: "1"}), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("1", "1G", api.ScalarResource{Name: "nvidia.com/gpu", Value: "1"}), "pg2", make(map[string]string), make(map[string]string)),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("1", "1G", api.ScalarResource{Name: "pods", Value: "10"}, api.ScalarResource{Name: "nvidia.com/gpu", Value: "10"}), make(map[string]string)),
+				util.BuildNode("n2", api.BuildResourceList("1", "1G", api.ScalarResource{Name: "pods", Value: "10"}, api.ScalarResource{Name: "nvidia.com/gpu", Value: "2"}), make(map[string]string)),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, nil),
+			},
+			ExpectEvictNum: 1,
+			ExpectEvicted:  []string{"c1/preemptee2"},
+		},
+		{
+			Name: "victim priority beats node-order score",
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue, "medium-priority"),
+				util.BuildPodGroupWithPrio("pg3", "c1", "q1", 1, map[string]int32{"": 1}, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			Pods: []*v1.Pod{
+				util.BuildPodWithPriority("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G", api.ScalarResource{Name: "nvidia.com/gpu", Value: "1"}), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string), &lowPrio.Value),
+				util.BuildPodWithPriority("c1", "preemptee2", "n2", v1.PodRunning, api.BuildResourceList("1", "1G", api.ScalarResource{Name: "nvidia.com/gpu", Value: "1"}), "pg2", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string), &mediumPrio.Value),
+				util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("1", "1G", api.ScalarResource{Name: "nvidia.com/gpu", Value: "1"}), "pg3", make(map[string]string), make(map[string]string)),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("1", "1G", api.ScalarResource{Name: "pods", Value: "10"}, api.ScalarResource{Name: "nvidia.com/gpu", Value: "10"}), make(map[string]string)),
+				util.BuildNode("n2", api.BuildResourceList("1", "1G", api.ScalarResource{Name: "pods", Value: "10"}, api.ScalarResource{Name: "nvidia.com/gpu", Value: "2"}), make(map[string]string)),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, nil),
+			},
+			ExpectEvictNum: 1,
+			ExpectEvicted:  []string{"c1/preemptee1"},
+		},
+		{
+			Name: "disable node-order score preserves default selection",
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg3", "c1", "q1", 1, map[string]int32{"": 1}, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			Pods: []*v1.Pod{
+				util.BuildPod("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G", api.ScalarResource{Name: "nvidia.com/gpu", Value: "2"}), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptee2", "n2", v1.PodRunning, api.BuildResourceList("500m", "500M", api.ScalarResource{Name: "nvidia.com/gpu", Value: "1"}), "pg2", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptee3", "n2", v1.PodRunning, api.BuildResourceList("500m", "500M", api.ScalarResource{Name: "nvidia.com/gpu", Value: "1"}), "pg2", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("1", "1G", api.ScalarResource{Name: "nvidia.com/gpu", Value: "2"}), "pg3", make(map[string]string), make(map[string]string)),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("1", "1G", api.ScalarResource{Name: "pods", Value: "10"}, api.ScalarResource{Name: "nvidia.com/gpu", Value: "10"}), make(map[string]string)),
+				util.BuildNode("n2", api.BuildResourceList("1", "1G", api.ScalarResource{Name: "pods", Value: "10"}, api.ScalarResource{Name: "nvidia.com/gpu", Value: "2"}), make(map[string]string)),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, nil),
+			},
+			ExpectEvictNum: 1,
+			ExpectEvicted:  []string{"c1/preemptee1"},
+		},
 	}
 
 	trueValue := true
@@ -581,6 +650,14 @@ func TestTopologyAwarePreempt(t *testing.T) {
 					EnabledJobStarving:  &trueValue,
 				},
 				{
+					Name:             binpack.PluginName,
+					EnabledNodeOrder: &trueValue,
+					Arguments: map[string]interface{}{
+						binpack.BinpackResources:           "nvidia.com/gpu",
+						"binpack.resources.nvidia.com/gpu": 10,
+					},
+				},
+				{
 					Name:               proportion.PluginName,
 					EnabledOverused:    &trueValue,
 					EnabledAllocatable: &trueValue,
@@ -598,10 +675,16 @@ func TestTopologyAwarePreempt(t *testing.T) {
 	actions := []framework.Action{New()}
 	for i, test := range tests {
 		test.Plugins = plugins
-		test.PriClass = []*schedulingv1.PriorityClass{highPrio, lowPrio}
+		test.PriClass = []*schedulingv1.PriorityClass{highPrio, lowPrio, mediumPrio}
 		t.Run(test.Name, func(t *testing.T) {
+			enableNodeOrderScore := test.Name != "disable node-order score preserves default selection"
 			test.RegisterSession(tiers, []conf.Configuration{{Name: actions[0].Name(),
-				Arguments: map[string]interface{}{EnableTopologyAwarePreemptionKey: true}}})
+				Arguments: map[string]interface{}{
+					EnableTopologyAwarePreemptionKey:    true,
+					EnableNodeOrderScoreInPreemptionKey: enableNodeOrderScore,
+					MinCandidateNodesAbsoluteKey:        2,
+					MaxCandidateNodesAbsoluteKey:        2,
+				}}})
 			defer test.Close()
 			test.Run(actions)
 			if err := test.CheckAll(i); err != nil {
