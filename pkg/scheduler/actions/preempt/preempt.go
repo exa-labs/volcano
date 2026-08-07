@@ -505,9 +505,14 @@ func (pmpt *Action) pipelineOnFittingNode(
 		return false
 	}
 
+	// predicateNodes may include nodes kept only because their predicate
+	// failures are resolvable by eviction (e.g. anti-affinity); a resource fit
+	// alone doesn't make the task runnable there, so re-check predicates
+	// against the current session state before pipelining without victims.
 	var fittingNodes []*api.NodeInfo
 	for _, node := range predicateNodes {
-		if preemptor.InitResreq.LessEqual(node.FutureIdle(), api.Zero) {
+		if preemptor.InitResreq.LessEqual(node.FutureIdle(), api.Zero) &&
+			ssn.PredicateFn(preemptor, node) == nil {
 			fittingNodes = append(fittingNodes, node)
 		}
 	}
@@ -518,7 +523,11 @@ func (pmpt *Action) pipelineOnFittingNode(
 	best := fittingNodes[0]
 	if len(fittingNodes) > 1 {
 		nodeScores := util.PrioritizeNodes(preemptor, fittingNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
-		best = util.SortNodes(nodeScores)[0]
+		sortedNodes := util.SortNodes(nodeScores)
+		if len(sortedNodes) == 0 {
+			return false
+		}
+		best = sortedNodes[0]
 	}
 
 	klog.V(3).Infof("Task <%s/%s> fits future idle of Node <%s>, pipelining without evictions",

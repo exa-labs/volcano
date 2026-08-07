@@ -651,6 +651,9 @@ func TestTopologyAwarePreempt(t *testing.T) {
 			},
 			ExpectEvictNum: 1,
 			ExpectEvicted:  []string{"c1/preemptee1"},
+			ExpectPipeLined: map[string][]string{
+				"c1/pg3": {"n1"},
+			},
 		},
 	}
 
