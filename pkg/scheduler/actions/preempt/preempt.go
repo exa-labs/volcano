@@ -481,6 +481,62 @@ func (pmpt *Action) taskEligibleToPreempt(preemptor *api.TaskInfo) error {
 	return nil
 }
 
+// pipelineOnFittingNode pipelines the preemptor without evicting anyone when
+// some node's future idle resources already fit it — typically capacity being
+// released by victims of earlier preemptions in the same session. Node-order
+// plugins (binpack et al.) choose among fitting nodes, so successive tasks of
+// a preempting job stack into holes already opened by their siblings instead
+// of each evicting a fresh victim on another node. normalPreempt gets this
+// behavior from its zero-victim path (ValidateVictims allows empty victim
+// sets); the topology-aware path requires at least one victim per candidate,
+// so without this it must evict somewhere even when eviction is unnecessary.
+func (pmpt *Action) pipelineOnFittingNode(
+	ssn *framework.Session,
+	stmt *framework.Statement,
+	preemptor *api.TaskInfo,
+	predicateNodes []*api.NodeInfo,
+) bool {
+	job, found := ssn.Jobs[preemptor.Job]
+	if !found {
+		return false
+	}
+
+	if !ssn.Allocatable(ssn.Queues[job.Queue], preemptor) {
+		return false
+	}
+
+	var fittingNodes []*api.NodeInfo
+	for _, node := range predicateNodes {
+		if preemptor.InitResreq.LessEqual(node.FutureIdle(), api.Zero) {
+			fittingNodes = append(fittingNodes, node)
+		}
+	}
+	if len(fittingNodes) == 0 {
+		return false
+	}
+
+	best := fittingNodes[0]
+	if len(fittingNodes) > 1 {
+		nodeScores := util.PrioritizeNodes(preemptor, fittingNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
+		best = util.SortNodes(nodeScores)[0]
+	}
+
+	klog.V(3).Infof("Task <%s/%s> fits future idle of Node <%s>, pipelining without evictions",
+		preemptor.Namespace, preemptor.Name, best.Name)
+
+	if err := stmt.Pipeline(preemptor, best.Name, false); err != nil {
+		klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>",
+			preemptor.Namespace, preemptor.Name, best.Name)
+		if rollbackErr := stmt.UnPipeline(preemptor); rollbackErr != nil {
+			klog.Errorf("Failed to unpipeline Task %v on %v in Session %v for %v.",
+				preemptor.UID, best.Name, ssn.UID, rollbackErr)
+		}
+	}
+
+	// Ignore pipeline error, will be corrected in next scheduling loop.
+	return true
+}
+
 func (pmpt *Action) topologyAwarePreempt(
 	ssn *framework.Session,
 	stmt *framework.Statement,
@@ -488,6 +544,10 @@ func (pmpt *Action) topologyAwarePreempt(
 	filter func(*api.TaskInfo) bool,
 	predicateNodes []*api.NodeInfo,
 ) (bool, error) {
+	if pmpt.pipelineOnFittingNode(ssn, stmt, preemptor, predicateNodes) {
+		return true, nil
+	}
+
 	// Find all preemption candidates.
 	candidates, nodeToStatusMap, err := pmpt.findCandidates(preemptor, filter, predicateNodes, stmt)
 	if err != nil && len(candidates) == 0 {
