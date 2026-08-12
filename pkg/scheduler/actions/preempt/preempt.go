@@ -350,9 +350,7 @@ func (pmpt *Action) normalPreempt(
 	filter func(*api.TaskInfo) bool,
 	predicateNodes []*api.NodeInfo,
 ) (bool, error) {
-	nodeScores := util.PrioritizeNodes(preemptor, predicateNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
-
-	selectedNodes := util.SortNodes(nodeScores)
+	selectedNodes := sortNodesByGradient(ssn, preemptor, predicateNodes)
 
 	job, found := ssn.Jobs[preemptor.Job]
 	if !found {
@@ -522,8 +520,7 @@ func (pmpt *Action) pipelineOnFittingNode(
 
 	best := fittingNodes[0]
 	if len(fittingNodes) > 1 {
-		nodeScores := util.PrioritizeNodes(preemptor, fittingNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
-		sortedNodes := util.SortNodes(nodeScores)
+		sortedNodes := sortNodesByGradient(ssn, preemptor, fittingNodes)
 		if len(sortedNodes) == 0 {
 			return false
 		}
@@ -544,6 +541,31 @@ func (pmpt *Action) pipelineOnFittingNode(
 
 	// Ignore pipeline error, will be corrected in next scheduling loop.
 	return true
+}
+
+// sortNodesByGradient orders candidate nodes so that nodes whose current Idle
+// resources satisfy the task come before nodes that only fit after releasing
+// resources free up, mirroring allocate's gradient partition in
+// prioritizeNodes. Nodes are scored and sorted within each gradient.
+func sortNodesByGradient(ssn *framework.Session, task *api.TaskInfo, nodes []*api.NodeInfo) []*api.NodeInfo {
+	var idleFitNodes, futureFitNodes []*api.NodeInfo
+	for _, node := range nodes {
+		if task.InitResreq.LessEqual(node.Idle, api.Zero) {
+			idleFitNodes = append(idleFitNodes, node)
+		} else {
+			futureFitNodes = append(futureFitNodes, node)
+		}
+	}
+
+	sorted := make([]*api.NodeInfo, 0, len(nodes))
+	for _, gradient := range [][]*api.NodeInfo{idleFitNodes, futureFitNodes} {
+		if len(gradient) == 0 {
+			continue
+		}
+		nodeScores := util.PrioritizeNodes(task, gradient, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
+		sorted = append(sorted, util.SortNodes(nodeScores)...)
+	}
+	return sorted
 }
 
 func (pmpt *Action) topologyAwarePreempt(

@@ -208,7 +208,7 @@ func BinPackingScore(task *api.TaskInfo, node *api.NodeInfo, weight priorityWeig
 	weightSum := 0
 	requested := task.Resreq
 	allocatable := node.Allocatable
-	used := node.Used
+	useFutureOccupancy := !task.InitResreq.LessEqual(node.Idle, api.Zero)
 
 	for _, resource := range requested.ResourceNames() {
 		request := requested.Get(resource)
@@ -216,7 +216,16 @@ func BinPackingScore(task *api.TaskInfo, node *api.NodeInfo, weight priorityWeig
 			continue
 		}
 		allocate := allocatable.Get(resource)
-		nodeUsed := used.Get(resource)
+		nodeUsed := node.Used.Get(resource)
+		baseline := "used"
+		if useFutureOccupancy {
+			futureIdle := node.Idle.Get(resource) + node.Releasing.Get(resource) - node.Pipelined.Get(resource)
+			nodeUsed = allocate - futureIdle
+			if nodeUsed < 0 {
+				nodeUsed = 0
+			}
+			baseline = "future occupancy"
+		}
 
 		resourceWeight, found := weight.BinPackingResources[resource]
 		if !found {
@@ -225,12 +234,12 @@ func BinPackingScore(task *api.TaskInfo, node *api.NodeInfo, weight priorityWeig
 
 		resourceScore, err := ResourceBinPackingScore(request, allocate, nodeUsed, resourceWeight)
 		if err != nil {
-			klog.V(4).Infof("task %s/%s cannot binpack node %s: resource: %s is %s, need %f, used %f, allocatable %f",
-				task.Namespace, task.Name, node.Name, resource, err.Error(), request, nodeUsed, allocate)
+			klog.V(4).Infof("task %s/%s cannot binpack node %s: resource: %s is %s, need %f, %s %f, allocatable %f",
+				task.Namespace, task.Name, node.Name, resource, err.Error(), request, baseline, nodeUsed, allocate)
 			return 0
 		}
-		klog.V(5).Infof("task %s/%s on node %s resource %s, need %f, used %f, allocatable %f, weight %d, score %f",
-			task.Namespace, task.Name, node.Name, resource, request, nodeUsed, allocate, resourceWeight, resourceScore)
+		klog.V(5).Infof("task %s/%s on node %s resource %s, need %f, %s %f, allocatable %f, weight %d, score %f",
+			task.Namespace, task.Name, node.Name, resource, request, baseline, nodeUsed, allocate, resourceWeight, resourceScore)
 
 		score += resourceScore
 		weightSum += resourceWeight

@@ -794,6 +794,65 @@ func TestNodeOrderScorePreservesFractionalScores(t *testing.T) {
 	}
 }
 
+func TestSortNodesByGradientPrefersIdleFit(t *testing.T) {
+	trueValue := true
+	test := &uthelper.TestCommonStruct{
+		Plugins: map[string]framework.PluginBuilder{
+			binpack.PluginName: binpack.New,
+		},
+	}
+	ssn := test.RegisterSession([]conf.Tier{{
+		Plugins: []conf.PluginOption{{
+			Name:             binpack.PluginName,
+			EnabledNodeOrder: &trueValue,
+			Arguments: map[string]interface{}{
+				binpack.BinpackResources:           "nvidia.com/gpu",
+				"binpack.resources.nvidia.com/gpu": 10,
+			},
+		}},
+	}}, nil)
+	defer test.Close()
+
+	gpu := func(value string) *api.Resource {
+		return api.NewResource(api.BuildResourceList("0", "0", api.ScalarResource{Name: "nvidia.com/gpu", Value: value}))
+	}
+	req := gpu("1")
+	task := &api.TaskInfo{
+		Name:       "task",
+		Namespace:  "c1",
+		Resreq:     req,
+		InitResreq: req,
+	}
+
+	// The draining node's committed future occupancy (Allocatable - FutureIdle)
+	// gives it a higher binpack score than the idle-fit node, but the idle-fit
+	// node must still be ordered first.
+	idleFit := &api.NodeInfo{
+		Name:        "idle-fit",
+		Idle:        gpu("7"),
+		Used:        gpu("1"),
+		Releasing:   gpu("0"),
+		Pipelined:   gpu("0"),
+		Allocatable: gpu("8"),
+	}
+	draining := &api.NodeInfo{
+		Name:        "draining",
+		Idle:        gpu("0"),
+		Used:        gpu("8"),
+		Releasing:   gpu("8"),
+		Pipelined:   gpu("4"),
+		Allocatable: gpu("8"),
+	}
+
+	sorted := sortNodesByGradient(ssn, task, []*api.NodeInfo{draining, idleFit})
+	if len(sorted) != 2 {
+		t.Fatalf("expected 2 sorted nodes, got %d", len(sorted))
+	}
+	if sorted[0].Name != "idle-fit" {
+		t.Fatalf("expected idle-fit node ordered before draining node, got %s first", sorted[0].Name)
+	}
+}
+
 func buildPodWithPodAntiAffinity(name, namespace, node string, phase v1.PodPhase, req v1.ResourceList, groupName string, labels map[string]string, selector map[string]string, topologyKey string) *v1.Pod {
 	pod := util.BuildPod(name, namespace, node, phase, req, groupName, labels, selector)
 
