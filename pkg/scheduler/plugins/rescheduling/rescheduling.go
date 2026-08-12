@@ -59,6 +59,7 @@ func init() {
 
 	// register victim functions for all strategies here
 	VictimFn["lowNodeUtilization"] = victimsFnForLnu
+	VictimFn[GpuFragmentationStrategy] = victimsFnForGpuFragmentation
 }
 
 type reschedulingPlugin struct {
