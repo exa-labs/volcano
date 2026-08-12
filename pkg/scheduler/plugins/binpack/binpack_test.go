@@ -305,6 +305,44 @@ func TestBinPackingScoreFutureOccupancy(t *testing.T) {
 	}
 }
 
+func TestBinPackingScoreFutureOccupancyNilScalarResources(t *testing.T) {
+	gpu := v1.ResourceName("nvidia.com/gpu")
+	weight := priorityWeight{
+		BinPackingWeight: 1,
+		BinPackingResources: map[v1.ResourceName]int{
+			gpu: 1,
+		},
+	}
+	task := &api.TaskInfo{
+		Name:       "task",
+		Namespace:  "namespace",
+		Resreq:     newGPUResource(1),
+		InitResreq: newGPUResource(1),
+	}
+
+	// Node resources carry only cpu/memory, so their ScalarResources maps are
+	// nil; the scalar GPU request must read as zero everywhere and the node
+	// must score 0 (allocatable 0 < request) instead of panicking.
+	newCPUMemResource := func(cpuMilli int64, memGi int64) *api.Resource {
+		return api.NewResource(v1.ResourceList{
+			v1.ResourceCPU:    *resource.NewMilliQuantity(cpuMilli, resource.DecimalSI),
+			v1.ResourceMemory: *resource.NewQuantity(memGi*1024*1024*1024, resource.BinarySI),
+		})
+	}
+	node := &api.NodeInfo{
+		Name:        "nil-scalar",
+		Idle:        newCPUMemResource(0, 0),
+		Used:        newCPUMemResource(8000, 16),
+		Releasing:   newCPUMemResource(8000, 16),
+		Pipelined:   newCPUMemResource(2000, 4),
+		Allocatable: newCPUMemResource(8000, 16),
+	}
+
+	if score := BinPackingScore(task, node, weight); math.Abs(score) > eps {
+		t.Fatalf("expected score 0 for nil scalar maps, got %v", score)
+	}
+}
+
 func TestBinPackingScoreFutureOccupancyCPUMemory(t *testing.T) {
 	weight := priorityWeight{
 		BinPackingWeight: 1,
