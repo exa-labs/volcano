@@ -305,6 +305,53 @@ func TestBinPackingScoreFutureOccupancy(t *testing.T) {
 	}
 }
 
+func TestBinPackingScoreFutureOccupancyCPUMemory(t *testing.T) {
+	weight := priorityWeight{
+		BinPackingWeight: 1,
+		BinPackingResources: map[v1.ResourceName]int{
+			v1.ResourceCPU:    1,
+			v1.ResourceMemory: 1,
+		},
+	}
+	req := api.NewResource(v1.ResourceList{
+		v1.ResourceCPU:    *resource.NewMilliQuantity(2000, resource.DecimalSI),
+		v1.ResourceMemory: *resource.NewQuantity(4*1024*1024*1024, resource.BinarySI),
+	})
+	task := &api.TaskInfo{
+		Name:       "task",
+		Namespace:  "namespace",
+		Resreq:     req,
+		InitResreq: req,
+	}
+
+	newCPUMemResource := func(cpuMilli, memGi float64) *api.Resource {
+		return api.NewResource(v1.ResourceList{
+			v1.ResourceCPU:    *resource.NewMilliQuantity(int64(cpuMilli), resource.DecimalSI),
+			v1.ResourceMemory: *resource.NewQuantity(int64(memGi*1024*1024*1024), resource.BinarySI),
+		})
+	}
+	newNode := func(name string, pipelined *api.Resource) *api.NodeInfo {
+		return &api.NodeInfo{
+			Name:        name,
+			Idle:        newCPUMemResource(0, 0),
+			Used:        newCPUMemResource(8000, 16),
+			Releasing:   newCPUMemResource(8000, 16),
+			Pipelined:   pipelined,
+			Allocatable: newCPUMemResource(8000, 16),
+		}
+	}
+
+	reserved := newNode("reserved", newCPUMemResource(2000, 4))
+	unreserved := newNode("unreserved", newCPUMemResource(0, 0))
+
+	if score := BinPackingScore(task, reserved, weight); math.Abs(score-50) > eps {
+		t.Fatalf("expected reserved node score 50, got %v", score)
+	}
+	if score := BinPackingScore(task, unreserved, weight); math.Abs(score-25) > eps {
+		t.Fatalf("expected unreserved node score 25, got %v", score)
+	}
+}
+
 func newGPUResource(value float64) *api.Resource {
 	return api.NewResource(v1.ResourceList{
 		v1.ResourceName("nvidia.com/gpu"): *resource.NewMilliQuantity(int64(value*1000), resource.DecimalSI),
