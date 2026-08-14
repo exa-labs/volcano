@@ -115,6 +115,10 @@ func eligible() map[string]string {
 	return map[string]string{"exa.ai/repack-eligible": "true"}
 }
 
+func optedOut() map[string]string {
+	return map[string]string{"exa.ai/repack-eligible": "false"}
+}
+
 func TestPlanSelectsSoleEligiblePodWithFullerDestination(t *testing.T) {
 	f := newFixture(t)
 	source := f.addNode(gpuNode("source", 8, nil))
@@ -131,15 +135,28 @@ func TestPlanSelectsSoleEligiblePodWithFullerDestination(t *testing.T) {
 	}
 }
 
-func TestPlanSkipsWithoutOptIn(t *testing.T) {
+func TestPlanSelectsUnlabeledPodByDefault(t *testing.T) {
 	f := newFixture(t)
 	source := f.addNode(gpuNode("source", 8, nil))
 	dest := f.addNode(gpuNode("dest", 8, nil))
 	f.placePod(t, source, gpuPod("victim", "source", 1, nil, nil, true), 1, "")
 	f.placePod(t, dest, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
 
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 || plans[0].victim.Name != "victim" {
+		t.Fatalf("expected unlabeled pod to be eligible by default, got %+v", plans)
+	}
+}
+
+func TestPlanSkipsOptedOutPod(t *testing.T) {
+	f := newFixture(t)
+	source := f.addNode(gpuNode("source", 8, nil))
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	f.placePod(t, source, gpuPod("victim", "source", 1, optedOut(), nil, true), 1, "")
+	f.placePod(t, dest, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
+
 	if plans := f.plan(newGpuFragmentationConf(), nil); len(plans) != 0 {
-		t.Fatalf("expected no plans without opt-in, got %+v", plans)
+		t.Fatalf("expected no plans for opted-out pod, got %+v", plans)
 	}
 }
 
@@ -248,8 +265,8 @@ func TestPlanRequiresStrictlyFullerDestinationWithRoom(t *testing.T) {
 	emptier := f.addNode(gpuNode("emptier", 8, nil))
 	full := f.addNode(gpuNode("full", 8, nil))
 	f.placePod(t, source, gpuPod("victim", "source", 3, eligible(), nil, true), 1, "")
-	f.placePod(t, emptier, gpuPod("small", "emptier", 1, nil, nil, true), 1, "")
-	f.placePod(t, full, gpuPod("big", "full", 7, nil, nil, true), 1, "")
+	f.placePod(t, emptier, gpuPod("small", "emptier", 1, optedOut(), nil, true), 1, "")
+	f.placePod(t, full, gpuPod("big", "full", 7, optedOut(), nil, true), 1, "")
 
 	// emptier is less full than source; full has only 1 free GPU for a 3-GPU victim.
 	if plans := f.plan(newGpuFragmentationConf(), nil); len(plans) != 0 {
