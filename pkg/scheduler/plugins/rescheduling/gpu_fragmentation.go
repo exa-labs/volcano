@@ -19,6 +19,7 @@ package rescheduling
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"time"
 
@@ -49,6 +50,11 @@ var DefaultGpuFragmentationConf = map[string]interface{}{
 	"maxVictims":        1,
 	"maxVictimPriority": -1,
 }
+
+// KillSwitchEnv disables the strategy entirely when set to "true" on the
+// scheduler process, e.g. `kubectl -n volcano set env deploy/<scheduler>
+// EXA_GPU_REPACK_DISABLED=true`.
+const KillSwitchEnv = "EXA_GPU_REPACK_DISABLED"
 
 const (
 	lastEvictionAnnotation  = "exa.ai/repack-last-eviction"
@@ -88,6 +94,10 @@ func (c *gpuFragmentationConf) parse(configs map[string]interface{}) {
 
 var victimsFnForGpuFragmentation = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	if Session == nil {
+		return nil
+	}
+	if os.Getenv(KillSwitchEnv) == "true" {
+		klog.V(2).Infof("gpuFragmentation: disabled via %s", KillSwitchEnv)
 		return nil
 	}
 	conf := newGpuFragmentationConf()
