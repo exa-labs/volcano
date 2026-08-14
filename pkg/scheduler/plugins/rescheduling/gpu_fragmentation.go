@@ -19,6 +19,7 @@ package rescheduling
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"time"
 
@@ -32,7 +33,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
-// GpuFragmentationStrategy evicts at most one opted-in GPU pod per node pool
+// GpuFragmentationStrategy evicts at most one eligible GPU pod per node pool
 // whose departure empties its node of GPU work and which provably fits on a
 // fuller node in the same pool. The replacement is recreated by the pod's
 // controller and scheduled normally; binpack scoring steers it to the fuller
@@ -44,11 +45,16 @@ var DefaultGpuFragmentationConf = map[string]interface{}{
 	"dryRun":            true,
 	"gpuResource":       "nvidia.com/gpu",
 	"poolLabel":         "karpenter.sh/nodepool",
-	"eligibleLabel":     "exa.ai/repack-eligible",
+	"optOutLabel":       "exa.ai/repack-eligible",
 	"cooldownSeconds":   1800,
 	"maxVictims":        1,
 	"maxVictimPriority": -1,
 }
+
+// KillSwitchEnv disables the strategy entirely when set to "true" on the
+// scheduler process, e.g. `kubectl -n volcano set env deploy/<scheduler>
+// EXA_GPU_REPACK_DISABLED=true`.
+const KillSwitchEnv = "EXA_GPU_REPACK_DISABLED"
 
 const (
 	lastEvictionAnnotation  = "exa.ai/repack-last-eviction"
@@ -57,10 +63,11 @@ const (
 )
 
 type gpuFragmentationConf struct {
-	DryRun          bool   `mapstructure:"dryRun"`
-	GpuResource     string `mapstructure:"gpuResource"`
-	PoolLabel       string `mapstructure:"poolLabel"`
-	EligibleLabel   string `mapstructure:"eligibleLabel"`
+	DryRun      bool   `mapstructure:"dryRun"`
+	GpuResource string `mapstructure:"gpuResource"`
+	PoolLabel   string `mapstructure:"poolLabel"`
+	// OptOutLabel excludes a pod from repacking when set to "false".
+	OptOutLabel     string `mapstructure:"optOutLabel"`
 	CooldownSeconds int    `mapstructure:"cooldownSeconds"`
 	MaxVictims      int    `mapstructure:"maxVictims"`
 	// MaxVictimPriority is the highest pod priority still movable. Pods
@@ -87,6 +94,10 @@ func (c *gpuFragmentationConf) parse(configs map[string]interface{}) {
 
 var victimsFnForGpuFragmentation = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	if Session == nil {
+		return nil
+	}
+	if os.Getenv(KillSwitchEnv) == "true" {
+		klog.V(2).Infof("gpuFragmentation: disabled via %s", KillSwitchEnv)
 		return nil
 	}
 	conf := newGpuFragmentationConf()
@@ -229,7 +240,7 @@ func planGpuFragmentationMoves(
 }
 
 // movableSoleGpuTask returns the node's single GPU-consuming task iff that
-// task is safe to move: it is running, opted in, not protected, at or below
+// task is safe to move: it is running, not opted out, not protected, at or below
 // the movable priority ceiling, owned by a controller that will recreate it,
 // and its PodGroup has exactly one member.
 func movableSoleGpuTask(
@@ -259,7 +270,7 @@ func movableSoleGpuTask(
 	if _, isRunning := running[sole.Pod.UID]; !isRunning {
 		return nil
 	}
-	if sole.Pod.Labels[conf.EligibleLabel] != "true" {
+	if sole.Pod.Labels[conf.OptOutLabel] == "false" {
 		return nil
 	}
 	if sole.Pod.Annotations[doNotDisruptAnnotation] == "true" {
