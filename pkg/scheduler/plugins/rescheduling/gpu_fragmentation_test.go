@@ -64,6 +64,8 @@ func gpuPod(name, nodeName string, gpus int64, labels, annotations map[string]st
 			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "owner", UID: types.UID("owner-" + name), Controller: &controller,
 		}}
 	}
+	priority := int32(-1)
+	pod.Spec.Priority = &priority
 	return pod
 }
 
@@ -153,6 +155,38 @@ func TestPlanSkipsDoNotDisruptAndUncontrolled(t *testing.T) {
 
 	if plans := f.plan(newGpuFragmentationConf(), nil); len(plans) != 0 {
 		t.Fatalf("expected no plans, got %+v", plans)
+	}
+}
+
+func TestPlanSkipsVictimAbovePriorityCeiling(t *testing.T) {
+	f := newFixture(t)
+	source := f.addNode(gpuNode("source", 8, nil))
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	victim := gpuPod("victim", "source", 1, eligible(), nil, true)
+	zero := int32(0)
+	victim.Spec.Priority = &zero
+	f.placePod(t, source, victim, 1, "")
+	f.placePod(t, dest, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
+
+	if plans := f.plan(newGpuFragmentationConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected no plans for priority-0 victim, got %+v", plans)
+	}
+
+	nilPriority := gpuPod("victim", "source", 1, eligible(), nil, true)
+	nilPriority.Spec.Priority = nil
+	g := newFixture(t)
+	source2 := g.addNode(gpuNode("source", 8, nil))
+	dest2 := g.addNode(gpuNode("dest", 8, nil))
+	g.placePod(t, source2, nilPriority, 1, "")
+	g.placePod(t, dest2, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
+	if plans := g.plan(newGpuFragmentationConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected no plans for nil-priority (default 0) victim, got %+v", plans)
+	}
+
+	conf := newGpuFragmentationConf()
+	conf.MaxVictimPriority = 0
+	if plans := g.plan(conf, nil); len(plans) != 1 {
+		t.Fatalf("expected 1 plan with raised ceiling, got %+v", plans)
 	}
 }
 
