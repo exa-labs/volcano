@@ -41,12 +41,13 @@ const GpuFragmentationStrategy = "gpuFragmentation"
 
 // DefaultGpuFragmentationConf holds the default (dry-run) configuration.
 var DefaultGpuFragmentationConf = map[string]interface{}{
-	"dryRun":          true,
-	"gpuResource":     "nvidia.com/gpu",
-	"poolLabel":       "karpenter.sh/nodepool",
-	"eligibleLabel":   "exa.ai/repack-eligible",
-	"cooldownSeconds": 1800,
-	"maxVictims":      1,
+	"dryRun":            true,
+	"gpuResource":       "nvidia.com/gpu",
+	"poolLabel":         "karpenter.sh/nodepool",
+	"eligibleLabel":     "exa.ai/repack-eligible",
+	"cooldownSeconds":   1800,
+	"maxVictims":        1,
+	"maxVictimPriority": -1,
 }
 
 const (
@@ -62,6 +63,10 @@ type gpuFragmentationConf struct {
 	EligibleLabel   string `mapstructure:"eligibleLabel"`
 	CooldownSeconds int    `mapstructure:"cooldownSeconds"`
 	MaxVictims      int    `mapstructure:"maxVictims"`
+	// MaxVictimPriority is the highest pod priority still movable. Pods
+	// without an explicit priority count as 0, so the default (-1) restricts
+	// repacking to negative-priority (interruptible) workloads.
+	MaxVictimPriority int32 `mapstructure:"maxVictimPriority"`
 }
 
 func newGpuFragmentationConf() *gpuFragmentationConf {
@@ -224,8 +229,9 @@ func planGpuFragmentationMoves(
 }
 
 // movableSoleGpuTask returns the node's single GPU-consuming task iff that
-// task is safe to move: it is running, opted in, not protected, owned by a
-// controller that will recreate it, and its PodGroup has exactly one member.
+// task is safe to move: it is running, opted in, not protected, at or below
+// the movable priority ceiling, owned by a controller that will recreate it,
+// and its PodGroup has exactly one member.
 func movableSoleGpuTask(
 	node *api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -257,6 +263,13 @@ func movableSoleGpuTask(
 		return nil
 	}
 	if sole.Pod.Annotations[doNotDisruptAnnotation] == "true" {
+		return nil
+	}
+	priority := int32(0)
+	if sole.Pod.Spec.Priority != nil {
+		priority = *sole.Pod.Spec.Priority
+	}
+	if priority > conf.MaxVictimPriority {
 		return nil
 	}
 	if metav1.GetControllerOf(sole.Pod) == nil {
