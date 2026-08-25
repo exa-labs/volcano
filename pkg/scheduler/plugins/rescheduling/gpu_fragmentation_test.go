@@ -207,6 +207,44 @@ func TestPlanSkipsVictimAbovePriorityCeiling(t *testing.T) {
 	}
 }
 
+// The eviction path (Session.Evict -> JobInfo.UpdateTaskStatus) mutates the
+// victim's status in place before NodeInfo.RemoveTask reads it back out of
+// node.Tasks. Returning the node-local clone therefore flips the node copy to
+// Releasing and RemoveTask subtracts from an empty ni.Releasing, panicking.
+// The plan must carry the session-side task, never the node-local clone.
+func TestPlanVictimIsSessionTaskAndEvictionAccountingHolds(t *testing.T) {
+	f := newFixture(t)
+	source := f.addNode(gpuNode("source", 8, nil))
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	sessionTask := f.placePod(t, source, gpuPod("victim", "source", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, dest, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
+
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %d", len(plans))
+	}
+	victim := plans[0].victim
+	if victim != sessionTask {
+		t.Fatalf("plan victim must be the session-side task, got node-local clone")
+	}
+	for _, nodeCopy := range source.Tasks {
+		if victim == nodeCopy {
+			t.Fatalf("plan victim must not alias a node-local task copy")
+		}
+	}
+
+	// Replay Session.Evict's node-side sequence and assert accounting survives.
+	if err := f.jobs[victim.Job].UpdateTaskStatus(victim, api.Releasing); err != nil {
+		t.Fatalf("UpdateTaskStatus: %v", err)
+	}
+	if err := source.UpdateTask(victim); err != nil {
+		t.Fatalf("UpdateTask: %v", err)
+	}
+	if got := source.Releasing.Get("nvidia.com/gpu"); got != 1000 {
+		t.Fatalf("expected 1 GPU releasing on source, got %v", got)
+	}
+}
+
 func TestPlanSkipsMultiMemberGang(t *testing.T) {
 	f := newFixture(t)
 	source := f.addNode(gpuNode("source", 8, nil))
