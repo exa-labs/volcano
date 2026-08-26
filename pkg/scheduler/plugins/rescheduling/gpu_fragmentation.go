@@ -267,7 +267,11 @@ func movableSoleGpuTask(
 	if sole == nil || sole.Pod == nil {
 		return nil
 	}
-	if _, isRunning := running[sole.Pod.UID]; !isRunning {
+	// node.Tasks holds node-local clones; the eviction path mutates the
+	// victim's status in place, so the session-side task must be returned
+	// or node resource accounting corrupts and the scheduler panics.
+	sessionTask, isRunning := running[sole.Pod.UID]
+	if !isRunning {
 		return nil
 	}
 	if sole.Pod.Labels[conf.OptOutLabel] == "false" {
@@ -299,7 +303,7 @@ func movableSoleGpuTask(
 	if raw, ok := job.PodGroup.Annotations[groupEvictionAnnotation]; ok && raw != "0" {
 		return nil
 	}
-	return sole
+	return sessionTask
 }
 
 // findDestination proves at least one strictly fuller node in the pool can
