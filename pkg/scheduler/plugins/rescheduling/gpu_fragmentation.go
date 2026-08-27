@@ -33,11 +33,13 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
-// GpuFragmentationStrategy evicts at most one eligible GPU pod per node pool
-// whose departure empties its node of GPU work and which provably fits on a
-// fuller node in the same pool. The replacement is recreated by the pod's
-// controller and scheduled normally; binpack scoring steers it to the fuller
-// node. Cooldown and per-PodGroup eviction caps are the anti-thrash mechanism.
+// GpuFragmentationStrategy drains at most one fragmented node per pool per
+// pass: every GPU pod on the node must be movable and provably fit, under a
+// simulated first-fit-decreasing placement, onto other nodes in the same pool
+// that are at least as full. Replacements are recreated by the pods'
+// controllers and scheduled normally; binpack scoring steers them to the
+// fuller nodes. Cooldown and per-PodGroup eviction caps are the anti-thrash
+// mechanism.
 const GpuFragmentationStrategy = "gpuFragmentation"
 
 // DefaultGpuFragmentationConf holds the default (dry-run) configuration.
@@ -47,7 +49,7 @@ var DefaultGpuFragmentationConf = map[string]interface{}{
 	"poolLabel":         "karpenter.sh/nodepool",
 	"optOutLabel":       "exa.ai/repack-eligible",
 	"cooldownSeconds":   1800,
-	"maxVictims":        1,
+	"maxVictims":        4,
 	"maxVictimPriority": -1,
 }
 
@@ -69,7 +71,9 @@ type gpuFragmentationConf struct {
 	// OptOutLabel excludes a pod from repacking when set to "false".
 	OptOutLabel     string `mapstructure:"optOutLabel"`
 	CooldownSeconds int    `mapstructure:"cooldownSeconds"`
-	MaxVictims      int    `mapstructure:"maxVictims"`
+	// MaxVictims caps total evictions per pass. A node's move set is atomic:
+	// it is only taken when the whole set fits in the remaining budget.
+	MaxVictims int `mapstructure:"maxVictims"`
 	// MaxVictimPriority is the highest pod priority still movable. Pods
 	// without an explicit priority count as 0, so the default (-1) restricts
 	// repacking to negative-priority (interruptible) workloads.
@@ -162,11 +166,13 @@ func probeTask(task *api.TaskInfo) *api.TaskInfo {
 	return api.NewTaskInfo(pod)
 }
 
-// planGpuFragmentationMoves selects at most conf.MaxVictims moves, one per
-// pool. A move requires: the source node's entire GPU usage is the single
-// eligible task, the task's PodGroup has exactly one member, the node's
-// cooldown clock permits it, its PodGroup eviction cap is unspent, and some
-// strictly fuller node in the same pool passes resources and predicates.
+// planGpuFragmentationMoves drains at most one node per pool, capped at
+// conf.MaxVictims evictions overall. A node drains only when every GPU task
+// on it is movable (single-member PodGroup, unspent eviction cap, at or below
+// the priority ceiling, controller-owned, not opted out or protected), the
+// pool's cooldown clock permits it, and a simulated first-fit-decreasing
+// placement fits all of them onto other pool nodes that are at least as full,
+// passing resources and predicates. Emptier nodes are drained first.
 func planGpuFragmentationMoves(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -200,7 +206,13 @@ func planGpuFragmentationMoves(
 			break
 		}
 		members := pools[pool]
-		sort.Slice(members, func(i, j int) bool { return members[i].Name < members[j].Name })
+		sort.Slice(members, func(i, j int) bool {
+			ui, uj := members[i].Used.Get(gpu), members[j].Used.Get(gpu)
+			if ui != uj {
+				return ui < uj
+			}
+			return members[i].Name < members[j].Name
+		})
 		// Cooldown is a pool-wide budget: any recent (or unparseable)
 		// eviction clock in the pool holds the whole pool.
 		cooled := true
@@ -217,83 +229,102 @@ func planGpuFragmentationMoves(
 			continue
 		}
 		for _, source := range members {
-			victim := movableSoleGpuTask(source, jobs, running, conf, gpu)
-			if victim == nil {
+			victims := movableGpuTasks(source, jobs, running, conf, gpu)
+			if len(victims) == 0 {
 				continue
 			}
-			gain := source.Used.Get(gpu)
-			dest := findDestination(members, source, victim, gpu, predicate)
-			if dest == nil {
+			if conf.MaxVictims > 0 && len(plans)+len(victims) > conf.MaxVictims {
 				continue
 			}
-			plans = append(plans, gpuFragmentationPlan{
-				victim:      victim,
-				pool:        pool,
-				source:      source.Name,
-				destination: dest.Name,
-				gain:        gain,
-			})
+			moves := simulateDrain(members, source, victims, gpu, predicate)
+			if moves == nil {
+				continue
+			}
+			for _, move := range moves {
+				plans = append(plans, gpuFragmentationPlan{
+					victim:      move.victim,
+					pool:        pool,
+					source:      source.Name,
+					destination: move.destination,
+					gain:        source.Used.Get(gpu),
+				})
+			}
 			break
 		}
 	}
 	return plans
 }
 
-// movableSoleGpuTask returns the node's single GPU-consuming task iff that
-// task is safe to move: it is running, not opted out, not protected, at or below
-// the movable priority ceiling, owned by a controller that will recreate it,
-// and its PodGroup has exactly one member.
-func movableSoleGpuTask(
+// movableGpuTasks returns every GPU-consuming task on the node iff all of
+// them are safe to move: running, not opted out, not protected, at or below
+// the movable priority ceiling, owned by a controller that will recreate
+// them, in a single-member PodGroup with an unspent eviction cap. Draining is
+// all-or-nothing — one immovable GPU task keeps the node's GPUs stranded, so
+// evicting the others would churn pods without freeing the node.
+func movableGpuTasks(
 	node *api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
 	running map[types.UID]*api.TaskInfo,
 	conf *gpuFragmentationConf,
 	gpu v1.ResourceName,
-) *api.TaskInfo {
+) []*api.TaskInfo {
 	used := node.Used.Get(gpu)
 	if used <= 0 || used >= node.Allocatable.Get(gpu) {
 		return nil
 	}
-	var sole *api.TaskInfo
+	victims := make([]*api.TaskInfo, 0, len(node.Tasks))
 	for _, task := range node.Tasks {
 		if task.Resreq.Get(gpu) <= 0 && task.InitResreq.Get(gpu) <= 0 {
 			continue
 		}
-		if sole != nil {
+		sessionTask := movableTask(task, jobs, running, conf)
+		if sessionTask == nil {
 			return nil
 		}
-		sole = task
+		victims = append(victims, sessionTask)
 	}
-	if sole == nil || sole.Pod == nil {
+	sort.Slice(victims, func(i, j int) bool { return victims[i].Name < victims[j].Name })
+	return victims
+}
+
+// movableTask returns the session-side counterpart of a node-local task iff
+// the task is safe to move, nil otherwise.
+func movableTask(
+	task *api.TaskInfo,
+	jobs map[api.JobID]*api.JobInfo,
+	running map[types.UID]*api.TaskInfo,
+	conf *gpuFragmentationConf,
+) *api.TaskInfo {
+	if task.Pod == nil {
 		return nil
 	}
 	// node.Tasks holds node-local clones; the eviction path mutates the
 	// victim's status in place, so the session-side task must be returned
 	// or node resource accounting corrupts and the scheduler panics.
-	sessionTask, isRunning := running[sole.Pod.UID]
+	sessionTask, isRunning := running[task.Pod.UID]
 	if !isRunning {
 		return nil
 	}
-	if sole.Pod.Labels[conf.OptOutLabel] == "false" {
+	if task.Pod.Labels[conf.OptOutLabel] == "false" {
 		return nil
 	}
-	if sole.Pod.Annotations[doNotDisruptAnnotation] == "true" {
+	if task.Pod.Annotations[doNotDisruptAnnotation] == "true" {
 		return nil
 	}
 	priority := int32(0)
-	if sole.Pod.Spec.Priority != nil {
-		priority = *sole.Pod.Spec.Priority
+	if task.Pod.Spec.Priority != nil {
+		priority = *task.Pod.Spec.Priority
 	}
 	if priority > conf.MaxVictimPriority {
 		return nil
 	}
-	if metav1.GetControllerOf(sole.Pod) == nil {
+	if metav1.GetControllerOf(task.Pod) == nil {
 		return nil
 	}
-	if sole.Job == "" {
+	if task.Job == "" {
 		return nil
 	}
-	job, ok := jobs[sole.Job]
+	job, ok := jobs[task.Job]
 	if !ok || job.PodGroup == nil {
 		return nil
 	}
@@ -306,38 +337,88 @@ func movableSoleGpuTask(
 	return sessionTask
 }
 
-// findDestination proves at least one strictly fuller node in the pool can
-// host the task today. The replacement is not pinned there; binpack scoring
-// makes the fuller node the likely landing spot.
-func findDestination(
+type gpuFragmentationMove struct {
+	victim      *api.TaskInfo
+	destination string
+}
+
+// simulateDrain proves the whole victim set fits on other pool nodes today
+// via first-fit-decreasing placement over cloned idle capacity, so two
+// victims cannot both claim the same free GPU. Destinations must be at least
+// as full as the source (name-ordered on ties, so two equally-empty nodes
+// consolidate in one deterministic direction instead of swapping pods), and
+// are tried fullest-first. Returns nil unless every victim places; the
+// replacements are not pinned — binpack scoring makes the fuller nodes the
+// likely landing spots.
+func simulateDrain(
 	members []*api.NodeInfo,
 	source *api.NodeInfo,
-	victim *api.TaskInfo,
+	victims []*api.TaskInfo,
 	gpu v1.ResourceName,
 	predicate func(*api.TaskInfo, *api.NodeInfo) error,
-) *api.NodeInfo {
-	need := victim.InitResreq
-	if victim.Resreq.Get(gpu) > need.Get(gpu) {
-		need = victim.Resreq
+) []gpuFragmentationMove {
+	sourceUsed := source.Used.Get(gpu)
+	type candidate struct {
+		node *api.NodeInfo
+		idle *api.Resource
 	}
+	candidates := make([]candidate, 0, len(members))
 	for _, dest := range members {
 		if dest.Name == source.Name {
 			continue
 		}
-		if dest.Used.Get(gpu) <= source.Used.Get(gpu) {
+		destUsed := dest.Used.Get(gpu)
+		if destUsed < sourceUsed || (destUsed == sourceUsed && dest.Name < source.Name) {
 			continue
 		}
-		if !need.LessEqual(dest.Idle, api.Zero) {
-			continue
+		candidates = append(candidates, candidate{node: dest, idle: dest.Idle.Clone()})
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		ui, uj := candidates[i].node.Used.Get(gpu), candidates[j].node.Used.Get(gpu)
+		if ui != uj {
+			return ui > uj
 		}
-		if predicate != nil {
-			if err := predicate(victim, dest); err != nil {
+		return candidates[i].node.Name < candidates[j].node.Name
+	})
+
+	ordered := make([]*api.TaskInfo, len(victims))
+	copy(ordered, victims)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return taskGpuNeed(ordered[i], gpu).Get(gpu) > taskGpuNeed(ordered[j], gpu).Get(gpu)
+	})
+
+	moves := make([]gpuFragmentationMove, 0, len(ordered))
+placement:
+	for _, victim := range ordered {
+		need := taskGpuNeed(victim, gpu)
+		for i := range candidates {
+			if !need.LessEqual(candidates[i].idle, api.Zero) {
 				continue
 			}
+			if predicate != nil {
+				if err := predicate(victim, candidates[i].node); err != nil {
+					continue
+				}
+			}
+			candidates[i].idle.Sub(need)
+			moves = append(moves, gpuFragmentationMove{victim: victim, destination: candidates[i].node.Name})
+			continue placement
 		}
-		return dest
+		return nil
 	}
-	return nil
+	return moves
+}
+
+// taskGpuNeed picks the larger of the task's init and running resource
+// requests, keyed on the GPU dimension.
+func taskGpuNeed(task *api.TaskInfo, gpu v1.ResourceName) *api.Resource {
+	if task.Resreq.Get(gpu) > task.InitResreq.Get(gpu) {
+		return task.Resreq
+	}
+	return task.InitResreq
 }
 
 // stampGpuFragmentationMove durably records the move before eviction: the
