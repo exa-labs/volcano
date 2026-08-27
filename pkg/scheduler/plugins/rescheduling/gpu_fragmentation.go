@@ -172,7 +172,9 @@ func probeTask(task *api.TaskInfo) *api.TaskInfo {
 // the priority ceiling, controller-owned, not opted out or protected), the
 // pool's cooldown clock permits it, and a simulated first-fit-decreasing
 // placement fits all of them onto other pool nodes that are at least as full,
-// passing resources and predicates. Emptier nodes are drained first.
+// passing resources and predicates. Emptier nodes are drained first;
+// equally-empty nodes tie-break toward the one running lower-priority
+// victims, so the cheaper-to-disrupt workload is the one moved.
 func planGpuFragmentationMoves(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -228,11 +230,31 @@ func planGpuFragmentationMoves(
 		if !cooled {
 			continue
 		}
-		for _, source := range members {
-			victims := movableGpuTasks(source, jobs, running, conf, gpu)
+		type drainable struct {
+			source  *api.NodeInfo
+			victims []*api.TaskInfo
+		}
+		sources := make([]drainable, 0, len(members))
+		for _, member := range members {
+			victims := movableGpuTasks(member, jobs, running, conf, gpu)
 			if len(victims) == 0 {
 				continue
 			}
+			sources = append(sources, drainable{source: member, victims: victims})
+		}
+		sort.SliceStable(sources, func(i, j int) bool {
+			ui, uj := sources[i].source.Used.Get(gpu), sources[j].source.Used.Get(gpu)
+			if ui != uj {
+				return ui < uj
+			}
+			pi, pj := maxVictimPriority(sources[i].victims), maxVictimPriority(sources[j].victims)
+			if pi != pj {
+				return pi < pj
+			}
+			return sources[i].source.Name < sources[j].source.Name
+		})
+		for _, cand := range sources {
+			source, victims := cand.source, cand.victims
 			if conf.MaxVictims > 0 && len(plans)+len(victims) > conf.MaxVictims {
 				continue
 			}
@@ -337,6 +359,22 @@ func movableTask(
 	return sessionTask
 }
 
+// maxVictimPriority returns the highest pod priority in the victim set;
+// pods without an explicit priority count as 0.
+func maxVictimPriority(victims []*api.TaskInfo) int32 {
+	var max int32
+	for i, victim := range victims {
+		priority := int32(0)
+		if victim.Pod != nil && victim.Pod.Spec.Priority != nil {
+			priority = *victim.Pod.Spec.Priority
+		}
+		if i == 0 || priority > max {
+			max = priority
+		}
+	}
+	return max
+}
+
 type gpuFragmentationMove struct {
 	victim      *api.TaskInfo
 	destination string
@@ -345,8 +383,8 @@ type gpuFragmentationMove struct {
 // simulateDrain proves the whole victim set fits on other pool nodes today
 // via first-fit-decreasing placement over cloned idle capacity, so two
 // victims cannot both claim the same free GPU. Destinations must be at least
-// as full as the source (name-ordered on ties, so two equally-empty nodes
-// consolidate in one deterministic direction instead of swapping pods), and
+// as full as the source (equally-full nodes consolidate in one deterministic
+// direction — the planner's source ordering — instead of swapping pods), and
 // are tried fullest-first. Returns nil unless every victim places; the
 // replacements are not pinned — binpack scoring makes the fuller nodes the
 // likely landing spots.
@@ -367,8 +405,7 @@ func simulateDrain(
 		if dest.Name == source.Name {
 			continue
 		}
-		destUsed := dest.Used.Get(gpu)
-		if destUsed < sourceUsed || (destUsed == sourceUsed && dest.Name < source.Name) {
+		if dest.Used.Get(gpu) < sourceUsed {
 			continue
 		}
 		candidates = append(candidates, candidate{node: dest, idle: dest.Idle.Clone()})

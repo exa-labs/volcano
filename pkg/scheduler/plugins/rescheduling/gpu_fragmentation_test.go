@@ -360,6 +360,26 @@ func TestPlanConsolidatesEquallyEmptyNodes(t *testing.T) {
 	}
 }
 
+func TestPlanEqualUsageTieBreaksTowardLowerPriorityVictims(t *testing.T) {
+	f := newFixture(t)
+	nodeA := f.addNode(gpuNode("node-a", 4, nil))
+	nodeB := f.addNode(gpuNode("node-b", 4, nil))
+	podA := gpuPod("pod-a", "node-a", 1, eligible(), nil, true)
+	podB := gpuPod("pod-b", "node-b", 1, eligible(), nil, true)
+	low := int32(-100)
+	podB.Spec.Priority = &low
+	f.placePod(t, nodeA, podA, 1, "")
+	f.placePod(t, nodeB, podB, 1, "")
+
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %+v", plans)
+	}
+	if plans[0].source != "node-b" || plans[0].destination != "node-a" || plans[0].victim.Name != "pod-b" {
+		t.Fatalf("expected the lower-priority workload (node-b) to move, got %+v", plans[0])
+	}
+}
+
 func TestPlanSimulatedIdlePreventsDoubleBooking(t *testing.T) {
 	f := newFixture(t)
 	source := f.addNode(gpuNode("source", 8, nil))
