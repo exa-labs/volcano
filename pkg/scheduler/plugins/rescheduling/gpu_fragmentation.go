@@ -49,7 +49,7 @@ var DefaultGpuFragmentationConf = map[string]interface{}{
 	"poolLabel":         "karpenter.sh/nodepool",
 	"optOutLabel":       "exa.ai/repack-eligible",
 	"cooldownSeconds":   1800,
-	"maxVictims":        4,
+	"maxVictims":        8,
 	"maxVictimPriority": -1,
 }
 
