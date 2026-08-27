@@ -107,8 +107,29 @@ func (f *fixture) placePod(t *testing.T, node *api.NodeInfo, pod *v1.Pod, minMem
 	return task
 }
 
-func (f *fixture) plan(conf *gpuFragmentationConf, predicate func(*api.TaskInfo, *api.NodeInfo) error) []gpuFragmentationPlan {
-	return planGpuFragmentationMoves(f.nodes, f.jobs, f.running, conf, time.Now(), predicate)
+// plannedMove is the per-victim flattening of the planner's drain sets,
+// keeping assertions on individual moves straightforward.
+type plannedMove struct {
+	victim      *api.TaskInfo
+	pool        string
+	source      string
+	destination string
+}
+
+func (f *fixture) plan(conf *gpuFragmentationConf, predicate func(*api.TaskInfo, *api.NodeInfo) error) []plannedMove {
+	drains := planGpuFragmentationDrains(f.nodes, f.jobs, f.running, conf, time.Now(), predicate)
+	plans := make([]plannedMove, 0)
+	for _, drain := range drains {
+		for _, move := range drain.moves {
+			plans = append(plans, plannedMove{
+				victim:      move.victim,
+				pool:        drain.pool,
+				source:      drain.source,
+				destination: move.destination,
+			})
+		}
+	}
+	return plans
 }
 
 func eligible() map[string]string {
@@ -455,5 +476,51 @@ func TestProbeTaskUnbindsPod(t *testing.T) {
 	}
 	if pod.Spec.NodeName != "source" {
 		t.Fatalf("original pod mutated")
+	}
+}
+
+func TestPlanComparesFullnessAsFractionAcrossNodeSizes(t *testing.T) {
+	f := newFixture(t)
+	big := f.addNode(gpuNode("big", 8, nil))
+	small := f.addNode(gpuNode("small", 4, nil))
+	// big: 1/8 used (0.125) < small: 1/4 used (0.25) — the big node is the
+	// less-utilized one and must drain onto the small node, even though both
+	// use the same absolute GPU count.
+	f.placePod(t, big, gpuPod("victim", "big", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, small, gpuPod("resident", "small", 1, nil, nil, true), 1, "")
+
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 || plans[0].source != "big" || plans[0].destination != "small" {
+		t.Fatalf("expected fractional fullness to drain big onto small, got %+v", plans)
+	}
+}
+
+func TestNodeOrderPenalizesRecentlyDrainedSource(t *testing.T) {
+	conf := newGpuFragmentationConf()
+	orderFn := gpuFragmentationNodeOrderFn(conf)
+	task := api.NewTaskInfo(gpuPod("replacement", "", 1, nil, nil, true))
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	drained := gpuNode("drained", 8, map[string]string{drainSourceAnnotation: now})
+	destination := gpuNode("destination", 8, map[string]string{lastEvictionAnnotation: now})
+	expired := gpuNode("expired", 8, map[string]string{
+		drainSourceAnnotation: time.Now().Add(-2 * time.Duration(conf.CooldownSeconds) * time.Second).UTC().Format(time.RFC3339),
+	})
+
+	if score, _ := orderFn(task, drained); score != -drainedNodePenalty {
+		t.Fatalf("expected penalty on recently drained source, got %v", score)
+	}
+	if score, _ := orderFn(task, destination); score != 0 {
+		t.Fatalf("cooldown-only destination must not be penalized, got %v", score)
+	}
+	if score, _ := orderFn(task, expired); score != 0 {
+		t.Fatalf("expired drain stamp must not be penalized, got %v", score)
+	}
+
+	nonGpu := api.NewTaskInfo(util.BuildPod("default", "cpu-pod", "", v1.PodRunning, v1.ResourceList{
+		"cpu": *apiResource("1"),
+	}, "pg-cpu-pod", nil, nil))
+	if score, _ := orderFn(nonGpu, drained); score != 0 {
+		t.Fatalf("non-GPU pods must not be steered, got %v", score)
 	}
 }

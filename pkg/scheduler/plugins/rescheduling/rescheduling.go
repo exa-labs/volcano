@@ -17,6 +17,7 @@ limitations under the License.
 package rescheduling
 
 import (
+	"os"
 	"time"
 
 	"github.com/mitchellh/mapstructure"
@@ -93,6 +94,24 @@ func (rp *reschedulingPlugin) OnSessionOpen(ssn *framework.Session) {
 				break
 			}
 		}
+	}
+
+	// The drained-node penalty must run in every session (not just the
+	// rescheduling ones): replacements for evicted pods are scheduled in the
+	// sessions that follow a drain, and without it an equally-utilized
+	// drained node ties with the intended destination under binpack.
+	for _, strategy := range configs.strategies {
+		if strategy.Name != GpuFragmentationStrategy || os.Getenv(KillSwitchEnv) == "true" {
+			continue
+		}
+		conf := newGpuFragmentationConf()
+		if params, ok := RegisteredStrategyConfigs[GpuFragmentationStrategy].(map[string]interface{}); ok {
+			conf.parse(params)
+		}
+		if !conf.DryRun {
+			ssn.AddNodeOrderFn(rp.Name(), gpuFragmentationNodeOrderFn(conf))
+		}
+		break
 	}
 
 	if !timeToRun(configs.interval) {
