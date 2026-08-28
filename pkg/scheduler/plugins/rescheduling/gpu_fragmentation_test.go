@@ -107,8 +107,29 @@ func (f *fixture) placePod(t *testing.T, node *api.NodeInfo, pod *v1.Pod, minMem
 	return task
 }
 
-func (f *fixture) plan(conf *gpuFragmentationConf, predicate func(*api.TaskInfo, *api.NodeInfo) error) []gpuFragmentationPlan {
-	return planGpuFragmentationMoves(f.nodes, f.jobs, f.running, conf, time.Now(), predicate)
+// plannedMove is the per-victim flattening of the planner's drain sets,
+// keeping assertions on individual moves straightforward.
+type plannedMove struct {
+	victim      *api.TaskInfo
+	pool        string
+	source      string
+	destination string
+}
+
+func (f *fixture) plan(conf *gpuFragmentationConf, predicate func(*api.TaskInfo, *api.NodeInfo) error) []plannedMove {
+	drains := planGpuFragmentationDrains(f.nodes, f.jobs, f.running, conf, time.Now(), predicate)
+	plans := make([]plannedMove, 0)
+	for _, drain := range drains {
+		for _, move := range drain.moves {
+			plans = append(plans, plannedMove{
+				victim:      move.victim,
+				pool:        drain.pool,
+				source:      drain.source,
+				destination: move.destination,
+			})
+		}
+	}
+	return plans
 }
 
 func eligible() map[string]string {
@@ -312,16 +333,100 @@ func TestPlanRequiresStrictlyFullerDestinationWithRoom(t *testing.T) {
 	}
 }
 
-func TestPlanSkipsNodeWithSecondGpuPod(t *testing.T) {
+func TestPlanDrainsMultiPodNode(t *testing.T) {
+	f := newFixture(t)
+	source := f.addNode(gpuNode("source", 8, nil))
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	f.placePod(t, source, gpuPod("victim-a", "source", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, source, gpuPod("victim-b", "source", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, dest, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
+
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 2 {
+		t.Fatalf("expected 2 plans draining the node, got %+v", plans)
+	}
+	for _, plan := range plans {
+		if plan.source != "source" || plan.destination != "dest" {
+			t.Fatalf("unexpected plan: %+v", plan)
+		}
+	}
+}
+
+func TestPlanSkipsNodeWithImmovableGpuPod(t *testing.T) {
 	f := newFixture(t)
 	source := f.addNode(gpuNode("source", 8, nil))
 	dest := f.addNode(gpuNode("dest", 8, nil))
 	f.placePod(t, source, gpuPod("victim", "source", 1, eligible(), nil, true), 1, "")
-	f.placePod(t, source, gpuPod("neighbor", "source", 1, nil, nil, true), 1, "")
+	f.placePod(t, source, gpuPod("pinned", "source", 1, optedOut(), nil, true), 1, "")
 	f.placePod(t, dest, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
 
 	if plans := f.plan(newGpuFragmentationConf(), nil); len(plans) != 0 {
-		t.Fatalf("expected no plans with a second GPU pod on source, got %+v", plans)
+		t.Fatalf("expected no plans when a GPU pod on source is immovable, got %+v", plans)
+	}
+}
+
+func TestPlanConsolidatesEquallyEmptyNodes(t *testing.T) {
+	f := newFixture(t)
+	nodeA := f.addNode(gpuNode("node-a", 4, nil))
+	nodeB := f.addNode(gpuNode("node-b", 4, nil))
+	f.placePod(t, nodeA, gpuPod("pod-a", "node-a", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, nodeB, gpuPod("pod-b", "node-b", 1, eligible(), nil, true), 1, "")
+
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 consolidation plan, got %+v", plans)
+	}
+	if plans[0].source != "node-a" || plans[0].destination != "node-b" || plans[0].victim.Name != "pod-a" {
+		t.Fatalf("expected deterministic node-a -> node-b consolidation, got %+v", plans[0])
+	}
+}
+
+func TestPlanEqualUsageTieBreaksTowardLowerPriorityVictims(t *testing.T) {
+	f := newFixture(t)
+	nodeA := f.addNode(gpuNode("node-a", 4, nil))
+	nodeB := f.addNode(gpuNode("node-b", 4, nil))
+	podA := gpuPod("pod-a", "node-a", 1, eligible(), nil, true)
+	podB := gpuPod("pod-b", "node-b", 1, eligible(), nil, true)
+	low := int32(-100)
+	podB.Spec.Priority = &low
+	f.placePod(t, nodeA, podA, 1, "")
+	f.placePod(t, nodeB, podB, 1, "")
+
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 plan, got %+v", plans)
+	}
+	if plans[0].source != "node-b" || plans[0].destination != "node-a" || plans[0].victim.Name != "pod-b" {
+		t.Fatalf("expected the lower-priority workload (node-b) to move, got %+v", plans[0])
+	}
+}
+
+func TestPlanSimulatedIdlePreventsDoubleBooking(t *testing.T) {
+	f := newFixture(t)
+	source := f.addNode(gpuNode("source", 8, nil))
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	f.placePod(t, source, gpuPod("victim-a", "source", 2, eligible(), nil, true), 1, "")
+	f.placePod(t, source, gpuPod("victim-b", "source", 2, eligible(), nil, true), 1, "")
+	f.placePod(t, dest, gpuPod("resident", "dest", 5, nil, nil, true), 1, "")
+
+	// dest has 3 idle GPUs; both 2-GPU victims cannot fit, so no partial drain.
+	if plans := f.plan(newGpuFragmentationConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected no plans when the full set cannot place, got %+v", plans)
+	}
+}
+
+func TestPlanNodeMoveSetIsAtomicUnderVictimBudget(t *testing.T) {
+	f := newFixture(t)
+	source := f.addNode(gpuNode("source", 8, nil))
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	f.placePod(t, source, gpuPod("victim-a", "source", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, source, gpuPod("victim-b", "source", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, dest, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
+
+	conf := newGpuFragmentationConf()
+	conf.MaxVictims = 1
+	if plans := f.plan(conf, nil); len(plans) != 0 {
+		t.Fatalf("expected no plans when the set exceeds the budget, got %+v", plans)
 	}
 }
 
@@ -352,6 +457,7 @@ func TestPlanOneVictimAcrossPools(t *testing.T) {
 	}
 
 	conf := newGpuFragmentationConf()
+	conf.MaxVictims = 1
 	if plans := f.plan(conf, nil); len(plans) != 1 {
 		t.Fatalf("expected maxVictims=1 to cap plans, got %d", len(plans))
 	}
@@ -370,5 +476,51 @@ func TestProbeTaskUnbindsPod(t *testing.T) {
 	}
 	if pod.Spec.NodeName != "source" {
 		t.Fatalf("original pod mutated")
+	}
+}
+
+func TestPlanComparesFullnessAsFractionAcrossNodeSizes(t *testing.T) {
+	f := newFixture(t)
+	big := f.addNode(gpuNode("big", 8, nil))
+	small := f.addNode(gpuNode("small", 4, nil))
+	// big: 1/8 used (0.125) < small: 1/4 used (0.25) — the big node is the
+	// less-utilized one and must drain onto the small node, even though both
+	// use the same absolute GPU count.
+	f.placePod(t, big, gpuPod("victim", "big", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, small, gpuPod("resident", "small", 1, nil, nil, true), 1, "")
+
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 || plans[0].source != "big" || plans[0].destination != "small" {
+		t.Fatalf("expected fractional fullness to drain big onto small, got %+v", plans)
+	}
+}
+
+func TestNodeOrderPenalizesRecentlyDrainedSource(t *testing.T) {
+	conf := newGpuFragmentationConf()
+	orderFn := gpuFragmentationNodeOrderFn(conf)
+	task := api.NewTaskInfo(gpuPod("replacement", "", 1, nil, nil, true))
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	drained := gpuNode("drained", 8, map[string]string{drainSourceAnnotation: now})
+	destination := gpuNode("destination", 8, map[string]string{lastEvictionAnnotation: now})
+	expired := gpuNode("expired", 8, map[string]string{
+		drainSourceAnnotation: time.Now().Add(-2 * time.Duration(conf.CooldownSeconds) * time.Second).UTC().Format(time.RFC3339),
+	})
+
+	if score, _ := orderFn(task, drained); score != -drainedNodePenalty {
+		t.Fatalf("expected penalty on recently drained source, got %v", score)
+	}
+	if score, _ := orderFn(task, destination); score != 0 {
+		t.Fatalf("cooldown-only destination must not be penalized, got %v", score)
+	}
+	if score, _ := orderFn(task, expired); score != 0 {
+		t.Fatalf("expired drain stamp must not be penalized, got %v", score)
+	}
+
+	nonGpu := api.NewTaskInfo(util.BuildPod("default", "cpu-pod", "", v1.PodRunning, v1.ResourceList{
+		"cpu": *apiResource("1"),
+	}, "pg-cpu-pod", nil, nil))
+	if score, _ := orderFn(nonGpu, drained); score != 0 {
+		t.Fatalf("non-GPU pods must not be steered, got %v", score)
 	}
 }
