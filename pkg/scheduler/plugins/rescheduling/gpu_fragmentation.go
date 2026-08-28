@@ -115,6 +115,7 @@ var victimsFnForGpuFragmentation = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	if params, ok := RegisteredStrategyConfigs[GpuFragmentationStrategy].(map[string]interface{}); ok {
 		conf.parse(params)
 	}
+	gpuRepackPasses.Inc()
 
 	running := make(map[types.UID]*api.TaskInfo, len(tasks))
 	for _, task := range tasks {
@@ -154,6 +155,7 @@ var victimsFnForGpuFragmentation = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 		if conf.DryRun {
 			klog.V(2).Infof("gpuFragmentation[dry-run]: would drain %s (pool %s): %d pods, frees %v GPUs -> %v",
 				drain.source, drain.pool, len(drain.moves), drain.gain, drain.destinations())
+			drain.observe("dry_run", len(drain.moves))
 			continue
 		}
 		// The drain set is atomic in planning; keep execution as close to
@@ -162,20 +164,26 @@ var victimsFnForGpuFragmentation = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 		// when the clock cannot be recorded.
 		if err := stampGpuFragmentationNodes(drain); err != nil {
 			klog.Errorf("gpuFragmentation: skip drain of %s, failed to record cooldown: %v", drain.source, err)
+			gpuRepackStampFailures.WithLabelValues("source").Inc()
 			continue
 		}
 		klog.V(2).Infof("gpuFragmentation: draining %s (pool %s): %d pods, frees %v GPUs -> %v",
 			drain.source, drain.pool, len(drain.moves), drain.gain, drain.destinations())
+		evicted := 0
 		for _, move := range drain.moves {
 			if err := stampGpuFragmentationVictim(move.victim); err != nil {
 				klog.Errorf("gpuFragmentation: skip eviction of %s/%s, failed to record move: %v",
 					move.victim.Namespace, move.victim.Name, err)
+				gpuRepackStampFailures.WithLabelValues("victim").Inc()
 				continue
 			}
 			klog.V(2).Infof("gpuFragmentation: evicting %s/%s from %s (destination %s fits)",
 				move.victim.Namespace, move.victim.Name, drain.source, move.destination)
 			victims = append(victims, move.victim)
+			evicted++
 		}
+		drain.observe("live", evicted)
+		gpuRepackLastDrain.WithLabelValues(drain.pool).SetToCurrentTime()
 	}
 	return victims
 }
@@ -215,6 +223,14 @@ type gpuFragmentationDrain struct {
 	source string
 	moves  []gpuFragmentationMove
 	gain   float64
+}
+
+// observe records the drain in the strategy's Prometheus counters. gain is
+// in the scheduler's milli-units, so it is scaled back to whole GPUs.
+func (d gpuFragmentationDrain) observe(mode string, victims int) {
+	gpuRepackDrains.WithLabelValues(d.pool, mode).Inc()
+	gpuRepackVictims.WithLabelValues(d.pool, mode).Add(float64(victims))
+	gpuRepackGpusFreed.WithLabelValues(d.pool, mode).Add(d.gain / 1000)
 }
 
 func (d gpuFragmentationDrain) destinations() []string {
