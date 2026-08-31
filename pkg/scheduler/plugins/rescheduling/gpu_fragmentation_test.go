@@ -467,6 +467,57 @@ func TestPlanOneVictimAcrossPools(t *testing.T) {
 	}
 }
 
+func TestPlanCrossPoolConsolidatesAcrossPoolBoundary(t *testing.T) {
+	f := newFixture(t)
+	source := gpuNode("pool-a-source", 8, nil)
+	source.Node.Labels["karpenter.sh/nodepool"] = "pool-a"
+	dest := gpuNode("pool-b-dest", 8, nil)
+	dest.Node.Labels["karpenter.sh/nodepool"] = "pool-b"
+	f.addNode(source)
+	f.addNode(dest)
+	f.placePod(t, source, gpuPod("victim", source.Name, 1, eligible(), nil, true), 1, "")
+	f.placePod(t, dest, gpuPod("resident", dest.Name, 3, nil, nil, true), 1, "")
+
+	conf := newGpuFragmentationConf()
+	if plans := f.plan(conf, nil); len(plans) != 0 {
+		t.Fatalf("expected per-pool mode to block cross-pool move, got %d plans", len(plans))
+	}
+	conf.CrossPool = true
+	plans := f.plan(conf, nil)
+	if len(plans) != 1 {
+		t.Fatalf("expected 1 cross-pool plan, got %d", len(plans))
+	}
+	if plans[0].source != "pool-a-source" || plans[0].destination != "pool-b-dest" || plans[0].pool != crossPoolName {
+		t.Fatalf("unexpected plan: %+v", plans[0])
+	}
+}
+
+func TestPlanCrossPoolIncludesUnlabeledNodesAndRespectsPredicate(t *testing.T) {
+	f := newFixture(t)
+	source := gpuNode("labeled-source", 8, nil)
+	dest := gpuNode("unlabeled-dest", 8, nil)
+	delete(dest.Node.Labels, "karpenter.sh/nodepool")
+	f.addNode(source)
+	f.addNode(dest)
+	f.placePod(t, source, gpuPod("victim", source.Name, 1, eligible(), nil, true), 1, "")
+	f.placePod(t, dest, gpuPod("resident", dest.Name, 3, nil, nil, true), 1, "")
+
+	conf := newGpuFragmentationConf()
+	conf.CrossPool = true
+	plans := f.plan(conf, nil)
+	if len(plans) != 1 || plans[0].destination != "unlabeled-dest" {
+		t.Fatalf("expected drain onto unlabeled node, got %+v", plans)
+	}
+	// The workload's own node selection, surfaced through the predicate, is
+	// the only placement filter in cross-pool mode.
+	veto := func(task *api.TaskInfo, node *api.NodeInfo) error {
+		return fmt.Errorf("nodeSelector mismatch on %s", node.Name)
+	}
+	if plans := f.plan(conf, veto); len(plans) != 0 {
+		t.Fatalf("expected predicate veto to block cross-pool move, got %d plans", len(plans))
+	}
+}
+
 func TestProbeTaskUnbindsPod(t *testing.T) {
 	pod := gpuPod("victim", "source", 1, eligible(), nil, true)
 	task := api.NewTaskInfo(pod)
