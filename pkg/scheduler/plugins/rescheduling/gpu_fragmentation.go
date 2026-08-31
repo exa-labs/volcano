@@ -36,7 +36,10 @@ import (
 // GpuFragmentationStrategy drains at most one fragmented node per pool per
 // pass: every GPU pod on the node must be movable and provably fit, under a
 // simulated first-fit-decreasing placement, onto other nodes in the same pool
-// that are at least as (fractionally) full. Replacements are recreated by the
+// that are at least as (fractionally) full. With crossPool enabled the pool
+// boundary disappears: all GPU nodes form one candidate set and the workloads'
+// own node selection (evaluated through the session predicates) is the only
+// placement filter. Replacements are recreated by the
 // pods' controllers and scheduled normally; binpack scoring plus a penalty on
 // the recently drained source steer them to the fuller nodes. Cooldown and
 // per-PodGroup eviction caps are the anti-thrash mechanism.
@@ -48,6 +51,7 @@ var DefaultGpuFragmentationConf = map[string]interface{}{
 	"gpuResource":       "nvidia.com/gpu",
 	"poolLabel":         "karpenter.sh/nodepool",
 	"optOutLabel":       "exa.ai/repack-eligible",
+	"crossPool":         false,
 	"cooldownSeconds":   1800,
 	"maxVictims":        8,
 	"maxVictimPriority": -1,
@@ -69,13 +73,23 @@ const (
 	doNotDisruptAnnotation  = "karpenter.sh/do-not-disrupt"
 )
 
+// crossPoolName is the single group name (and metrics pool label) used when
+// crossPool merges every GPU node into one candidate set.
+const crossPoolName = "cross-pool"
+
 type gpuFragmentationConf struct {
 	DryRun      bool   `mapstructure:"dryRun"`
 	GpuResource string `mapstructure:"gpuResource"`
 	PoolLabel   string `mapstructure:"poolLabel"`
 	// OptOutLabel excludes a pod from repacking when set to "false".
-	OptOutLabel     string `mapstructure:"optOutLabel"`
-	CooldownSeconds int    `mapstructure:"cooldownSeconds"`
+	OptOutLabel string `mapstructure:"optOutLabel"`
+	// CrossPool widens consolidation to every GPU node in the cluster,
+	// including nodes without the pool label. Predicates (the workload's own
+	// nodeSelector, required affinity, taints) become the only placement
+	// filter, and the cooldown clock and one-drain-per-pass budget apply
+	// cluster-wide instead of per pool.
+	CrossPool       bool `mapstructure:"crossPool"`
+	CooldownSeconds int  `mapstructure:"cooldownSeconds"`
 	// MaxVictims caps total evictions per pass. A node's move set is atomic:
 	// it is only taken when the whole set fits in the remaining budget. The
 	// default of 8 covers the largest drainable set on an 8-GPU node: 7
@@ -253,7 +267,8 @@ func probeTask(task *api.TaskInfo) *api.TaskInfo {
 	return api.NewTaskInfo(pod)
 }
 
-// planGpuFragmentationDrains drains at most one node per pool, capped at
+// planGpuFragmentationDrains drains at most one node per pool (or one node
+// total when crossPool merges the cluster into a single group), capped at
 // conf.MaxVictims evictions overall. A node drains only when every GPU task
 // on it is movable (single-member PodGroup, unspent eviction cap, at or below
 // the priority ceiling, controller-owned, not opted out or protected), the
@@ -275,6 +290,10 @@ func planGpuFragmentationDrains(
 	pools := make(map[string][]*api.NodeInfo)
 	for _, node := range nodes {
 		if node.Node == nil || node.Allocatable.Get(gpu) <= 0 {
+			continue
+		}
+		if conf.CrossPool {
+			pools[crossPoolName] = append(pools[crossPoolName], node)
 			continue
 		}
 		pool, ok := node.Node.Labels[conf.PoolLabel]
