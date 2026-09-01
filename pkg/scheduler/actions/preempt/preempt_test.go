@@ -31,8 +31,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 
+	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/cmd/scheduler/app/options"
+	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
@@ -317,6 +319,10 @@ func TestPreempt(t *testing.T) {
 		})
 	}
 }
+
+// nominatedNodeCase runs allocate before preempt, as in production, so the
+// predicate cycle state exists when the nominated node is checked.
+const nominatedNodeCase = "task nominated to a node that passes predicates still preempts for its gang"
 
 func TestTopologyAwarePreempt(t *testing.T) {
 	plugins := map[string]framework.PluginBuilder{
@@ -655,6 +661,72 @@ func TestTopologyAwarePreempt(t *testing.T) {
 				"c1/pg3": {"n1"},
 			},
 		},
+		{
+			Name: nominatedNodeCase,
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg3", "c1", "q1", 2, map[string]int32{"": 2}, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			// preemptor1 carries a nominatedNodeName from an earlier cycle. The
+			// node passes predicates (they ignore resources) but is full, so the
+			// task must stay eligible or the gang never reaches minAvailable.
+			// n3 is tainted so neither task can use it; its idle capacity only
+			// keeps the queue from being overused so allocate considers the tasks
+			// and, as in production, leaves the predicate cycle state behind for
+			// preempt to consult.
+			Pods: []*v1.Pod{
+				util.BuildPodWithPriority("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("2", "2G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string), &lowPrio.Value),
+				util.BuildPodWithPriority("c1", "preemptee2", "n2", v1.PodRunning, api.BuildResourceList("2", "2G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string), &lowPrio.Value),
+				buildPodWithNominatedNode(util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("2", "2G"), "pg3", make(map[string]string), make(map[string]string)), "n1"),
+				util.BuildPod("c1", "preemptor2", "", v1.PodPending, api.BuildResourceList("2", "2G"), "pg3", make(map[string]string), make(map[string]string)),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), make(map[string]string)),
+				util.BuildNode("n2", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), make(map[string]string)),
+				buildTaintedNode(util.BuildNode("n3", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), make(map[string]string))),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, nil),
+			},
+			ExpectEvictNum: 2,
+			ExpectEvicted:  []string{"c1/preemptee1", "c1/preemptee2"},
+			ExpectPipeLined: map[string][]string{
+				"c1/pg3": {"n1", "n2"},
+			},
+		},
+		{
+			Name: "retry gang placement when the first task lands in a domain its siblings cannot join",
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue, "medium-priority"),
+				util.BuildPodGroupWithPrio("pg3", "c1", "q1", 2, map[string]int32{"worker": 2}, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			// The gang's tasks must share a zone. The cheapest victim is in zone a,
+			// which has a single node, so placing preemptor1 there strands
+			// preemptor2. The retry must move the whole gang to zone b and evict
+			// both medium-priority victims. The tasks share a task role so the
+			// predicate error cache is live and must not leak across attempts.
+			Pods: []*v1.Pod{
+				util.BuildPodWithPriority("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("2", "2G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string), &lowPrio.Value),
+				util.BuildPodWithPriority("c1", "preemptee2", "n2", v1.PodRunning, api.BuildResourceList("2", "2G"), "pg2", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string), &mediumPrio.Value),
+				util.BuildPodWithPriority("c1", "preemptee3", "n3", v1.PodRunning, api.BuildResourceList("2", "2G"), "pg2", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string), &mediumPrio.Value),
+				buildGangWorker("c1", "preemptor1", api.BuildResourceList("2", "2G"), "pg3", "zone"),
+				buildGangWorker("c1", "preemptor2", api.BuildResourceList("2", "2G"), "pg3", "zone"),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "a"}),
+				util.BuildNode("n2", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "b"}),
+				util.BuildNode("n3", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "b"}),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, nil),
+			},
+			ExpectEvictNum: 2,
+			ExpectEvicted:  []string{"c1/preemptee2", "c1/preemptee3"},
+			ExpectPipeLined: map[string][]string{
+				"c1/pg3": {"n2", "n3"},
+			},
+		},
 	}
 
 	trueValue := true
@@ -716,7 +788,11 @@ func TestTopologyAwarePreempt(t *testing.T) {
 					MaxCandidateNodesAbsoluteKey:        2,
 				}}})
 			defer test.Close()
-			test.Run(actions)
+			if test.Name == nominatedNodeCase {
+				test.Run([]framework.Action{allocate.New(), New()})
+			} else {
+				test.Run(actions)
+			}
 			if err := test.CheckAll(i); err != nil {
 				t.Fatal(err)
 			}
@@ -851,6 +927,41 @@ func TestSortNodesByGradientPrefersIdleFit(t *testing.T) {
 	if sorted[0].Name != "idle-fit" {
 		t.Fatalf("expected idle-fit node ordered before draining node, got %s first", sorted[0].Name)
 	}
+}
+
+// buildTaintedNode adds a NoSchedule taint no test pod tolerates.
+func buildTaintedNode(node *v1.Node) *v1.Node {
+	node.Spec.Taints = []v1.Taint{{Key: "reserved", Effect: v1.TaintEffectNoSchedule}}
+	return node
+}
+
+// buildPodWithNominatedNode stamps a nominatedNodeName as a prior scheduling
+// cycle's preemption would have.
+func buildPodWithNominatedNode(pod *v1.Pod, nodeName string) *v1.Pod {
+	pod.Status.NominatedNodeName = nodeName
+	return pod
+}
+
+// buildGangWorker builds a pending pod of a gang whose members must share the
+// topologyKey domain, expressed as a required pod affinity to the gang's own
+// label. All workers share the "worker" task role.
+func buildGangWorker(namespace, name string, req v1.ResourceList, groupName, topologyKey string) *v1.Pod {
+	gangLabels := map[string]string{"gang": groupName}
+	pod := util.BuildPod(namespace, name, "", v1.PodPending, req, groupName, gangLabels, make(map[string]string))
+	pod.Annotations[batchv1alpha1.TaskSpecKey] = "worker"
+	pod.Spec.Affinity = &v1.Affinity{
+		PodAffinity: &v1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []v1.PodAffinityTerm{
+				{
+					LabelSelector: &metav1.LabelSelector{
+						MatchLabels: gangLabels,
+					},
+					TopologyKey: topologyKey,
+				},
+			},
+		},
+	}
+	return pod
 }
 
 func buildPodWithPodAntiAffinity(name, namespace, node string, phase v1.PodPhase, req v1.ResourceList, groupName string, labels map[string]string, selector map[string]string, topologyKey string) *v1.Pod {

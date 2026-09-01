@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	k8sutil "k8s.io/kubernetes/pkg/scheduler/util"
@@ -63,6 +65,11 @@ const (
 	MinCandidateNodesPercentageKey = "minCandidateNodesPercentage"
 	MinCandidateNodesAbsoluteKey   = "minCandidateNodesAbsolute"
 	MaxCandidateNodesAbsoluteKey   = "maxCandidateNodesAbsolute"
+
+	// GangPlacementRetriesKey bounds how many times a starving job's preemption
+	// transaction is retried with the previously chosen nodes excluded when the
+	// job could not be pipelined as a whole. 0 disables retries.
+	GangPlacementRetriesKey = "gangPlacementRetries"
 )
 
 type Action struct {
@@ -78,6 +85,7 @@ type Action struct {
 	minCandidateNodesPercentage   int
 	minCandidateNodesAbsolute     int
 	maxCandidateNodesAbsolute     int
+	gangPlacementRetries          int
 }
 
 func New() *Action {
@@ -89,6 +97,7 @@ func New() *Action {
 		minCandidateNodesPercentage:      10,
 		minCandidateNodesAbsolute:        1,
 		maxCandidateNodesAbsolute:        100,
+		gangPlacementRetries:             2,
 	}
 }
 
@@ -107,6 +116,7 @@ func (pmpt *Action) parseArguments(ssn *framework.Session) {
 	arguments.GetInt(&pmpt.minCandidateNodesPercentage, MinCandidateNodesPercentageKey)
 	arguments.GetInt(&pmpt.minCandidateNodesAbsolute, MinCandidateNodesAbsoluteKey)
 	arguments.GetInt(&pmpt.maxCandidateNodesAbsolute, MaxCandidateNodesAbsoluteKey)
+	arguments.GetInt(&pmpt.gangPlacementRetries, GangPlacementRetriesKey)
 	pmpt.ssn = ssn
 }
 
@@ -157,13 +167,7 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 		}
 		preemptorsMap[job.Queue].Push(job)
 		underRequest = append(underRequest, job)
-		preemptorTasks[job.UID] = util.NewPriorityQueue(ssn.TaskOrderFn)
-		for _, task := range job.TaskStatusIndex[api.Pending] {
-			if task.SchGated {
-				continue
-			}
-			preemptorTasks[job.UID].Push(task)
-		}
+		preemptorTasks[job.UID] = pendingPreemptorTasks(ssn, job)
 	}
 
 	ph := util.NewPredicateHelper()
@@ -180,53 +184,9 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 
 			preemptorJob := preemptors.Pop().(*api.JobInfo)
 
-			stmt := framework.NewStatement(ssn)
-			var assigned bool
-			var err error
-			for {
-				// If job is not request more resource, then stop preempting.
-				if !ssn.JobStarving(preemptorJob) {
-					break
-				}
-
-				// If not preemptor tasks, next job.
-				if preemptorTasks[preemptorJob.UID].Empty() {
-					klog.V(3).Infof("No preemptor task in job <%s/%s>.",
-						preemptorJob.Namespace, preemptorJob.Name)
-					break
-				}
-
-				preemptor := preemptorTasks[preemptorJob.UID].Pop().(*api.TaskInfo)
-
-				assigned, err = pmpt.preempt(ssn, stmt, preemptor, func(task *api.TaskInfo) bool {
-					// Ignore non running task.
-					if !api.PreemptableStatus(task.Status) {
-						return false
-					}
-					// BestEffort pod is not supported to preempt unBestEffort pod.
-					if preemptor.BestEffort && !task.BestEffort {
-						return false
-					}
-					if !task.Preemptable {
-						return false
-					}
-					job, found := ssn.Jobs[task.Job]
-					if !found {
-						return false
-					}
-					// Preempt other jobs within queue
-					return job.Queue == preemptorJob.Queue && preemptor.Job != task.Job
-				}, ph)
-				if err != nil {
-					klog.V(3).Infof("Preemptor <%s/%s> failed to preempt Task , err: %s", preemptor.Namespace, preemptor.Name, err)
-				}
-			}
-
 			// Commit changes only if job is pipelined, otherwise try next job.
-			if ssn.JobPipelined(preemptorJob) {
-				stmt.Commit()
-			} else {
-				stmt.Discard()
+			assigned, committed := pmpt.preemptForJob(ssn, preemptorJob, preemptorTasks, ph)
+			if !committed {
 				continue
 			}
 
@@ -238,14 +198,7 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 		// Preemption between Task within Job.
 		for _, job := range underRequest {
 			// Fix: preemptor numbers lose when in same job
-			preemptorTasks[job.UID] = util.NewPriorityQueue(ssn.TaskOrderFn)
-			for _, task := range job.TaskStatusIndex[api.Pending] {
-				// Again, skip scheduling gated tasks
-				if task.SchGated {
-					continue
-				}
-				preemptorTasks[job.UID].Push(task)
-			}
+			preemptorTasks[job.UID] = pendingPreemptorTasks(ssn, job)
 			for {
 				if _, found := preemptorTasks[job.UID]; !found {
 					break
@@ -274,7 +227,7 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 
 					// Preempt tasks within job.
 					return preemptor.Job == task.Job
-				}, ph)
+				}, ph, nil)
 				if err != nil {
 					klog.V(3).Infof("Preemptor <%s/%s> failed to preempt Task , err: %s", preemptor.Namespace, preemptor.Name, err)
 				}
@@ -291,12 +244,140 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 
 func (pmpt *Action) UnInitialize() {}
 
+// pendingPreemptorTasks queues the job's pending, non-gated tasks in task order.
+func pendingPreemptorTasks(ssn *framework.Session, job *api.JobInfo) *util.PriorityQueue {
+	tasks := util.NewPriorityQueue(ssn.TaskOrderFn)
+	for _, task := range job.TaskStatusIndex[api.Pending] {
+		if task.SchGated {
+			continue
+		}
+		tasks.Push(task)
+	}
+	return tasks
+}
+
+// pipelinedNodes returns the nodes hosting the job's pipelined tasks, skipping
+// tasks listed in ignore (those pipelined by an earlier, committed statement).
+func pipelinedNodes(job *api.JobInfo, ignore sets.Set[api.TaskID]) sets.Set[string] {
+	nodes := sets.New[string]()
+	for uid, task := range job.TaskStatusIndex[api.Pipelined] {
+		if !ignore.Has(uid) {
+			nodes.Insert(task.NodeName)
+		}
+	}
+	return nodes
+}
+
+// preemptForJob runs preemption transactions for a starving job until one
+// leaves the job pipelined and is committed, or the retry budget is spent.
+//
+// Tasks are placed one at a time, so the node chosen for an early task can
+// leave later tasks with no candidate at all — e.g. a gang bound together by
+// a topology pod affinity whose first task lands in a domain that has no
+// other preemptable node. A single pass would discard the transaction every
+// session and the job would starve indefinitely while a viable placement
+// existed elsewhere. Each retry excludes the nodes the previous attempt
+// pipelined onto, steering the whole gang into a different region of the
+// cluster.
+//
+// Retries use a fresh predicate helper: its error cache is keyed by task
+// role, so failures recorded for one sibling under the abandoned placement
+// would otherwise be replayed against the others.
+//
+// Returns whether the last task attempt was assigned (the caller re-queues
+// the job to keep preempting for its remaining tasks) and whether the
+// transaction was committed.
+func (pmpt *Action) preemptForJob(
+	ssn *framework.Session,
+	job *api.JobInfo,
+	preemptorTasks map[api.JobID]*util.PriorityQueue,
+	predicateHelper util.PredicateHelper,
+) (assigned, committed bool) {
+	committedTasks := sets.KeySet(job.TaskStatusIndex[api.Pipelined])
+	excludedNodes := sets.New[string]()
+	for attempt := 0; ; attempt++ {
+		stmt := framework.NewStatement(ssn)
+		assigned = pmpt.preemptJobTasks(ssn, stmt, job, preemptorTasks[job.UID], predicateHelper, excludedNodes)
+		if ssn.JobPipelined(job) {
+			stmt.Commit()
+			return assigned, true
+		}
+
+		chosen := pipelinedNodes(job, committedTasks)
+		stmt.Discard()
+
+		if attempt >= pmpt.gangPlacementRetries || chosen.Len() == 0 {
+			return false, false
+		}
+
+		klog.V(3).Infof("Job <%s/%s> not pipelined after placing tasks on %v, retrying preemption without those nodes",
+			job.Namespace, job.Name, sets.List(chosen))
+		excludedNodes = excludedNodes.Union(chosen)
+		predicateHelper = util.NewPredicateHelper()
+		preemptorTasks[job.UID] = pendingPreemptorTasks(ssn, job)
+	}
+}
+
+// preemptJobTasks preempts for the job's queued tasks in order within a single
+// statement, stopping once the job is no longer starving or no tasks remain.
+// Returns whether the last attempted task was assigned.
+func (pmpt *Action) preemptJobTasks(
+	ssn *framework.Session,
+	stmt *framework.Statement,
+	job *api.JobInfo,
+	tasks *util.PriorityQueue,
+	predicateHelper util.PredicateHelper,
+	excludedNodes sets.Set[string],
+) bool {
+	var assigned bool
+	for {
+		// If job is not request more resource, then stop preempting.
+		if !ssn.JobStarving(job) {
+			break
+		}
+
+		// If not preemptor tasks, next job.
+		if tasks.Empty() {
+			klog.V(3).Infof("No preemptor task in job <%s/%s>.", job.Namespace, job.Name)
+			break
+		}
+
+		preemptor := tasks.Pop().(*api.TaskInfo)
+
+		var err error
+		assigned, err = pmpt.preempt(ssn, stmt, preemptor, func(task *api.TaskInfo) bool {
+			// Ignore non running task.
+			if !api.PreemptableStatus(task.Status) {
+				return false
+			}
+			// BestEffort pod is not supported to preempt unBestEffort pod.
+			if preemptor.BestEffort && !task.BestEffort {
+				return false
+			}
+			if !task.Preemptable {
+				return false
+			}
+			victimJob, found := ssn.Jobs[task.Job]
+			if !found {
+				return false
+			}
+			// Preempt other jobs within queue
+			return victimJob.Queue == job.Queue && preemptor.Job != task.Job
+		}, predicateHelper, excludedNodes)
+		if err != nil {
+			klog.V(3).Infof("Preemptor <%s/%s> failed to preempt Task , err: %s", preemptor.Namespace, preemptor.Name, err)
+		}
+	}
+	return assigned
+}
+
 func (pmpt *Action) preempt(
 	ssn *framework.Session,
 	stmt *framework.Statement,
 	preemptor *api.TaskInfo,
 	filter func(*api.TaskInfo) bool,
 	predicateHelper util.PredicateHelper,
+	excludedNodes sets.Set[string],
 ) (bool, error) {
 	// Check whether the task is eligible to preempt others, e.g., check preemptionPolicy is `Never` or not
 	if err := pmpt.taskEligibleToPreempt(preemptor); err != nil {
@@ -309,6 +390,12 @@ func (pmpt *Action) preempt(
 
 	// we should filter out those nodes that are UnschedulableAndUnresolvable status got in allocate action
 	allNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(preemptor)
+	if excludedNodes.Len() > 0 {
+		// Retrying a gang placement: allocate recorded those statuses against
+		// the sibling placement now being abandoned (e.g. pod affinity to a
+		// sibling that was pipelined elsewhere), so consider every node again.
+		allNodes = ssn.NodeList
+	}
 	predicateNodes, fitErrors := predicateHelper.PredicateNodes(preemptor, allNodes, ssn.PredicateForPreemptAction, pmpt.enablePredicateErrorCache, ssn.NodesInShard)
 
 	// When predicate filtering returns no candidates the cluster is effectively
@@ -325,6 +412,12 @@ func (pmpt *Action) preempt(
 				predicateNodes = append(predicateNodes, n)
 			}
 		}
+	}
+
+	if excludedNodes.Len() > 0 {
+		predicateNodes = slices.DeleteFunc(slices.Clone(predicateNodes), func(n *api.NodeInfo) bool {
+			return excludedNodes.Has(n.Name)
+		})
 	}
 
 	candidateNodes := util.GetPredicatedNodeByShard(predicateNodes, ssn.NodesInShard)
@@ -452,20 +545,20 @@ func (pmpt *Action) taskEligibleToPreempt(preemptor *api.TaskInfo) error {
 			return fmt.Errorf("not eligible due to the pod's nominated node is not found in the session")
 		}
 
-		err := pmpt.ssn.PredicateFn(preemptor, nodeInfo)
-		if err == nil {
-			return fmt.Errorf("not eligible due to the pod's nominated node is already schedulable, which should not happen as preemption means no node is schedulable")
-		}
+		// Predicates ignore resource fit, so a passing nominated node does not
+		// mean the task can run there; that is allocate's call. Preempt stays
+		// eligible so the task can join its gang siblings' transaction.
+		if err := pmpt.ssn.PredicateFn(preemptor, nodeInfo); err != nil {
+			fitError, ok := err.(*api.FitError)
+			if !ok {
+				return fmt.Errorf("not eligible due to the predicate returned a non-FitError error, the error is: %v", err)
+			}
 
-		fitError, ok := err.(*api.FitError)
-		if !ok {
-			return fmt.Errorf("not eligible due to the predicate returned a non-FitError error, the error is: %v", err)
-		}
-
-		// If the pod's nominated node is considered as UnschedulableAndUnresolvable by the predicate,
-		// then the pod should be considered for preempting again.
-		if fitError.Status.ContainsUnschedulableAndUnresolvable() {
-			return nil
+			// If the pod's nominated node is considered as UnschedulableAndUnresolvable by the predicate,
+			// then the pod should be considered for preempting again.
+			if fitError.Status.ContainsUnschedulableAndUnresolvable() {
+				return nil
+			}
 		}
 
 		preemptorPodPriority := PodPriority(preemptor.Pod)
