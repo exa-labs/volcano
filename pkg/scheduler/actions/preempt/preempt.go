@@ -170,7 +170,10 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 		preemptorTasks[job.UID] = pendingPreemptorTasks(ssn, job)
 	}
 
-	ph := util.NewPredicateHelper()
+	// The predicate error cache is keyed by task role within a job, so helpers
+	// are held per job: sharing one across jobs buys nothing, and a job's
+	// helper is replaced when a placement attempt is abandoned.
+	predicateHelpers := map[api.JobID]util.PredicateHelper{}
 	// Preemption between Jobs within Queue.
 	for _, queue := range queues {
 		for {
@@ -185,7 +188,7 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 			preemptorJob := preemptors.Pop().(*api.JobInfo)
 
 			// Commit changes only if job is pipelined, otherwise try next job.
-			assigned, committed := pmpt.preemptForJob(ssn, preemptorJob, preemptorTasks, ph)
+			assigned, committed := pmpt.preemptForJob(ssn, preemptorJob, preemptorTasks, predicateHelpers)
 			if !committed {
 				continue
 			}
@@ -227,7 +230,7 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 
 					// Preempt tasks within job.
 					return preemptor.Job == task.Job
-				}, ph, nil)
+				}, jobPredicateHelper(predicateHelpers, job.UID), nil)
 				if err != nil {
 					klog.V(3).Infof("Preemptor <%s/%s> failed to preempt Task , err: %s", preemptor.Namespace, preemptor.Name, err)
 				}
@@ -256,6 +259,16 @@ func pendingPreemptorTasks(ssn *framework.Session, job *api.JobInfo) *util.Prior
 	return tasks
 }
 
+// jobPredicateHelper returns the job's predicate helper, creating it on first use.
+func jobPredicateHelper(helpers map[api.JobID]util.PredicateHelper, jobID api.JobID) util.PredicateHelper {
+	if helper, found := helpers[jobID]; found {
+		return helper
+	}
+	helper := util.NewPredicateHelper()
+	helpers[jobID] = helper
+	return helper
+}
+
 // pipelinedNodes returns the nodes hosting the job's pipelined tasks, skipping
 // tasks listed in ignore (those pipelined by an earlier, committed statement).
 func pipelinedNodes(job *api.JobInfo, ignore sets.Set[api.TaskID]) sets.Set[string] {
@@ -280,9 +293,10 @@ func pipelinedNodes(job *api.JobInfo, ignore sets.Set[api.TaskID]) sets.Set[stri
 // pipelined onto, steering the whole gang into a different region of the
 // cluster.
 //
-// Retries use a fresh predicate helper: its error cache is keyed by task
-// role, so failures recorded for one sibling under the abandoned placement
-// would otherwise be replayed against the others.
+// Each retry replaces the job's predicate helper: its error cache is keyed
+// by task role, so failures recorded for one sibling under the abandoned
+// placement would otherwise be replayed against the others — in this attempt
+// and in every later use of the helper for this job.
 //
 // Returns whether the last task attempt was assigned (the caller re-queues
 // the job to keep preempting for its remaining tasks) and whether the
@@ -291,13 +305,13 @@ func (pmpt *Action) preemptForJob(
 	ssn *framework.Session,
 	job *api.JobInfo,
 	preemptorTasks map[api.JobID]*util.PriorityQueue,
-	predicateHelper util.PredicateHelper,
+	predicateHelpers map[api.JobID]util.PredicateHelper,
 ) (assigned, committed bool) {
 	committedTasks := sets.KeySet(job.TaskStatusIndex[api.Pipelined])
 	excludedNodes := sets.New[string]()
 	for attempt := 0; ; attempt++ {
 		stmt := framework.NewStatement(ssn)
-		assigned = pmpt.preemptJobTasks(ssn, stmt, job, preemptorTasks[job.UID], predicateHelper, excludedNodes)
+		assigned = pmpt.preemptJobTasks(ssn, stmt, job, preemptorTasks[job.UID], jobPredicateHelper(predicateHelpers, job.UID), excludedNodes)
 		if ssn.JobPipelined(job) {
 			stmt.Commit()
 			return assigned, true
@@ -313,8 +327,19 @@ func (pmpt *Action) preemptForJob(
 		klog.V(3).Infof("Job <%s/%s> not pipelined after placing tasks on %v, retrying preemption without those nodes",
 			job.Namespace, job.Name, sets.List(chosen))
 		excludedNodes = excludedNodes.Union(chosen)
-		predicateHelper = util.NewPredicateHelper()
+		predicateHelpers[job.UID] = util.NewPredicateHelper()
 		preemptorTasks[job.UID] = pendingPreemptorTasks(ssn, job)
+		clearLastTxContexts(job)
+	}
+}
+
+// clearLastTxContexts drops the transaction context Discard left on the job's
+// pending tasks, so the scheduling reason and nominated node published at
+// session close describe the final attempt alone rather than a mix of
+// placements from abandoned ones.
+func clearLastTxContexts(job *api.JobInfo) {
+	for _, task := range job.TaskStatusIndex[api.Pending] {
+		task.ClearLastTxContext()
 	}
 }
 
@@ -379,22 +404,25 @@ func (pmpt *Action) preempt(
 	predicateHelper util.PredicateHelper,
 	excludedNodes sets.Set[string],
 ) (bool, error) {
+	// Eligibility predicates the nominated node, which needs the task's cycle state.
+	if err := ssn.PrePredicateFn(preemptor); err != nil {
+		return false, fmt.Errorf("PrePredicate for task %s/%s failed for: %v", preemptor.Namespace, preemptor.Name, err)
+	}
+
 	// Check whether the task is eligible to preempt others, e.g., check preemptionPolicy is `Never` or not
 	if err := pmpt.taskEligibleToPreempt(preemptor); err != nil {
 		return false, err
 	}
 
-	if err := ssn.PrePredicateFn(preemptor); err != nil {
-		return false, fmt.Errorf("PrePredicate for task %s/%s failed for: %v", preemptor.Namespace, preemptor.Name, err)
-	}
-
 	// we should filter out those nodes that are UnschedulableAndUnresolvable status got in allocate action
 	allNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(preemptor)
 	if excludedNodes.Len() > 0 {
-		// Retrying a gang placement: allocate recorded those statuses against
-		// the sibling placement now being abandoned (e.g. pod affinity to a
-		// sibling that was pipelined elsewhere), so consider every node again.
-		allNodes = ssn.NodeList
+		// Drop the nodes abandoned gang placement attempts chose before
+		// PredicateNodes samples its candidates, so the exclusion cannot
+		// shrink an already truncated sample.
+		allNodes = slices.DeleteFunc(slices.Clone(allNodes), func(n *api.NodeInfo) bool {
+			return excludedNodes.Has(n.Name)
+		})
 	}
 	predicateNodes, fitErrors := predicateHelper.PredicateNodes(preemptor, allNodes, ssn.PredicateForPreemptAction, pmpt.enablePredicateErrorCache, ssn.NodesInShard)
 
@@ -412,12 +440,6 @@ func (pmpt *Action) preempt(
 				predicateNodes = append(predicateNodes, n)
 			}
 		}
-	}
-
-	if excludedNodes.Len() > 0 {
-		predicateNodes = slices.DeleteFunc(slices.Clone(predicateNodes), func(n *api.NodeInfo) bool {
-			return excludedNodes.Has(n.Name)
-		})
 	}
 
 	candidateNodes := util.GetPredicatedNodeByShard(predicateNodes, ssn.NodesInShard)
@@ -545,9 +567,12 @@ func (pmpt *Action) taskEligibleToPreempt(preemptor *api.TaskInfo) error {
 			return fmt.Errorf("not eligible due to the pod's nominated node is not found in the session")
 		}
 
-		// Predicates ignore resource fit, so a passing nominated node does not
-		// mean the task can run there; that is allocate's call. Preempt stays
-		// eligible so the task can join its gang siblings' transaction.
+		// Diverges from upstream, which rejects the task when its nominated
+		// node passes predicates. Predicates ignore resource fit, so a passing
+		// nominated node does not mean the task can run there; that is
+		// allocate's call. Preempt stays eligible so the task can join its
+		// gang siblings' transaction (pipelineOnFittingNode keeps it from
+		// evicting anyone if the node really does fit).
 		if err := pmpt.ssn.PredicateFn(preemptor, nodeInfo); err != nil {
 			fitError, ok := err.(*api.FitError)
 			if !ok {
