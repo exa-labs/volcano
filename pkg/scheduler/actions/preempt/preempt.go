@@ -321,6 +321,9 @@ func (pmpt *Action) preemptForJob(
 		stmt.Discard()
 
 		if attempt >= pmpt.gangPlacementRetries || chosen.Len() == 0 {
+			if attempt > 0 {
+				clearLastTxContexts(job)
+			}
 			return false, false
 		}
 
@@ -329,14 +332,14 @@ func (pmpt *Action) preemptForJob(
 		excludedNodes = excludedNodes.Union(chosen)
 		predicateHelpers[job.UID] = util.NewPredicateHelper()
 		preemptorTasks[job.UID] = pendingPreemptorTasks(ssn, job)
-		clearLastTxContexts(job)
 	}
 }
 
 // clearLastTxContexts drops the transaction context Discard left on the job's
-// pending tasks, so the scheduling reason and nominated node published at
-// session close describe the final attempt alone rather than a mix of
-// placements from abandoned ones.
+// pending tasks. After a retried placement fails for good, that context is
+// the last attempt's, made with the better nodes excluded; publishing it as
+// the tasks' scheduling reason and nominated node would steer allocate's
+// next session toward the worst placement tried.
 func clearLastTxContexts(job *api.JobInfo) {
 	for _, task := range job.TaskStatusIndex[api.Pending] {
 		task.ClearLastTxContext()
