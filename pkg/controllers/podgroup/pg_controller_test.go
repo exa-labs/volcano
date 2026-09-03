@@ -1706,3 +1706,151 @@ func TestAddPodGroup_NonGangOwnerProducesDistinctPodGroups(t *testing.T) {
 		}
 	}
 }
+
+// scaleFromZeroFixture builds a volcano-scheduled ReplicaSet at the given
+// replica count plus one pod it controls, mirroring a Deployment being scaled
+// 0 -> 1. The pod is registered in both the fake API server and the pod
+// informer cache; the ReplicaSet only in the API server.
+func scaleFromZeroFixture(t *testing.T, c *pgcontroller, replicas int32) (*appsv1.ReplicaSet, *v1.Pod) {
+	t.Helper()
+	namespace := "test"
+	rsUID := types.UID("rs-scale-from-zero")
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "verify-canary",
+			Namespace: namespace,
+			UID:       rsUID,
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: ptr.To(replicas),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "verify-canary"}},
+			Template: v1.PodTemplateSpec{Spec: v1.PodSpec{SchedulerName: "volcano"}},
+		},
+	}
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "verify-canary-abc12",
+			Namespace: namespace,
+			Labels:    map[string]string{"app": "verify-canary"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       rs.Name,
+				UID:        rsUID,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: v1.PodSpec{SchedulerName: "volcano"},
+	}
+	_, err := c.kubeClient.AppsV1().ReplicaSets(namespace).Create(context.TODO(), rs, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	_, err = c.kubeClient.CoreV1().Pods(namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	assert.NoError(t, c.podInformer.Informer().GetIndexer().Add(pod))
+	return rs, pod
+}
+
+// A ReplicaSet update carrying spec.replicas == 0 that is delivered after the
+// pod (and its PodGroup) already exist must not delete the PodGroup: the pod
+// would keep its group-name annotation and never be scheduled.
+func TestAddReplicaSet_StaleZeroReplicasKeepsPodGroupWhilePodsExist(t *testing.T) {
+	c := newFakeController()
+	rs, pod := scaleFromZeroFixture(t, c, 1)
+	pgName := generatePodGroupName(pod)
+
+	c.addPod(pod)
+	c.processNextReq()
+	_, err := c.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+	assert.NoError(t, err, "addPod should create the PodGroup")
+
+	stale := rs.DeepCopy()
+	stale.Spec.Replicas = ptr.To[int32](0)
+	c.updateReplicaSet(rs, stale)
+
+	_, err = c.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+	assert.NoError(t, err, "stale spec.replicas == 0 event must not delete the PodGroup of a live pod")
+}
+
+// Once no pods remain, spec.replicas == 0 still tears the PodGroup down.
+func TestAddReplicaSet_ZeroReplicasDeletesPodGroupWhenNoPodsRemain(t *testing.T) {
+	c := newFakeController()
+	rs, pod := scaleFromZeroFixture(t, c, 1)
+	pgName := generatePodGroupName(pod)
+
+	c.addPod(pod)
+	c.processNextReq()
+
+	assert.NoError(t, c.kubeClient.CoreV1().Pods(rs.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{}))
+	scaledDown := rs.DeepCopy()
+	scaledDown.Spec.Replicas = ptr.To[int32](0)
+	c.updateReplicaSet(rs, scaledDown)
+
+	_, err := c.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+	assert.True(t, apierrors.IsNotFound(err), "PodGroup should be deleted once the ReplicaSet has no pods, got %v", err)
+}
+
+// Terminating pods do not hold the PodGroup: a genuine scale-down whose pods
+// are still draining behaves as before.
+func TestAddReplicaSet_ZeroReplicasIgnoresTerminatingPods(t *testing.T) {
+	c := newFakeController()
+	rs, pod := scaleFromZeroFixture(t, c, 1)
+	pgName := generatePodGroupName(pod)
+
+	c.addPod(pod)
+	c.processNextReq()
+
+	terminating, err := c.kubeClient.CoreV1().Pods(rs.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	terminating.DeletionTimestamp = ptr.To(metav1.Now())
+	_, err = c.kubeClient.CoreV1().Pods(rs.Namespace).Update(context.TODO(), terminating, metav1.UpdateOptions{})
+	assert.NoError(t, err)
+
+	scaledDown := rs.DeepCopy()
+	scaledDown.Spec.Replicas = ptr.To[int32](0)
+	c.updateReplicaSet(rs, scaledDown)
+
+	_, err = c.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+	assert.True(t, apierrors.IsNotFound(err), "PodGroup should be deleted when the only remaining pods are terminating, got %v", err)
+}
+
+// A pod annotated with the controller-derived PodGroup name whose PodGroup is
+// gone gets it recreated on the next ReplicaSet event, so a pod stranded by an
+// earlier deletion becomes schedulable again.
+func TestAddReplicaSet_RecreatesMissingPodGroupForAnnotatedPod(t *testing.T) {
+	c := newFakeController()
+	rs, pod := scaleFromZeroFixture(t, c, 1)
+	pgName := generatePodGroupName(pod)
+
+	c.addPod(pod)
+	c.processNextReq()
+	assert.NoError(t, c.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Delete(context.TODO(), pgName, metav1.DeleteOptions{}))
+
+	annotated, err := c.kubeClient.CoreV1().Pods(rs.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, pgName, annotated.Annotations[scheduling.KubeGroupNameAnnotationKey], "pod keeps the group-name annotation after the PodGroup is deleted")
+
+	c.updateReplicaSet(rs, rs)
+
+	recreated, err := c.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+	assert.NoError(t, err, "missing PodGroup should be recreated for the annotated pod")
+	assert.Equal(t, int32(1), recreated.Spec.MinMember)
+}
+
+// A pod annotated with a PodGroup name this controller does not own (e.g. one
+// created by LeaderWorkerSet) is left alone even when that PodGroup is absent.
+func TestAddReplicaSet_LeavesForeignPodGroupAnnotationAlone(t *testing.T) {
+	c := newFakeController()
+	rs, pod := scaleFromZeroFixture(t, c, 1)
+
+	foreign, err := c.kubeClient.CoreV1().Pods(rs.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+	assert.NoError(t, err)
+	foreign.Annotations = map[string]string{scheduling.KubeGroupNameAnnotationKey: "lws-managed-pg"}
+	_, err = c.kubeClient.CoreV1().Pods(rs.Namespace).Update(context.TODO(), foreign, metav1.UpdateOptions{})
+	assert.NoError(t, err)
+
+	c.updateReplicaSet(rs, rs)
+
+	pgList, err := c.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).List(context.TODO(), metav1.ListOptions{})
+	assert.NoError(t, err)
+	assert.Empty(t, pgList.Items, "no PodGroup should be created for a foreign group-name annotation")
+}
