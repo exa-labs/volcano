@@ -448,6 +448,7 @@ func (pp *PredicatesPlugin) InitPlugin() {
 			nodeAffinityFilter := plugin.(*nodeaffinity.NodeAffinity)
 			filterPlugins[nodeaffinity.Name] = nodeAffinityFilter
 			stableFilterPlugins[nodeaffinity.Name] = nodeAffinityFilter
+			prefilterPlugins[nodeaffinity.Name] = nodeAffinityFilter
 		} else {
 			klog.Errorf("Failed to init %s plugin %v", nodeaffinity.Name, err)
 		}
