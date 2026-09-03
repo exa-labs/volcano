@@ -29,9 +29,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	kubeclient "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/ptr"
 
@@ -1704,5 +1706,201 @@ func TestAddPodGroup_NonGangOwnerProducesDistinctPodGroups(t *testing.T) {
 		if pg.Name == workflowPGName {
 			t.Errorf("pg %q was keyed on the FlyteWorkflow UID; per-pod keying expected", pg.Name)
 		}
+	}
+}
+
+// TestAddReplicaSet_ZeroReplicasOnlyDeletesPodGroupWithoutActivePods covers
+// the stale replicas=0 event a Deployment's new ReplicaSet always emits: the
+// PodGroup must survive while the ReplicaSet still owns an active pod and must
+// still be deleted once the pods are gone, terminating, or terminal.
+func TestAddReplicaSet_ZeroReplicasOnlyDeletesPodGroupWithoutActivePods(t *testing.T) {
+	namespace := "test"
+	rsUID := types.UID("9e0857f9-0000-0000-0000-000000000001")
+	pgName := "podgroup-" + string(rsUID)
+	labels := map[string]string{"app": "verify"}
+	now := metav1.Now()
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "verify-7d48f9c794", Namespace: namespace, UID: rsUID},
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: ptr.To[int32](0),
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+		},
+	}
+	ownedPod := func(name string, mutate func(*v1.Pod)) *v1.Pod {
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				UID:       types.UID("pod-" + name),
+				Labels:    labels,
+				OwnerReferences: []metav1.OwnerReference{
+					*metav1.NewControllerRef(rs, appsv1.SchemeGroupVersion.WithKind("ReplicaSet")),
+				},
+			},
+			Status: v1.PodStatus{Phase: v1.PodPending},
+		}
+		if mutate != nil {
+			mutate(pod)
+		}
+		return pod
+	}
+
+	testCases := []struct {
+		name          string
+		pods          []*v1.Pod
+		expectDeleted bool
+	}{
+		{
+			name:          "no pods: stale or genuine scale-down, delete",
+			expectDeleted: true,
+		},
+		{
+			name:          "pending pod already bound to the PodGroup: keep",
+			pods:          []*v1.Pod{ownedPod("verify-pps5w", nil)},
+			expectDeleted: false,
+		},
+		{
+			name: "running pod: keep",
+			pods: []*v1.Pod{ownedPod("verify-running", func(p *v1.Pod) {
+				p.Status.Phase = v1.PodRunning
+			})},
+			expectDeleted: false,
+		},
+		{
+			name: "only a terminating pod: scale-down in progress, delete",
+			pods: []*v1.Pod{ownedPod("verify-terminating", func(p *v1.Pod) {
+				p.DeletionTimestamp = &now
+			})},
+			expectDeleted: true,
+		},
+		{
+			name: "only terminal pods: delete",
+			pods: []*v1.Pod{
+				ownedPod("verify-succeeded", func(p *v1.Pod) { p.Status.Phase = v1.PodSucceeded }),
+				ownedPod("verify-failed", func(p *v1.Pod) { p.Status.Phase = v1.PodFailed }),
+			},
+			expectDeleted: true,
+		},
+		{
+			name: "pod matching the selector but controlled by another ReplicaSet: delete",
+			pods: []*v1.Pod{ownedPod("verify-other", func(p *v1.Pod) {
+				p.OwnerReferences[0].UID = types.UID("other-rs")
+				p.OwnerReferences[0].Name = "verify-other"
+			})},
+			expectDeleted: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newFakeController()
+			existing := &scheduling.PodGroup{ObjectMeta: metav1.ObjectMeta{Name: pgName, Namespace: namespace}}
+			if _, err := c.vcClient.SchedulingV1beta1().PodGroups(namespace).Create(context.TODO(), existing, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("failed to create podgroup: %v", err)
+			}
+			for _, pod := range tc.pods {
+				if err := c.podInformer.Informer().GetIndexer().Add(pod); err != nil {
+					t.Fatalf("failed to seed pod %s: %v", pod.Name, err)
+				}
+			}
+
+			c.addReplicaSet(rs)
+
+			_, err := c.vcClient.SchedulingV1beta1().PodGroups(namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+			deleted := apierrors.IsNotFound(err)
+			if err != nil && !deleted {
+				t.Fatalf("unexpected error getting podgroup: %v", err)
+			}
+			if deleted != tc.expectDeleted {
+				t.Errorf("expected deleted=%v, got deleted=%v", tc.expectDeleted, deleted)
+			}
+		})
+	}
+}
+
+// TestCreateNormalPodPGIfNotExist_RecreatesPodGroupDeletedDuringAnnotation
+// simulates a ReplicaSet handler deleting the PodGroup between its creation and
+// the pod annotation patch; the pod must not end up annotated to a missing
+// PodGroup.
+func TestCreateNormalPodPGIfNotExist_RecreatesPodGroupDeletedDuringAnnotation(t *testing.T) {
+	namespace := "test"
+	c := newFakeController()
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "verify-7d48f9c794-pps5w",
+			Namespace: namespace,
+			UID:       types.UID("9e0857f9-0000-0000-0000-000000000002"),
+		},
+		Spec: v1.PodSpec{SchedulerName: "volcano"},
+	}
+	pgName := generatePodGroupName(pod)
+	if _, err := c.kubeClient.CoreV1().Pods(namespace).Create(context.TODO(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+
+	deletes := 0
+	c.kubeClient.(*kubeclient.Clientset).PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if err := c.vcClient.SchedulingV1beta1().PodGroups(namespace).Delete(context.TODO(), pgName, metav1.DeleteOptions{}); err != nil {
+			t.Fatalf("racing delete of podgroup failed: %v", err)
+		}
+		deletes++
+		return false, nil, nil
+	})
+
+	if err := c.createNormalPodPGIfNotExist(pod); err != nil {
+		t.Fatalf("createNormalPodPGIfNotExist: %v", err)
+	}
+	if deletes != 1 {
+		t.Fatalf("expected the racing delete to run once, ran %d times", deletes)
+	}
+
+	pg, err := c.vcClient.SchedulingV1beta1().PodGroups(namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("podgroup %s must exist after the pod was annotated to it: %v", pgName, err)
+	}
+	if len(pg.OwnerReferences) != 1 || pg.OwnerReferences[0].UID != pod.UID {
+		t.Errorf("recreated podgroup must be owned by the pod, got %+v", pg.OwnerReferences)
+	}
+
+	annotated, err := c.kubeClient.CoreV1().Pods(namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get pod: %v", err)
+	}
+	if got := annotated.Annotations[scheduling.KubeGroupNameAnnotationKey]; got != pgName {
+		t.Errorf("expected pod annotated with %s, got %q", pgName, got)
+	}
+}
+
+// TestCreateNormalPodPGIfNotExist_NoRecreateWhenPodGroupSurvives checks that
+// the post-annotation re-check is a plain Get when nothing raced.
+func TestCreateNormalPodPGIfNotExist_NoRecreateWhenPodGroupSurvives(t *testing.T) {
+	namespace := "test"
+	c := newFakeController()
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "verify-7d48f9c794-fkhpb",
+			Namespace: namespace,
+			UID:       types.UID("9e0857f9-0000-0000-0000-000000000003"),
+		},
+		Spec: v1.PodSpec{SchedulerName: "volcano"},
+	}
+	if _, err := c.kubeClient.CoreV1().Pods(namespace).Create(context.TODO(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+	if err := c.createNormalPodPGIfNotExist(pod); err != nil {
+		t.Fatalf("createNormalPodPGIfNotExist: %v", err)
+	}
+
+	creates := 0
+	for _, action := range c.vcClient.(*vcclient.Clientset).Actions() {
+		if action.Matches("create", "podgroups") {
+			creates++
+		}
+	}
+	if creates != 1 {
+		t.Errorf("expected exactly one podgroup create, got %d", creates)
 	}
 }
