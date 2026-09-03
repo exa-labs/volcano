@@ -33,16 +33,18 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
-// GpuFragmentationStrategy drains at most one fragmented node per pool per
-// pass: every GPU pod on the node must be movable and provably fit, under a
-// simulated first-fit-decreasing placement, onto other nodes in the same pool
-// that are at least as (fractionally) full. With crossPool enabled the pool
-// boundary disappears: all GPU nodes form one candidate set and the workloads'
-// own node selection (evaluated through the session predicates) is the only
-// placement filter. Replacements are recreated by the
-// pods' controllers and scheduled normally; binpack scoring plus a penalty on
-// the recently drained source steer them to the fuller nodes. Cooldown and
-// per-PodGroup eviction caps are the anti-thrash mechanism.
+// GpuFragmentationStrategy drains fragmented nodes, emptiest first, until the
+// pass's victim budget is spent: every GPU pod on a drained node must be
+// movable and provably fit, under a simulated first-fit-decreasing placement
+// over capacity shared by all drains in the pass, onto other nodes in the
+// same pool that are at least as (fractionally) full. With crossPool enabled
+// the pool boundary disappears: all GPU nodes form one candidate set and the
+// workloads' own node selection (evaluated through the session predicates) is
+// the only placement filter. Replacements are recreated by the pods'
+// controllers and scheduled normally; binpack scoring plus a penalty on the
+// recently drained source steer them to the fuller nodes. A per-node cooldown
+// (a node drained or filled by a drain cannot be drained again until it
+// expires) and per-PodGroup eviction caps are the anti-thrash mechanism.
 const GpuFragmentationStrategy = "gpuFragmentation"
 
 // DefaultGpuFragmentationConf holds the default (dry-run) configuration.
@@ -65,9 +67,9 @@ const KillSwitchEnv = "EXA_GPU_REPACK_DISABLED"
 const (
 	lastEvictionAnnotation = "exa.ai/repack-last-eviction"
 	// drainSourceAnnotation marks only the drained source so the node-order
-	// penalty steers replacements away from it — the pool-wide cooldown
-	// clock (lastEvictionAnnotation) also lands on destinations, which must
-	// NOT be penalized: they are where the replacements should go.
+	// penalty steers replacements away from it — the cooldown clock
+	// (lastEvictionAnnotation) also lands on destinations, which must NOT
+	// be penalized: they are where the replacements should go.
 	drainSourceAnnotation   = "exa.ai/repack-drain-source"
 	groupEvictionAnnotation = "exa.ai/repack-evictions"
 	doNotDisruptAnnotation  = "karpenter.sh/do-not-disrupt"
@@ -86,14 +88,18 @@ type gpuFragmentationConf struct {
 	// CrossPool widens consolidation to every GPU node in the cluster,
 	// including nodes without the pool label. Predicates (the workload's own
 	// nodeSelector, required affinity, taints) become the only placement
-	// filter, and the cooldown clock and one-drain-per-pass budget apply
-	// cluster-wide instead of per pool.
-	CrossPool       bool `mapstructure:"crossPool"`
-	CooldownSeconds int  `mapstructure:"cooldownSeconds"`
-	// MaxVictims caps total evictions per pass. A node's move set is atomic:
-	// it is only taken when the whole set fits in the remaining budget. The
-	// default of 8 covers the largest drainable set on an 8-GPU node: 7
-	// one-GPU pods, since a fully-used node is never a source.
+	// filter, and the per-pass victim budget applies cluster-wide instead of
+	// per pool.
+	CrossPool bool `mapstructure:"crossPool"`
+	// CooldownSeconds is how long a node that was drained, or received a
+	// drain's victims, is held from being drained itself. It is per node, so
+	// one drain never holds the rest of the pool.
+	CooldownSeconds int `mapstructure:"cooldownSeconds"`
+	// MaxVictims caps total evictions per pass, so it also bounds how many
+	// nodes a pass drains. A node's move set is atomic: it is only taken when
+	// the whole set fits in the remaining budget. The default of 8 covers the
+	// largest drainable set on an 8-GPU node: 7 one-GPU pods, since a
+	// fully-used node is never a source.
 	MaxVictims int `mapstructure:"maxVictims"`
 	// MaxVictimPriority is the highest pod priority still movable. Pods
 	// without an explicit priority count as 0, so the default (-1) restricts
@@ -267,17 +273,19 @@ func probeTask(task *api.TaskInfo) *api.TaskInfo {
 	return api.NewTaskInfo(pod)
 }
 
-// planGpuFragmentationDrains drains at most one node per pool (or one node
-// total when crossPool merges the cluster into a single group), capped at
-// conf.MaxVictims evictions overall. A node drains only when every GPU task
-// on it is movable (single-member PodGroup, unspent eviction cap, at or below
-// the priority ceiling, controller-owned, not opted out or protected), the
-// pool's cooldown clock permits it, and a simulated first-fit-decreasing
+// planGpuFragmentationDrains drains nodes emptiest-first within each pool
+// (or across the cluster when crossPool merges it into a single group) until
+// conf.MaxVictims evictions are planned. A node drains only when every GPU
+// task on it is movable (single-member PodGroup, unspent eviction cap, at or
+// below the priority ceiling, controller-owned, not opted out or protected),
+// its own cooldown clock has expired, and a simulated first-fit-decreasing
 // placement fits all of them onto other pool nodes that are at least as full
 // (fractionally, so mixed-size pools compare fullness fairly), passing
-// resources and predicates. Less-utilized nodes are drained first;
-// equally-utilized nodes tie-break toward the one running lower-priority
-// victims, then fewer victims, so the cheapest-to-disrupt workload moves.
+// resources and predicates. Drains within a pass share one idle-capacity
+// ledger and never reuse a node already drained or filled by an earlier
+// drain, so the plans compose without double-booking. Equally-utilized nodes
+// tie-break toward the one running lower-priority victims, then fewer
+// victims, so the cheapest-to-disrupt workload moves.
 func planGpuFragmentationDrains(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -316,27 +324,15 @@ func planGpuFragmentationDrains(
 			break
 		}
 		members := pools[pool]
-		// Cooldown is a pool-wide budget: any recent (or unparseable)
-		// eviction clock in the pool holds the whole pool.
-		cooled := true
-		for _, node := range members {
-			if raw, ok := node.Node.Annotations[lastEvictionAnnotation]; ok {
-				last, err := time.Parse(time.RFC3339, raw)
-				if err != nil || last.After(now) || now.Sub(last) < time.Duration(conf.CooldownSeconds)*time.Second {
-					cooled = false
-					break
-				}
-			}
-		}
-		if !cooled {
-			continue
-		}
 		type drainable struct {
 			source  *api.NodeInfo
 			victims []*api.TaskInfo
 		}
 		sources := make([]drainable, 0, len(members))
 		for _, member := range members {
+			if !nodeCooled(member, conf, now) {
+				continue
+			}
 			victims := movableGpuTasks(member, jobs, running, conf, gpu)
 			if len(victims) == 0 {
 				continue
@@ -357,6 +353,7 @@ func planGpuFragmentationDrains(
 			}
 			return sources[i].source.Name < sources[j].source.Name
 		})
+		ledger := newDrainLedger(members)
 		for _, cand := range sources {
 			source, victims := cand.source, cand.victims
 			if conf.MaxVictims > 0 && planned+len(victims) > conf.MaxVictims {
@@ -364,7 +361,10 @@ func planGpuFragmentationDrains(
 				// would silently invert the emptiest-first policy.
 				break
 			}
-			moves := simulateDrain(members, source, victims, gpu, predicate)
+			if ledger.touched(source.Name) {
+				continue
+			}
+			moves := simulateDrain(members, source, victims, gpu, ledger, predicate)
 			if len(moves) == 0 {
 				continue
 			}
@@ -375,10 +375,65 @@ func planGpuFragmentationDrains(
 				gain:   source.Used.Get(gpu),
 			})
 			planned += len(moves)
-			break
 		}
 	}
 	return drains
+}
+
+// nodeCooled reports whether the node's own cooldown clock permits draining
+// it. A missing clock is cooled; an unparseable or future one is not, since
+// a corrupt stamp must fail safe rather than unlock the node.
+func nodeCooled(node *api.NodeInfo, conf *gpuFragmentationConf, now time.Time) bool {
+	raw, ok := node.Node.Annotations[lastEvictionAnnotation]
+	if !ok {
+		return true
+	}
+	last, err := time.Parse(time.RFC3339, raw)
+	if err != nil || last.After(now) {
+		return false
+	}
+	return now.Sub(last) >= time.Duration(conf.CooldownSeconds)*time.Second
+}
+
+// drainLedger carries the capacity already promised by earlier drains in the
+// pass: idle resources per node, net of simulated placements, plus the set
+// of nodes an earlier drain emptied or filled. A drained source is about to
+// lose its pods, so its live fullness is stale and it must not receive; a
+// destination is about to gain pods and will be stamped, so it must not be
+// drained in the same pass.
+type drainLedger struct {
+	idle    map[string]*api.Resource
+	drained map[string]bool
+	filled  map[string]bool
+}
+
+func newDrainLedger(members []*api.NodeInfo) *drainLedger {
+	ledger := &drainLedger{
+		idle:    make(map[string]*api.Resource, len(members)),
+		drained: make(map[string]bool),
+		filled:  make(map[string]bool),
+	}
+	for _, node := range members {
+		ledger.idle[node.Name] = node.Idle.Clone()
+	}
+	return ledger
+}
+
+// touched reports whether an earlier drain in the pass emptied or filled the
+// node, either of which disqualifies it as a further source.
+func (l *drainLedger) touched(node string) bool {
+	return l.drained[node] || l.filled[node]
+}
+
+// commit records a planned drain: the source can no longer receive, the
+// destinations can no longer be drained, and the destinations' idle capacity
+// shrinks by what they absorbed.
+func (l *drainLedger) commit(source string, moves []gpuFragmentationMove, gpu v1.ResourceName) {
+	l.drained[source] = true
+	for _, move := range moves {
+		l.filled[move.destination] = true
+		l.idle[move.destination].Sub(taskGpuNeed(move.victim, gpu))
+	}
 }
 
 // gpuFullness is the node's GPU utilization as a fraction of allocatable, so
@@ -496,13 +551,15 @@ type gpuFragmentationMove struct {
 }
 
 // simulateDrain proves the whole victim set fits on other pool nodes today
-// via first-fit-decreasing placement over cloned idle capacity, so two
-// victims cannot both claim the same free GPU. Destinations must be at least
-// as (fractionally) full as the source (equally-full nodes consolidate in
-// one deterministic direction — the planner's source ordering — instead of
-// swapping pods), and are tried fullest-first. Returns nil unless every
-// victim places; the replacements are not pinned — binpack scoring makes the
-// fuller nodes the likely landing spots.
+// via first-fit-decreasing placement over the ledger's idle capacity, so two
+// victims — in this drain or an earlier one in the pass — cannot both claim
+// the same free GPU. Destinations must be at least as (fractionally) full as
+// the source (equally-full nodes consolidate in one deterministic direction —
+// the planner's source ordering — instead of swapping pods), must not have
+// been drained earlier in the pass, and are tried fullest-first. Returns nil
+// unless every victim places, in which case the drain is committed to the
+// ledger; the replacements are not pinned — binpack scoring makes the fuller
+// nodes the likely landing spots.
 //
 // The simulation covers resources, not placed-pod-dependent predicates:
 // predicates run against live node state, so constraints that react to pods
@@ -513,6 +570,7 @@ func simulateDrain(
 	source *api.NodeInfo,
 	victims []*api.TaskInfo,
 	gpu v1.ResourceName,
+	ledger *drainLedger,
 	predicate func(*api.TaskInfo, *api.NodeInfo) error,
 ) []gpuFragmentationMove {
 	if len(victims) == 0 {
@@ -525,13 +583,13 @@ func simulateDrain(
 	}
 	candidates := make([]candidate, 0, len(members))
 	for _, dest := range members {
-		if dest.Name == source.Name {
+		if dest.Name == source.Name || ledger.drained[dest.Name] {
 			continue
 		}
 		if gpuFullness(dest, gpu) < sourceFullness {
 			continue
 		}
-		candidates = append(candidates, candidate{node: dest, idle: dest.Idle.Clone()})
+		candidates = append(candidates, candidate{node: dest, idle: ledger.idle[dest.Name].Clone()})
 	}
 	if len(candidates) == 0 {
 		return nil
@@ -569,6 +627,7 @@ placement:
 		}
 		return nil
 	}
+	ledger.commit(source.Name, moves, gpu)
 	return moves
 }
 
@@ -583,12 +642,13 @@ func taskGpuNeed(task *api.TaskInfo, gpu v1.ResourceName) *api.Resource {
 
 // stampGpuFragmentationNodes durably records the drain's cooldown clock
 // before any eviction, once per drain rather than once per victim. The
-// destinations are stamped too: they survive the drain by construction,
-// while the emptied source is reaped along with the pool's only cooldown
-// record — which would erase the anti-thrash window exactly when the drain
-// succeeds. A source stamp failure aborts the drain so the budget cannot be
-// overspent; a destination stamp failure is logged but not fatal, since the
-// source clock alone already holds the pool.
+// destinations are stamped too: they are the nodes that just absorbed the
+// victims, and the clock keeps them from being drained in turn before the
+// replacements have settled — the emptied source is usually reaped, so its
+// clock alone would protect nothing. A source stamp failure aborts the drain
+// so the budget cannot be overspent; a destination stamp failure is logged
+// but not fatal, since the source's drain-source penalty still steers
+// replacements and the per-PodGroup eviction cap still bounds churn.
 func stampGpuFragmentationNodes(drain gpuFragmentationDrain) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	sourcePatch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{%q:%q,%q:%q}}}`,

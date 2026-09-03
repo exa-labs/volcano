@@ -290,9 +290,10 @@ func TestPlanSkipsSpentEvictionCap(t *testing.T) {
 	}
 }
 
-func TestPlanCooldownHoldsPool(t *testing.T) {
+func TestPlanCooldownHoldsStampedSource(t *testing.T) {
 	recent := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	for _, annotation := range []string{recent, "not-a-timestamp"} {
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	for _, annotation := range []string{recent, future, "not-a-timestamp"} {
 		f := newFixture(t)
 		source := f.addNode(gpuNode("source", 8, map[string]string{lastEvictionAnnotation: annotation}))
 		dest := f.addNode(gpuNode("dest", 8, nil))
@@ -300,8 +301,91 @@ func TestPlanCooldownHoldsPool(t *testing.T) {
 		f.placePod(t, dest, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
 
 		if plans := f.plan(newGpuFragmentationConf(), nil); len(plans) != 0 {
-			t.Fatalf("expected cooldown (%q) to hold pool, got %+v", annotation, plans)
+			t.Fatalf("expected cooldown (%q) to hold source, got %+v", annotation, plans)
 		}
+	}
+}
+
+func TestPlanCooldownIsPerNodeNotPerPool(t *testing.T) {
+	recent := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	f := newFixture(t)
+	cooling := f.addNode(gpuNode("cooling", 8, map[string]string{lastEvictionAnnotation: recent}))
+	source := f.addNode(gpuNode("source", 8, nil))
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	f.placePod(t, cooling, gpuPod("cooling-victim", "cooling", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, source, gpuPod("victim", "source", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, dest, gpuPod("resident", "dest", 3, nil, nil, true), 1, "")
+
+	// The cooling node's clock holds only that node: the untouched source
+	// still drains, and the cooling node remains a valid destination.
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 || plans[0].source != "source" || plans[0].victim.Name != "victim" {
+		t.Fatalf("expected the uncooled node to drain, got %+v", plans)
+	}
+
+	f.placePod(t, cooling, gpuPod("cooling-resident", "cooling", 4, nil, nil, true), 1, "")
+	delete(f.nodes, "dest")
+	plans = f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 || plans[0].source != "source" || plans[0].destination != "cooling" {
+		t.Fatalf("expected the cooling node to still receive, got %+v", plans)
+	}
+}
+
+func TestPlanDrainsSeveralNodesPerPassWithinBudget(t *testing.T) {
+	f := newFixture(t)
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	f.placePod(t, dest, gpuPod("resident", "dest", 4, nil, nil, true), 1, "")
+	for _, name := range []string{"source-a", "source-b", "source-c"} {
+		source := f.addNode(gpuNode(name, 8, nil))
+		f.placePod(t, source, gpuPod(name+"-victim", name, 1, eligible(), nil, true), 1, "")
+	}
+
+	conf := newGpuFragmentationConf()
+	plans := f.plan(conf, nil)
+	if len(plans) != 3 {
+		t.Fatalf("expected all three sources to drain in one pass, got %+v", plans)
+	}
+	for _, plan := range plans {
+		if plan.destination != "dest" {
+			t.Fatalf("expected every victim on dest, got %+v", plan)
+		}
+	}
+
+	conf.MaxVictims = 2
+	if plans := f.plan(conf, nil); len(plans) != 2 {
+		t.Fatalf("expected maxVictims=2 to stop after two drains, got %+v", plans)
+	}
+}
+
+func TestPlanLedgerPreventsDoubleBookingAcrossDrains(t *testing.T) {
+	f := newFixture(t)
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	f.placePod(t, dest, gpuPod("resident", "dest", 5, nil, nil, true), 1, "")
+	for _, name := range []string{"source-a", "source-b"} {
+		source := f.addNode(gpuNode(name, 8, nil))
+		f.placePod(t, source, gpuPod(name+"-victim", name, 2, eligible(), nil, true), 1, "")
+	}
+
+	// dest has 3 idle GPUs: room for one 2-GPU victim, not two.
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 || plans[0].source != "source-a" {
+		t.Fatalf("expected exactly one drain onto dest's remaining capacity, got %+v", plans)
+	}
+}
+
+func TestPlanDrainedSourceNeverReceivesInSamePass(t *testing.T) {
+	f := newFixture(t)
+	emptier := f.addNode(gpuNode("emptier", 8, nil))
+	fuller := f.addNode(gpuNode("fuller", 8, nil))
+	f.placePod(t, emptier, gpuPod("emptier-victim", "emptier", 1, eligible(), nil, true), 1, "")
+	f.placePod(t, fuller, gpuPod("fuller-victim", "fuller", 2, eligible(), nil, true), 1, "")
+
+	// emptier drains onto fuller. fuller is then a destination, so it must
+	// not be drained in turn (which would bounce emptier's victim twice),
+	// and emptier is drained, so it cannot receive fuller's victim.
+	plans := f.plan(newGpuFragmentationConf(), nil)
+	if len(plans) != 1 || plans[0].source != "emptier" || plans[0].destination != "fuller" {
+		t.Fatalf("expected a single emptier -> fuller drain, got %+v", plans)
 	}
 }
 
