@@ -119,9 +119,30 @@ func (pg *pgcontroller) addReplicaSet(obj interface{}) {
 
 	if *rs.Spec.Replicas == 0 {
 		pgName := batchv1alpha1.PodgroupNamePrefix + string(rs.UID)
+		// A replicas==0 event is not proof that the ReplicaSet is idle. When a
+		// Deployment is scaled 0 -> 1 its controller first writes the
+		// ReplicaSet's annotations (still at 0 replicas) and only then its
+		// scale, and the ReplicaSet watch can deliver that 0-replica revision
+		// after the pod watch has already delivered the new pod and addPod has
+		// created its PodGroup. Deleting the PodGroup at that point strands the
+		// pod forever: it keeps the group-name annotation, processNextReq skips
+		// annotated pods, and the scheduler ignores jobs whose PodGroup is nil,
+		// so the pod never gets a PodScheduled condition or an event. Deleting
+		// only when a live read shows no remaining pods keeps the scale-to-zero
+		// cleanup while making a stale replicas==0 event harmless.
+		livePods, err := pg.listLiveReplicaSetPods(rs)
+		if err != nil {
+			klog.Errorf("Failed to list pods for ReplicaSet %s: %v", klog.KObj(rs), err)
+			return
+		}
+		if len(livePods) > 0 {
+			klog.V(4).Infof("Keep podgroup %s for replicaset %s/%s: spec.replicas == 0 but %d pod(s) still exist (stale event)",
+				pgName, rs.Namespace, rs.Name, len(livePods))
+			return
+		}
 		klog.V(4).Infof("Delete podgroup %s for replicaset %s/%s spec.replicas == 0",
 			pgName, rs.Namespace, rs.Name)
-		err := pg.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Delete(context.TODO(), pgName, metav1.DeleteOptions{})
+		err = pg.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Delete(context.TODO(), pgName, metav1.DeleteOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			klog.Errorf("Failed to delete PodGroup <%s/%s>: %v", rs.Namespace, pgName, err)
 		}
@@ -144,10 +165,25 @@ func (pg *pgcontroller) addReplicaSet(obj interface{}) {
 				klog.V(4).Infof("Pod %s field SchedulerName is not matched", klog.KObj(&pod))
 				return
 			}
-			// If the pod is already associated with a podgroup, skip creating a new one.
+			// If the pod is already associated with a podgroup, skip creating a new one,
+			// unless that podgroup is the one this controller derives for the pod and it
+			// no longer exists: an annotated pod whose podgroup is gone is invisible to
+			// the scheduler (nil PodGroup) and processNextReq never revisits annotated
+			// pods, so this is the only path that can make it schedulable again.
+			// Foreign podgroup names (e.g. LeaderWorkerSet's) are left alone.
 			if pgName := pod.Annotations[scheduling.KubeGroupNameAnnotationKey]; pgName != "" {
-				klog.V(4).Infof("Pod %s is already associated with a podgroup %s", klog.KObj(&pod), pgName)
-				return
+				if pgName != generatePodGroupName(&pod) {
+					klog.V(4).Infof("Pod %s is already associated with a podgroup %s", klog.KObj(&pod), pgName)
+					return
+				}
+				if _, err := pg.pgLister.PodGroups(pod.Namespace).Get(pgName); err == nil {
+					klog.V(4).Infof("Pod %s is already associated with a podgroup %s", klog.KObj(&pod), pgName)
+					return
+				} else if !apierrors.IsNotFound(err) {
+					klog.Errorf("Failed to get PodGroup <%s/%s> for pod %s: %v", pod.Namespace, pgName, klog.KObj(&pod), err)
+					return
+				}
+				klog.Warningf("Pod %s is associated with podgroup %s which no longer exists; recreating it", klog.KObj(&pod), pgName)
 			}
 			// In the upgrade scenario, need to synchronize and update the podgroup-related information.
 			// For example, if you update `scheduling.volcano.sh/group-min-member: "2"`, the podgroup's `minMember` needs to be updated to 2.
@@ -157,6 +193,30 @@ func (pg *pgcontroller) addReplicaSet(obj interface{}) {
 			}
 		}
 	}
+}
+
+// listLiveReplicaSetPods returns the non-terminating pods controlled by rs,
+// read from the API server rather than the informer cache so the answer is not
+// subject to the same watch lag as the ReplicaSet event being handled.
+func (pg *pgcontroller) listLiveReplicaSetPods(rs *appsv1.ReplicaSet) ([]v1.Pod, error) {
+	selector := metav1.LabelSelector{MatchLabels: rs.Spec.Selector.MatchLabels}
+	podList, err := pg.kubeClient.CoreV1().Pods(rs.Namespace).List(context.TODO(),
+		metav1.ListOptions{LabelSelector: metav1.FormatLabelSelector(&selector)})
+	if err != nil {
+		return nil, err
+	}
+	live := make([]v1.Pod, 0, len(podList.Items))
+	for _, pod := range podList.Items {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		owner := metav1.GetControllerOf(&pod)
+		if owner == nil || owner.UID != rs.UID {
+			continue
+		}
+		live = append(live, pod)
+	}
+	return live, nil
 }
 
 func (pg *pgcontroller) updateReplicaSet(oldObj, newObj interface{}) {
