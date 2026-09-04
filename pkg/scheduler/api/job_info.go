@@ -24,7 +24,6 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"maps"
 	"sort"
@@ -426,21 +425,7 @@ func (ji *JobInfo) SetPodGroup(pg *PodGroup) {
 	ji.Queue = QueueID(pg.Spec.Queue)
 	ji.CreationTimestamp = pg.GetCreationTimestamp()
 
-	var err error
-	ji.WaitingTime, err = ji.extractWaitingTime(pg, v1beta1.JobWaitingTime)
-	if err != nil {
-		klog.Warningf("Error occurs in parsing waiting time for job <%s/%s>, err: %s.",
-			pg.Namespace, pg.Name, err.Error())
-		ji.WaitingTime = nil
-	}
-	if ji.WaitingTime == nil {
-		ji.WaitingTime, err = ji.extractWaitingTime(pg, JobWaitingTime)
-		if err != nil {
-			klog.Warningf("Error occurs in parsing waiting time for job <%s/%s>, err: %s.",
-				pg.Namespace, pg.Name, err.Error())
-			ji.WaitingTime = nil
-		}
-	}
+	ji.WaitingTime = extractWaitingTime(pg.Annotations, fmt.Sprintf("podgroup <%s/%s>", pg.Namespace, pg.Name))
 
 	ji.Preemptable = ji.extractPreemptable(pg)
 	ji.RevocableZone = ji.extractRevocableZone(pg)
@@ -469,23 +454,61 @@ func (ji *JobInfo) SetPodGroup(pg *PodGroup) {
 	}
 }
 
-// extractWaitingTime reads sla waiting time for job from podgroup annotations
+// GetWaitingTime returns the sla waiting time in effect for the job: the one
+// declared on its PodGroup, or, when the PodGroup declares none, the shortest
+// one declared by a member pod.
+//
+// Pods are consulted because gang operators that create their own PodGroup (the
+// kubeflow training-operator, and anything else implementing gang scheduling
+// itself) do not necessarily carry volcano's annotations over from the pod
+// template, which would leave such a workload no way to declare a waiting time.
+// The value is resolved on read so that it tracks pod annotation updates, and
+// the shortest is taken so that it does not depend on task iteration order when
+// members disagree.
+func (ji *JobInfo) GetWaitingTime() *time.Duration {
+	if ji.WaitingTime != nil {
+		return ji.WaitingTime
+	}
+
+	var shortest *time.Duration
+	for _, task := range ji.Tasks {
+		if task.Pod == nil {
+			continue
+		}
+		waitingTime := extractWaitingTime(task.Pod.Annotations, fmt.Sprintf("pod <%s/%s>", task.Namespace, task.Name))
+		if waitingTime != nil && (shortest == nil || *waitingTime < *shortest) {
+			shortest = waitingTime
+		}
+	}
+
+	return shortest
+}
+
+// extractWaitingTime reads the sla waiting time from a set of annotations,
+// preferring the prefixed key over the bare one. owner names the annotated
+// object for logging. It returns nil when the value is absent or unusable.
 // TODO: should also read from given field in volcano job spec
-func (ji *JobInfo) extractWaitingTime(pg *PodGroup, waitingTimeKey string) (*time.Duration, error) {
-	if _, exist := pg.Annotations[waitingTimeKey]; !exist {
-		return nil, nil
+func extractWaitingTime(annotations map[string]string, owner string) *time.Duration {
+	for _, key := range []string{v1beta1.JobWaitingTime, JobWaitingTime} {
+		value, exist := annotations[key]
+		if !exist {
+			continue
+		}
+
+		waitingTime, err := time.ParseDuration(value)
+		if err != nil {
+			klog.Warningf("Error occurs in parsing waiting time %s=%s of %s, err: %s.", key, value, owner, err.Error())
+			continue
+		}
+		if waitingTime <= 0 {
+			klog.Warningf("Invalid sla waiting time %s=%s of %s.", key, value, owner)
+			continue
+		}
+
+		return &waitingTime
 	}
 
-	jobWaitingTime, err := time.ParseDuration(pg.Annotations[waitingTimeKey])
-	if err != nil {
-		return nil, err
-	}
-
-	if jobWaitingTime <= 0 {
-		return nil, errors.New("invalid sla waiting time")
-	}
-
-	return &jobWaitingTime, nil
+	return nil
 }
 
 // extractPreemptable return volcano.sh/preemptable value for job
