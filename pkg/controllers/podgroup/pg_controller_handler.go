@@ -119,11 +119,23 @@ func (pg *pgcontroller) addReplicaSet(obj interface{}) {
 
 	if *rs.Spec.Replicas == 0 {
 		pgName := batchv1alpha1.PodgroupNamePrefix + string(rs.UID)
-		klog.V(4).Infof("Delete podgroup %s for replicaset %s/%s spec.replicas == 0",
-			pgName, rs.Namespace, rs.Name)
-		err := pg.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Delete(context.TODO(), pgName, metav1.DeleteOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
-			klog.Errorf("Failed to delete PodGroup <%s/%s>: %v", rs.Namespace, pgName, err)
+		// Every new Deployment ReplicaSet is created at replicas=0 and scaled up
+		// right after, and the pod watch may deliver the pod (and its PodGroup)
+		// before this stale replicas=0 event arrives. Deleting then would leave
+		// the pod annotated to a PodGroup that no longer exists, which the
+		// scheduler ignores and this controller never revisits.
+		if live, err := pg.activePodsOwnedBy(rs); err != nil {
+			klog.Errorf("Failed to list pods for ReplicaSet %s, not deleting PodGroup %s: %v", klog.KObj(rs), pgName, err)
+		} else if len(live) > 0 {
+			klog.V(4).Infof("Skip deleting podgroup %s for replicaset %s/%s spec.replicas == 0: it still owns %d active pod(s), e.g. %s",
+				pgName, rs.Namespace, rs.Name, len(live), klog.KObj(live[0]))
+		} else {
+			klog.V(4).Infof("Delete podgroup %s for replicaset %s/%s spec.replicas == 0",
+				pgName, rs.Namespace, rs.Name)
+			err := pg.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Delete(context.TODO(), pgName, metav1.DeleteOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				klog.Errorf("Failed to delete PodGroup <%s/%s>: %v", rs.Namespace, pgName, err)
+			}
 		}
 	}
 
@@ -161,6 +173,34 @@ func (pg *pgcontroller) addReplicaSet(obj interface{}) {
 
 func (pg *pgcontroller) updateReplicaSet(oldObj, newObj interface{}) {
 	pg.addReplicaSet(newObj)
+}
+
+// activePodsOwnedBy returns the cached pods that match the ReplicaSet's
+// selector, are controlled by it, and are active in the sense the ReplicaSet
+// controller uses for status.replicas: not terminating and not in a terminal
+// phase. Terminating pods do not count, so a genuine scale-down to zero (a spec
+// update, then a status update once the pods are marked for deletion) still
+// deletes the PodGroup on the status update.
+func (pg *pgcontroller) activePodsOwnedBy(rs *appsv1.ReplicaSet) ([]*v1.Pod, error) {
+	selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
+	if err != nil {
+		return nil, err
+	}
+	pods, err := pg.podLister.Pods(rs.Namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+	active := make([]*v1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if !metav1.IsControlledBy(pod, rs) {
+			continue
+		}
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed {
+			continue
+		}
+		active = append(active, pod)
+	}
+	return active, nil
 }
 
 func (pg *pgcontroller) addStatefulSet(obj interface{}) {
@@ -363,7 +403,39 @@ func (pg *pgcontroller) createNormalPodPGIfNotExist(pod *v1.Pod) error {
 		}
 	}
 
-	return pg.updatePodAnnotations(pod, pgName)
+	if err := pg.updatePodAnnotations(pod, pgName); err != nil {
+		return err
+	}
+	return pg.ensurePodGroupStillExists(pod, pgName)
+}
+
+// ensurePodGroupStillExists re-reads the PodGroup from the API server after the
+// pod has been annotated with its name and recreates it if it is gone. Between
+// the Create above and the annotation Patch, a concurrent ReplicaSet handler may
+// have deleted the PodGroup (see addReplicaSet). Once annotated, the pod is never
+// handled again — processNextReq returns early on the annotation — so this is the
+// last point at which the controller can notice. A live Get rather than the
+// lister: the lister may not have observed the delete yet.
+func (pg *pgcontroller) ensurePodGroupStillExists(pod *v1.Pod, pgName string) error {
+	_, err := pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		klog.Errorf("Failed to re-check PodGroup <%s/%s> for Pod <%s/%s>: %v",
+			pod.Namespace, pgName, pod.Namespace, pod.Name, err)
+		return err
+	}
+
+	klog.Warningf("PodGroup <%s/%s> disappeared while Pod <%s/%s> was being bound to it; recreating",
+		pod.Namespace, pgName, pod.Namespace, pod.Name)
+	podGroup := pg.buildPodGroupFromPod(pod, pgName)
+	if _, err := pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(context.TODO(), podGroup, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		klog.Errorf("Failed to recreate PodGroup <%s/%s> for Pod <%s/%s>: %v",
+			pod.Namespace, pgName, pod.Namespace, pod.Name, err)
+		return err
+	}
+	return nil
 }
 
 // When statefulSet is updated, its associated pod template may change.
