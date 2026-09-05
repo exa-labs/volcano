@@ -27,6 +27,9 @@ import (
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilFeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
@@ -111,6 +114,14 @@ type PredicatesPlugin struct {
 	ScoreWeights        map[string]int // Weight for each score plugin
 	PredicateCache      *predicateCache
 	Handle              k8sframework.Handle
+
+	// gangAffinityBootstrap, when set, reports whether a task is the bootstrap
+	// member of a gang whose required pod affinity is self-referential and may
+	// therefore be relaxed for the InterPodAffinity filter (see
+	// isGangAffinityBootstrap). It is wired up per session in OnSessionOpen and
+	// is nil for schedulers that drive the plugin without a volcano Session, in
+	// which case the relaxation is skipped.
+	gangAffinityBootstrap func(task *api.TaskInfo) bool
 }
 
 // New return predicate plugin
@@ -194,6 +205,9 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 		k8s.WithInformerFactory(ssn.InformerFactory()),
 	)
 	pp.Handle = handle
+	pp.gangAffinityBootstrap = func(task *api.TaskInfo) bool {
+		return isGangAffinityBootstrap(ssn, task)
+	}
 
 	pp.InitPlugin()
 
@@ -647,6 +661,24 @@ func (pp *PredicatesPlugin) Predicate(task *api.TaskInfo, node *api.NodeInfo, st
 		status := plugin.Filter(context.TODO(), state, task.Pod, nodeInfo)
 		filterStatus := api.ConvertPredicateStatus(status)
 		if filterStatus.Code != api.Success {
+			// Volcano evaluates inter-pod affinity per task against pods that are
+			// already placed, ignoring not-yet-scheduled members of the same gang.
+			// A gang whose required pod affinity can only be satisfied by its own
+			// members (e.g. EFA training workers that must co-locate within a
+			// capacity-reservation topology) therefore deadlocks: its first member
+			// matches no placed pod on any node, InterPodAffinity returns
+			// UnschedulableAndUnresolvable, and the whole podgroup is stuck. Let the
+			// bootstrap member through; once it is placed the standard filter
+			// enforces the topology constraint for the remaining members, keeping
+			// the gang co-located. Only the affinity (not anti-affinity) failure is
+			// relaxed. See https://github.com/volcano-sh/volcano/issues/3845
+			if name == interpodaffinity.Name &&
+				filterStatus.Reason == interpodaffinity.ErrReasonAffinityRulesNotMatch &&
+				pp.gangAffinityBootstrap != nil && pp.gangAffinityBootstrap(task) {
+				klog.V(3).Infof("predicates, allowing gang bootstrap task <%s/%s> on node <%s> past self-referential pod affinity",
+					task.Namespace, task.Name, node.Name)
+				continue
+			}
 			predicateStatus = append(predicateStatus, filterStatus)
 			if util.ShouldAbort(filterStatus) {
 				return api.NewFitErrWithStatus(task, node, predicateStatus...)
@@ -659,6 +691,127 @@ func (pp *PredicatesPlugin) Predicate(task *api.TaskInfo, node *api.NodeInfo, st
 	}
 
 	return nil
+}
+
+// isGangAffinityBootstrap reports whether task is the first ("bootstrap") member
+// of a gang whose required inter-pod affinity can only be satisfied by other
+// members of the same gang (podgroup).
+//
+// Volcano's InterPodAffinity filter evaluates a task only against pods that are
+// already placed, never against not-yet-scheduled members of the same podgroup.
+// A self-referential required pod affinity (for example EFA training workers
+// pinned to a shared capacity-reservation topology) therefore deadlocks on its
+// first member: no sibling is placed yet, so the affinity fails on every node,
+// and the caller treats that as UnschedulableAndUnresolvable, wedging the whole
+// gang. Allowing the first member through breaks the deadlock. Because Volcano
+// allocates the gang's members sequentially and updates the node snapshot after
+// each allocation, every subsequent member is still subject to the standard
+// filter and lands in the same topology domain as the bootstrap member, so the
+// gang stays co-located. See https://github.com/volcano-sh/volcano/issues/3845.
+//
+// A task qualifies only when all of the following hold:
+//   - it declares at least one required pod-affinity term,
+//   - it belongs to a known gang (podgroup) with more than one member,
+//   - no member of that gang occupies a node yet, and
+//   - every required term is satisfiable by a sibling member of the gang.
+func isGangAffinityBootstrap(ssn *framework.Session, task *api.TaskInfo) bool {
+	if task.Pod == nil || task.Pod.Spec.Affinity == nil || task.Pod.Spec.Affinity.PodAffinity == nil {
+		return false
+	}
+	required := task.Pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if len(required) == 0 {
+		return false
+	}
+
+	job, found := ssn.Jobs[task.Job]
+	if !found || len(job.Tasks) < 2 {
+		return false
+	}
+
+	// Bootstrap only applies while no gang member occupies a node. Once any
+	// member is placed, the standard filter can (and must) enforce the topology
+	// constraint for the remaining members, so we stop relaxing.
+	siblings := make([]*api.TaskInfo, 0, len(job.Tasks))
+	for _, sibling := range job.Tasks {
+		if sibling.UID == task.UID {
+			continue
+		}
+		if len(sibling.NodeName) != 0 {
+			return false
+		}
+		siblings = append(siblings, sibling)
+	}
+	if len(siblings) == 0 {
+		return false
+	}
+
+	// Every required term must be satisfiable by a sibling member; otherwise the
+	// affinity references pods outside the gang and relaxing it could place the
+	// task incorrectly.
+	for i := range required {
+		if !termSatisfiableByGang(&required[i], task, siblings) {
+			return false
+		}
+	}
+	return true
+}
+
+// termSatisfiableByGang reports whether at least one sibling gang member matches
+// the given required pod-affinity term, evaluated from the perspective of task.
+// matchLabelKeys are resolved against task's own labels and ANDed into the
+// selector, mirroring how kube-scheduler expands a PodAffinityTerm in PreFilter.
+func termSatisfiableByGang(term *v1.PodAffinityTerm, task *api.TaskInfo, siblings []*api.TaskInfo) bool {
+	selector, ok := podAffinityTermSelector(term, task.Pod)
+	if !ok {
+		return false
+	}
+	namespaces := podAffinityTermNamespaces(term, task.Pod)
+	for _, sibling := range siblings {
+		if sibling.Pod == nil {
+			continue
+		}
+		if !namespaces.Has(sibling.Pod.Namespace) {
+			continue
+		}
+		if selector.Matches(labels.Set(sibling.Pod.Labels)) {
+			return true
+		}
+	}
+	return false
+}
+
+// podAffinityTermSelector builds the label selector for a PodAffinityTerm,
+// expanding matchLabelKeys into equality requirements on pod's own label values
+// (the same expansion kube-scheduler performs). It returns ok=false when the
+// selector cannot be built or a referenced matchLabelKey is absent from pod.
+func podAffinityTermSelector(term *v1.PodAffinityTerm, pod *v1.Pod) (labels.Selector, bool) {
+	selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+	if err != nil {
+		return nil, false
+	}
+	for _, key := range term.MatchLabelKeys {
+		value, ok := pod.Labels[key]
+		if !ok {
+			return nil, false
+		}
+		req, err := labels.NewRequirement(key, selection.In, []string{value})
+		if err != nil {
+			return nil, false
+		}
+		selector = selector.Add(*req)
+	}
+	return selector, true
+}
+
+// podAffinityTermNamespaces returns the namespaces a PodAffinityTerm matches
+// against. NamespaceSelector handling is intentionally conservative: gang
+// members always share the pod's namespace, which is the only case this
+// relaxation targets, so we include the pod's namespace and any explicitly
+// listed namespaces.
+func podAffinityTermNamespaces(term *v1.PodAffinityTerm, pod *v1.Pod) sets.Set[string] {
+	ns := sets.New(pod.Namespace)
+	ns.Insert(term.Namespaces...)
+	return ns
 }
 
 // BatchNodeOrder runs all Score plugins for the given task and nodes.
