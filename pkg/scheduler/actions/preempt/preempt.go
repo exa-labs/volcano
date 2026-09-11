@@ -70,6 +70,10 @@ const (
 	// transaction is retried with the previously chosen nodes excluded when the
 	// job could not be pipelined as a whole. 0 disables retries.
 	GangPlacementRetriesKey = "gangPlacementRetries"
+
+	// DefaultPreemptGraceKey (util.DefaultPreemptGraceKey) delays preemption for
+	// a starving job while its pending pods wait for the autoscaler to add
+	// capacity. A pod's exa.ai/preempt-grace annotation overrides the default.
 )
 
 type Action struct {
@@ -86,6 +90,7 @@ type Action struct {
 	minCandidateNodesAbsolute     int
 	maxCandidateNodesAbsolute     int
 	gangPlacementRetries          int
+	defaultPreemptGrace           time.Duration
 }
 
 func New() *Action {
@@ -98,6 +103,7 @@ func New() *Action {
 		minCandidateNodesAbsolute:        1,
 		maxCandidateNodesAbsolute:        100,
 		gangPlacementRetries:             2,
+		defaultPreemptGrace:              0,
 	}
 }
 
@@ -117,6 +123,15 @@ func (pmpt *Action) parseArguments(ssn *framework.Session) {
 	arguments.GetInt(&pmpt.minCandidateNodesAbsolute, MinCandidateNodesAbsoluteKey)
 	arguments.GetInt(&pmpt.maxCandidateNodesAbsolute, MaxCandidateNodesAbsoluteKey)
 	arguments.GetInt(&pmpt.gangPlacementRetries, GangPlacementRetriesKey)
+	var preemptGraceRaw string
+	arguments.GetString(&preemptGraceRaw, util.DefaultPreemptGraceKey)
+	if preemptGraceRaw != "" {
+		if d, err := util.ParseGraceDuration(preemptGraceRaw); err != nil {
+			klog.Errorf("Invalid %s value %q: %v", util.DefaultPreemptGraceKey, preemptGraceRaw, err)
+		} else {
+			pmpt.defaultPreemptGrace = d
+		}
+	}
 	pmpt.ssn = ssn
 }
 
@@ -152,6 +167,11 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 
 		// check job if starving for more resources.
 		if !ssn.JobStarving(job) {
+			continue
+		}
+
+		if remaining := util.PreemptGraceRemaining(job, pmpt.defaultPreemptGrace, time.Now()); remaining > 0 {
+			klog.V(3).Infof("Job <%s/%s> Queue <%s> skip preemption: within preempt grace, %s remaining for the autoscaler to add capacity", job.Namespace, job.Name, job.Queue, remaining.Round(time.Second))
 			continue
 		}
 

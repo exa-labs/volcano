@@ -21,10 +21,14 @@ limitations under the License.
 package reclaim
 
 import (
+	"flag"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/cmd/scheduler/app/options"
@@ -42,6 +46,8 @@ import (
 
 func init() {
 	options.Default()
+	klog.InitFlags(nil)
+	flag.Set("v", "4")
 }
 
 func TestReclaim(t *testing.T) {
@@ -331,6 +337,109 @@ func TestReclaim(t *testing.T) {
 	for i, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
 			test.RegisterSession(tiers, nil)
+			defer test.Close()
+			test.Run([]framework.Action{reclaim})
+			if err := test.CheckAll(i); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestReclaimGrace(t *testing.T) {
+	plugins := map[string]framework.PluginBuilder{
+		conformance.PluginName: conformance.New,
+		gang.PluginName:        gang.New,
+		proportion.PluginName:  proportion.New,
+	}
+
+	createdAt := func(pod *v1.Pod, ts time.Time) *v1.Pod {
+		pod.CreationTimestamp = metav1.NewTime(ts)
+		return pod
+	}
+
+	tests := []uthelper.TestCommonStruct{
+		{
+			Name:    "do not reclaim while the job is within its preempt grace",
+			Plugins: plugins,
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q2", 1, nil, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			Pods: []*v1.Pod{
+				util.BuildPod("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "false"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptee2", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptee3", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "false"}, make(map[string]string)),
+				createdAt(util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg2", make(map[string]string), make(map[string]string)), time.Now()),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("3", "3Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), make(map[string]string)),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, nil),
+				util.BuildQueue("q2", 1, nil),
+			},
+			ExpectEvictNum: 0,
+			ExpectEvicted:  []string{},
+		},
+		{
+			Name:    "reclaim once the job's preempt grace has elapsed",
+			Plugins: plugins,
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q2", 1, nil, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			Pods: []*v1.Pod{
+				util.BuildPod("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "false"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptee2", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptee3", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "false"}, make(map[string]string)),
+				createdAt(util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg2", make(map[string]string), make(map[string]string)), time.Now().Add(-11*time.Minute)),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("3", "3Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), make(map[string]string)),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, nil),
+				util.BuildQueue("q2", 1, nil),
+			},
+			ExpectEvictNum: 1,
+			ExpectEvicted:  []string{"c1/preemptee2"},
+		},
+	}
+
+	reclaim := New()
+	trueValue := true
+	tiers := []conf.Tier{
+		{
+			Plugins: []conf.PluginOption{
+				{
+					Name:               conformance.PluginName,
+					EnabledReclaimable: &trueValue,
+				},
+				{
+					Name:               gang.PluginName,
+					EnabledReclaimable: &trueValue,
+					EnabledJobStarving: &trueValue,
+				},
+				{
+					Name:               proportion.PluginName,
+					EnabledReclaimable: &trueValue,
+					EnabledQueueOrder:  &trueValue,
+					EnablePreemptive:   &trueValue,
+				},
+				{
+					Name:               priority.PluginName,
+					EnabledReclaimable: &trueValue,
+					EnabledJobOrder:    &trueValue,
+					EnabledTaskOrder:   &trueValue,
+				},
+			},
+		},
+	}
+	for i, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			test.RegisterSession(tiers, []conf.Configuration{{Name: reclaim.Name(),
+				Arguments: map[string]interface{}{util.DefaultPreemptGraceKey: "10m"}}})
 			defer test.Close()
 			test.Run([]framework.Action{reclaim})
 			if err := test.CheckAll(i); err != nil {
