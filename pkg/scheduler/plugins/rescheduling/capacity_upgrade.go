@@ -152,6 +152,9 @@ type capacityUpgradeProposal struct {
 	// Preempting is the number of lower-priority pods the placement relies
 	// on the preempt action evicting from the target nodes.
 	Preempting int `json:"preempting"`
+	// Priority is the gang's highest member pod priority; the lifecycle
+	// owner executes proposals highest priority first.
+	Priority int32 `json:"priority"`
 	// At is when the proposal was made (RFC3339).
 	At string `json:"at"`
 }
@@ -364,6 +367,7 @@ func planCapacityUpgrades(
 				Members:    len(cand.members),
 				Gpus:       cand.gpus / 1000,
 				Preempting: placement.preempting,
+				Priority:   cand.priority,
 				At:         now.UTC().Format(time.RFC3339),
 			},
 		}

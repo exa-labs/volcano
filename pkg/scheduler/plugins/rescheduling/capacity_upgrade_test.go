@@ -176,7 +176,7 @@ func TestUpgradeGangIsProposedNotEvictedAndStaysInOneZone(t *testing.T) {
 		t.Fatalf("expected 1 plan, got %d", len(plans))
 	}
 	p := plans[0]
-	if !p.gang || p.proposal.Zone != "a" || p.proposal.Members != 2 || p.proposal.Gpus != 16 {
+	if !p.gang || p.proposal.Zone != "a" || p.proposal.Members != 2 || p.proposal.Gpus != 16 || p.proposal.Priority != -4 {
 		t.Fatalf("unexpected gang plan: %+v", p.proposal)
 	}
 	if len(p.proposal.Nodes) != 2 || p.proposal.Nodes[0] != "reserved-a" || p.proposal.Nodes[1] != "reserved-a2" {
@@ -279,6 +279,11 @@ func TestUpgradeOrdersHighestPriorityThenOldest(t *testing.T) {
 	}
 	if plans[0].members[0].Name != "high-old" || plans[1].members[0].Name != "high-new" {
 		t.Fatalf("unexpected order: %s, %s", plans[0].members[0].Name, plans[1].members[0].Name)
+	}
+	for _, p := range plans {
+		if p.proposal.Priority != -4 {
+			t.Fatalf("expected the -4 groups to win the room, got %+v", p.proposal)
+		}
 	}
 }
 
