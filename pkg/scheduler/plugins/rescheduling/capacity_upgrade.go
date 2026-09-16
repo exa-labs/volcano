@@ -59,6 +59,7 @@ const CapacityUpgradeStrategy = "capacityUpgrade"
 // DefaultCapacityUpgradeConf holds the default (dry-run) configuration.
 var DefaultCapacityUpgradeConf = map[string]interface{}{
 	"dryRun":            true,
+	"evictPods":         true,
 	"gpuResource":       "nvidia.com/gpu",
 	"nodeLabelKey":      capacitycost.DefaultNodeLabelKey,
 	"order":             capacitycost.DefaultOrder,
@@ -86,7 +87,11 @@ const (
 )
 
 type capacityUpgradeConf struct {
-	DryRun      bool   `mapstructure:"dryRun"`
+	DryRun bool `mapstructure:"dryRun"`
+	// EvictPods enables direct eviction of single-member PodGroups. With
+	// it off (and dryRun off) only gang proposals are stamped, so the
+	// lifecycle owner's side can be validated before any pod is evicted.
+	EvictPods   bool   `mapstructure:"evictPods"`
 	GpuResource string `mapstructure:"gpuResource"`
 	// NodeLabelKey, Order and UnlabeledRank define the capacity rank exactly
 	// as in the capacitycost plugin; keep them identical in the scheduler
@@ -228,7 +233,7 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 			kind = "gang"
 		}
 		pg := plan.job.PodGroup
-		if conf.DryRun {
+		if conf.DryRun || (!plan.gang && !conf.EvictPods) {
 			klog.V(2).Infof("capacityUpgrade[dry-run]: would move %s %s/%s (%d pods, %v GPUs) %s -> %s on %v (preempting %d)",
 				kind, pg.Namespace, pg.Name, plan.proposal.Members, plan.proposal.Gpus,
 				plan.proposal.From, plan.proposal.Target, plan.proposal.Nodes, plan.proposal.Preempting)

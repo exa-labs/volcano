@@ -353,11 +353,11 @@ func TestUpgradeMixedGangCountsOwnReservedMembersAsRoom(t *testing.T) {
 func TestUpgradeConfParseFallsBackOnBadParams(t *testing.T) {
 	conf := newCapacityUpgradeConf()
 	conf.parse(map[string]interface{}{"cooldownSeconds": "not-a-number"})
-	if conf.CooldownSeconds != 1800 || !conf.DryRun {
+	if conf.CooldownSeconds != 1800 || !conf.DryRun || !conf.EvictPods {
 		t.Fatalf("expected defaults after bad params, got %+v", conf)
 	}
-	conf.parse(map[string]interface{}{"dryRun": false, "maxGangProposals": 5, "order": "reserved,spot"})
-	if conf.DryRun || conf.MaxGangProposals != 5 || conf.Order != "reserved,spot" {
+	conf.parse(map[string]interface{}{"dryRun": false, "evictPods": false, "maxGangProposals": 5, "order": "reserved,spot"})
+	if conf.DryRun || conf.EvictPods || conf.MaxGangProposals != 5 || conf.Order != "reserved,spot" {
 		t.Fatalf("unexpected parsed conf: %+v", conf)
 	}
 }
