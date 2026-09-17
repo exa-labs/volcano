@@ -23,6 +23,8 @@ limitations under the License.
 package reclaim
 
 import (
+	"time"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
@@ -34,11 +36,17 @@ import (
 
 type Action struct {
 	enablePredicateErrorCache bool
+
+	// defaultPreemptGrace (action argument util.DefaultPreemptGraceKey) delays
+	// reclaim for a starving job while its pending pods wait for the autoscaler
+	// to add capacity. A pod's exa.ai/preempt-grace annotation overrides it.
+	defaultPreemptGrace time.Duration
 }
 
 func New() *Action {
 	return &Action{
 		enablePredicateErrorCache: true,
+		defaultPreemptGrace:       0,
 	}
 }
 
@@ -51,6 +59,15 @@ func (ra *Action) Initialize() {}
 func (ra *Action) parseArguments(ssn *framework.Session) {
 	arguments := framework.GetArgOfActionFromConf(ssn.Configurations, ra.Name())
 	arguments.GetBool(&ra.enablePredicateErrorCache, conf.EnablePredicateErrCacheKey)
+	var preemptGraceRaw string
+	arguments.GetString(&preemptGraceRaw, util.DefaultPreemptGraceKey)
+	if preemptGraceRaw != "" {
+		if d, err := util.ParseGraceDuration(preemptGraceRaw); err != nil {
+			klog.Errorf("Invalid %s value %q: %v", util.DefaultPreemptGraceKey, preemptGraceRaw, err)
+		} else {
+			ra.defaultPreemptGrace = d
+		}
+	}
 }
 
 func (ra *Action) Execute(ssn *framework.Session) {
@@ -88,6 +105,10 @@ func (ra *Action) Execute(ssn *framework.Session) {
 		}
 
 		if ssn.JobStarving(job) {
+			if remaining := util.PreemptGraceRemaining(job, ra.defaultPreemptGrace, time.Now()); remaining > 0 {
+				klog.V(3).Infof("Job <%s/%s> Queue <%s> skip reclaim: within preempt grace, %s remaining for the autoscaler to add capacity", job.Namespace, job.Name, job.Queue, remaining.Round(time.Second))
+				continue
+			}
 			if _, found := preemptorsMap[job.Queue]; !found {
 				preemptorsMap[job.Queue] = util.NewPriorityQueue(ssn.JobOrderFn)
 			}
