@@ -133,6 +133,14 @@ var (
 		},
 	)
 
+	preemptionBackoffSkips = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Subsystem: VolcanoSubSystemName,
+			Name:      "preemption_backoff_skips_total",
+			Help:      "Number of times a starving job was skipped by the preempt action because its previous preemption attempts failed and it is backing off",
+		},
+	)
+
 	unscheduleTaskCount = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: VolcanoSubSystemName,
@@ -212,6 +220,11 @@ func UpdatePreemptionVictimsCount(victimsCount int) {
 // RegisterPreemptionAttempts records number of attempts for preemtion
 func RegisterPreemptionAttempts() {
 	preemptionAttempts.Inc()
+}
+
+// RegisterPreemptionBackoffSkip records a starving job skipped by preemption backoff
+func RegisterPreemptionBackoffSkip() {
+	preemptionBackoffSkips.Inc()
 }
 
 // UpdateUnscheduleTaskCount records total number of unscheduleable tasks

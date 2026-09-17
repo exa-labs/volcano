@@ -70,6 +70,13 @@ const (
 	// transaction is retried with the previously chosen nodes excluded when the
 	// job could not be pipelined as a whole. 0 disables retries.
 	GangPlacementRetriesKey = "gangPlacementRetries"
+
+	// PreemptionBackoffSecondsKey is the interval a starving job is skipped
+	// for after its preemption transaction is discarded; it doubles with
+	// each consecutive failure up to PreemptionMaxBackoffSecondsKey and is
+	// reset once a transaction for the job commits. 0 disables the backoff.
+	PreemptionBackoffSecondsKey    = "preemptionBackoffSeconds"
+	PreemptionMaxBackoffSecondsKey = "preemptionMaxBackoffSeconds"
 )
 
 type Action struct {
@@ -86,6 +93,12 @@ type Action struct {
 	minCandidateNodesAbsolute     int
 	maxCandidateNodesAbsolute     int
 	gangPlacementRetries          int
+	preemptionBackoffSeconds      int
+	preemptionMaxBackoffSeconds   int
+
+	// backoff persists across sessions: the action is registered once and
+	// Execute is called on the same instance every scheduling cycle.
+	backoff *preemptBackoff
 }
 
 func New() *Action {
@@ -98,6 +111,9 @@ func New() *Action {
 		minCandidateNodesAbsolute:        1,
 		maxCandidateNodesAbsolute:        100,
 		gangPlacementRetries:             2,
+		preemptionBackoffSeconds:         0,
+		preemptionMaxBackoffSeconds:      60,
+		backoff:                          newPreemptBackoff(),
 	}
 }
 
@@ -117,6 +133,12 @@ func (pmpt *Action) parseArguments(ssn *framework.Session) {
 	arguments.GetInt(&pmpt.minCandidateNodesAbsolute, MinCandidateNodesAbsoluteKey)
 	arguments.GetInt(&pmpt.maxCandidateNodesAbsolute, MaxCandidateNodesAbsoluteKey)
 	arguments.GetInt(&pmpt.gangPlacementRetries, GangPlacementRetriesKey)
+	arguments.GetInt(&pmpt.preemptionBackoffSeconds, PreemptionBackoffSecondsKey)
+	arguments.GetInt(&pmpt.preemptionMaxBackoffSeconds, PreemptionMaxBackoffSecondsKey)
+	pmpt.backoff.configure(
+		time.Duration(pmpt.preemptionBackoffSeconds)*time.Second,
+		time.Duration(pmpt.preemptionMaxBackoffSeconds)*time.Second,
+	)
 	pmpt.ssn = ssn
 }
 
@@ -131,6 +153,8 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 
 	var underRequest []*api.JobInfo
 	queues := map[api.QueueID]*api.QueueInfo{}
+	starving := sets.New[api.JobID]()
+	defer func() { pmpt.backoff.prune(starving) }()
 
 	for _, job := range ssn.Jobs {
 		if job.IsPending() {
@@ -162,6 +186,14 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 			continue
 		}
 
+		starving.Insert(job.UID)
+		if pmpt.backoff.shouldSkip(job.UID) {
+			klog.V(4).Infof("Job <%s/%s> Queue <%s> skip preemption, reason: backing off after failed preemption",
+				job.Namespace, job.Name, job.Queue)
+			metrics.RegisterPreemptionBackoffSkip()
+			continue
+		}
+
 		if _, found := preemptorsMap[job.Queue]; !found {
 			preemptorsMap[job.Queue] = util.NewPriorityQueue(ssn.JobOrderFn)
 		}
@@ -190,8 +222,10 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 			// Commit changes only if job is pipelined, otherwise try next job.
 			assigned, committed := pmpt.preemptForJob(ssn, preemptorJob, preemptorTasks, predicateHelpers)
 			if !committed {
+				pmpt.backoff.recordFailure(preemptorJob.UID)
 				continue
 			}
+			pmpt.backoff.recordSuccess(preemptorJob.UID)
 
 			if assigned {
 				preemptors.Push(preemptorJob)
@@ -240,6 +274,7 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 				if !assigned {
 					break
 				}
+				pmpt.backoff.recordSuccess(job.UID)
 			}
 		}
 	}
@@ -739,7 +774,7 @@ func (pmpt *Action) findCandidates(preemptor *api.TaskInfo, filter func(*api.Tas
 		klog.V(3).Infof("No nodes are eligible to preempt task %s/%s", preemptor.Namespace, preemptor.Name)
 		return nil, nil, nil
 	}
-	klog.Infof("the predicateNodes number is %d", len(predicateNodes))
+	klog.V(3).Infof("Task <%s/%s> has %d predicate nodes for preemption", preemptor.Namespace, preemptor.Name, len(predicateNodes))
 
 	nodeToStatusMap := make(map[string]api.Status)
 
@@ -845,7 +880,14 @@ func (pmpt *Action) DryRunPreemption(preemptor *api.TaskInfo, potentialNodes []*
 	state := pmpt.ssn.GetCycleState(preemptor.UID)
 
 	checkNode := func(i int) {
-		nodeInfoCopy := potentialNodes[(int(offset)+i)%len(potentialNodes)].Clone()
+		node := potentialNodes[(int(offset)+i)%len(potentialNodes)]
+		if err := preemptableCapacityFits(preemptor, node, filter); err != nil {
+			statusesLock.Lock()
+			nodeStatuses[node.Name] = *api.AsStatus(err)
+			statusesLock.Unlock()
+			return
+		}
+		nodeInfoCopy := node.Clone()
 		stateCopy := state.Clone()
 
 		victims, status := SelectVictimsOnNode(ctx, stateCopy, preemptor, currentQueue, nodeInfoCopy, pmpt.ssn, filter, stmt)
@@ -873,6 +915,25 @@ func (pmpt *Action) DryRunPreemption(preemptor *api.TaskInfo, potentialNodes []*
 
 	workqueue.ParallelizeUntil(ctx, pmpt.topologyAwarePreemptWorkerNum, len(potentialNodes), checkNode)
 	return candidates.get(), nodeStatuses, utilerrors.NewAggregate(errs)
+}
+
+// preemptableCapacityFits is the cheap upper bound on what a dry run against
+// the node can free: the node's future idle plus the requests of every task
+// the filter admits. Preemptable plugins can only shrink that victim set, so
+// when the preemptor does not fit even this bound the dry run — which clones
+// the node, its tasks and the cycle state — cannot succeed and is skipped.
+func preemptableCapacityFits(preemptor *api.TaskInfo, node *api.NodeInfo, filter func(*api.TaskInfo) bool) error {
+	releasable := node.FutureIdle()
+	for _, task := range node.Tasks {
+		if filter == nil || filter(task) {
+			releasable.Add(task.Resreq)
+		}
+	}
+	if !preemptor.InitResreq.LessEqual(releasable, api.Zero) {
+		return fmt.Errorf("not enough preemptable resources on node %q: requested <%v>, but at most <%v> can be freed",
+			node.Name, preemptor.InitResreq, releasable)
+	}
+	return nil
 }
 
 type candidate struct {
@@ -1044,7 +1105,7 @@ func SelectVictimsOnNode(
 			victims = append(victims, pi)
 			klog.V(3).Info("Pod is a potential preemption victim on node", "pod", klog.KObj(pi.Pod), "node", klog.KObj(nodeInfo.Node))
 		}
-		klog.Infof("reprievePod for task: %v, fits: %v", pi.Name, fits)
+		klog.V(4).Infof("reprievePod for task: %v, fits: %v", pi.Name, fits)
 		return fits, nil
 	}
 
@@ -1055,7 +1116,7 @@ func SelectVictimsOnNode(
 		}
 	}
 
-	klog.Infof("victims: %v", victims)
+	klog.V(3).Infof("Task <%s/%s> victims on Node <%s>: %v", preemptor.Namespace, preemptor.Name, nodeInfo.Name, victims)
 
 	return victims, &api.Status{
 		Reason: "",

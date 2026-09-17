@@ -18,10 +18,11 @@ package main
 import (
 	"fmt"
 	"os"
-	"runtime"
 	"time"
 
 	"github.com/spf13/pflag"
+	// Sizes GOMAXPROCS from the container's CPU quota; leave it in place, the
+	// host CPU count is the wrong ceiling under a cgroup limit.
 	_ "go.uber.org/automaxprocs"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -45,8 +46,6 @@ import (
 var logFlushFreq = pflag.Duration("log-flush-frequency", 5*time.Second, "Maximum number of seconds between log flushes")
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
 	klog.InitFlags(nil)
 
 	fs := pflag.CommandLine
