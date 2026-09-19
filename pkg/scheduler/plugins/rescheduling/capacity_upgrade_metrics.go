@@ -21,9 +21,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Prometheus metrics for the capacityUpgrade strategy. "kind" is pod (a
-// single-member PodGroup evicted directly) or gang (a proposal left for the
-// lifecycle owner); "mode" is dry_run, live (evicted) or proposed.
+// Prometheus metrics for the capacityUpgrade strategy. "kind" is pod (one
+// pod restarted on its own) or gang (a whole PodGroup restarted together);
+// "mode" is dry_run (planned only), held (move started: holds written,
+// victims evicted) or moved (successor claimed the held capacity).
 var (
 	capacityUpgradePasses = promauto.NewCounter(
 		prometheus.CounterOpts{
@@ -61,7 +62,23 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: "volcano",
 			Name:      "capacity_upgrade_stamp_failures_total",
-			Help:      "PodGroup annotation failures, by kind (proposal skips the gang, victim skips the eviction).",
+			Help:      "Cluster write failures, by kind: mover (PodGroup cooldown/budget, skips the move), hold (node hold/drain state, skips or delays the step), successor (cooldown carry-over lost).",
 		}, []string{"kind"},
+	)
+
+	capacityUpgradeEvictions = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "volcano",
+			Name:      "capacity_upgrade_evictions_total",
+			Help:      "Pods evicted for capacity-upgrade moves, by move kind and role: victim (lower-priority pod on a target node) or mover (the pod being upgraded). Retried evictions count again.",
+		}, []string{"kind", "role"},
+	)
+
+	capacityUpgradeHoldOutcomes = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "volcano",
+			Name:      "capacity_upgrade_hold_outcomes_total",
+			Help:      "Finished capacity-upgrade moves by outcome (claimed, expired, abandoned) and kind; malformed counts node annotations that were cleared.",
+		}, []string{"outcome", "kind"},
 	)
 )
