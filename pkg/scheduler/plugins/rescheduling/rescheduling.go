@@ -22,6 +22,7 @@ import (
 
 	"github.com/mitchellh/mapstructure"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
@@ -97,42 +98,76 @@ func (rp *reschedulingPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 	}
 
-	// The drained-node penalty must run in every session (not just the
-	// rescheduling ones): replacements for evicted pods are scheduled in the
-	// sessions that follow a drain, and without it an equally-utilized
-	// drained node ties with the intended destination under binpack.
+	// Some strategy hooks must run in every session, not just the
+	// rescheduling ones, because they act on the sessions that follow an
+	// eviction: the gpuFragmentation drained-node penalty (without it an
+	// equally-utilized drained node ties with the intended destination
+	// under binpack) and the capacityUpgrade hold/drain predicate, hold
+	// preference and move maintenance (a move is a transaction that
+	// progresses one session at a time). The session keeps one hook of
+	// each kind per plugin, so they are composed here.
+	nodeOrderFns := make([]api.NodeOrderFn, 0)
+	everySessionVictimFns := make([]api.VictimTasksFn, 0)
 	for _, strategy := range configs.strategies {
-		if strategy.Name != GpuFragmentationStrategy || os.Getenv(KillSwitchEnv) == "true" {
-			continue
+		switch strategy.Name {
+		case GpuFragmentationStrategy:
+			if os.Getenv(KillSwitchEnv) == "true" {
+				continue
+			}
+			conf := newGpuFragmentationConf()
+			if params, ok := RegisteredStrategyConfigs[GpuFragmentationStrategy].(map[string]interface{}); ok {
+				conf.parse(params)
+			}
+			if !conf.DryRun {
+				nodeOrderFns = append(nodeOrderFns, gpuFragmentationNodeOrderFn(conf))
+			}
+		case CapacityUpgradeStrategy:
+			gpu := v1.ResourceName(loadCapacityUpgradeConf().GpuResource)
+			idx := capacityUpgradeSessionIndex()
+			ssn.AddPredicateFn(rp.Name(), capacityUpgradePredicateFn(idx, gpu))
+			nodeOrderFns = append(nodeOrderFns, capacityUpgradeNodeOrderFn(idx, gpu))
+			everySessionVictimFns = append(everySessionVictimFns, victimsFnForCapacityUpgradeMoves)
 		}
-		conf := newGpuFragmentationConf()
-		if params, ok := RegisteredStrategyConfigs[GpuFragmentationStrategy].(map[string]interface{}); ok {
-			conf.parse(params)
-		}
-		if !conf.DryRun {
-			ssn.AddNodeOrderFn(rp.Name(), gpuFragmentationNodeOrderFn(conf))
-		}
-		break
+	}
+	if len(nodeOrderFns) > 0 {
+		ssn.AddNodeOrderFn(rp.Name(), sumNodeOrderFns(nodeOrderFns))
 	}
 
-	if !timeToRun(configs.interval) {
+	victimFns := everySessionVictimFns
+	if timeToRun(configs.interval) {
+		for _, strategy := range configs.strategies {
+			if VictimFn[strategy.Name] != nil {
+				klog.V(4).Infof("strategy: %s\n", strategy.Name)
+				victimFns = append(victimFns, VictimFn[strategy.Name])
+			}
+		}
+	} else {
 		klog.V(3).Infof("It is not the time to execute rescheduling strategies.")
-		return
 	}
+	if len(victimFns) > 0 {
+		ssn.AddVictimTasksFns(rp.Name(), victimFns)
+	}
+}
 
-	// Get all strategies and register the victim functions for each strategy.
-	victimFns := make([]api.VictimTasksFn, 0)
-	for _, strategy := range configs.strategies {
-		if VictimFn[strategy.Name] != nil {
-			klog.V(4).Infof("strategy: %s\n", strategy.Name)
-			victimFns = append(victimFns, VictimFn[strategy.Name])
+// sumNodeOrderFns composes node-order functions by adding their scores; the
+// first error wins.
+func sumNodeOrderFns(fns []api.NodeOrderFn) api.NodeOrderFn {
+	return func(task *api.TaskInfo, node *api.NodeInfo) (float64, error) {
+		total := 0.0
+		for _, fn := range fns {
+			score, err := fn(task, node)
+			if err != nil {
+				return 0, err
+			}
+			total += score
 		}
+		return total, nil
 	}
-	ssn.AddVictimTasksFns(rp.Name(), victimFns)
 }
 
 func (rp *reschedulingPlugin) OnSessionClose(ssn *framework.Session) {
 	Session = nil
+	sessionCapacityUpgrade = nil
 	for k := range RegisteredStrategyConfigs {
 		delete(RegisteredStrategyConfigs, k)
 	}

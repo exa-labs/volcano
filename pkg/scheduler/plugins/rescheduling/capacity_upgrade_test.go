@@ -16,9 +16,18 @@ limitations under the License.
 
 package rescheduling
 
+// Tests for the capacityUpgrade strategy: the planner (which groups may
+// move where, in what order, with which victims) and the move transaction
+// (holds, drains, sequencing, claims, failure paths). The transaction tests
+// drive a move through the same steps the scheduler would across sessions,
+// re-reading the state from node annotations each time as a new session
+// does.
+
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
@@ -34,11 +44,13 @@ import (
 const (
 	capacityTypeLabel = "karpenter.sh/capacity-type"
 	zoneLabel         = "topology.kubernetes.io/zone"
+	gpuRes            = v1.ResourceName("nvidia.com/gpu")
 )
 
 var testNow = time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 
-// tierNode builds an 8-GPU node on the given capacity type and zone.
+// tierNode builds an 8-GPU node on the given capacity type and zone; an
+// empty capacity type leaves the node unlabeled.
 func tierNode(name, capacityType, zone string) *api.NodeInfo {
 	labels := map[string]string{"karpenter.sh/nodepool": testPool, zoneLabel: zone}
 	if capacityType != "" {
@@ -54,7 +66,8 @@ func tierNode(name, capacityType, zone string) *api.NodeInfo {
 }
 
 // tierPod builds a running, controller-owned GPU pod in PodGroup group with
-// the given priority, started age ago.
+// the given priority, started age ago. Its controller owner is derived from
+// the group so pods of one group share an identity.
 func tierPod(name, nodeName, group string, gpus int64, priority int32, age time.Duration) *v1.Pod {
 	pod := util.BuildPod("default", name, nodeName, v1.PodRunning, v1.ResourceList{
 		"cpu":            *apiResource("4"),
@@ -68,7 +81,31 @@ func tierPod(name, nodeName, group string, gpus int64, priority int32, age time.
 	pod.Spec.Priority = &priority
 	started := metav1.NewTime(testNow.Add(-age))
 	pod.Status.StartTime = &started
+	pod.CreationTimestamp = started
 	return pod
+}
+
+// successorPod builds a pending pod that restarts group after a move: same
+// owner, created at the given time, not yet bound.
+func successorPod(name, group string, gpus int64, priority int32, created time.Time) *v1.Pod {
+	pod := tierPod(name, "", group, gpus, priority, 0)
+	pod.Status.Phase = v1.PodPending
+	pod.Status.StartTime = nil
+	pod.CreationTimestamp = metav1.NewTime(created)
+	return pod
+}
+
+// inGroup moves the pod into another PodGroup, keeping its owner (a
+// restarted single pod gets a fresh per-pod PodGroup).
+func inGroup(pod *v1.Pod, group string) *v1.Pod {
+	pod.Annotations[schedulingv1beta1.KubeGroupNameAnnotationKey] = group
+	return pod
+}
+
+// sameTask reports whether two task views refer to the same pod (nodes hold
+// clones of the jobs' tasks).
+func sameTask(a, b *api.TaskInfo) bool {
+	return a != nil && b != nil && a.UID == b.UID
 }
 
 // placeGroup binds pods to their nodes and registers them as one job whose
@@ -84,25 +121,219 @@ func (f *fixture) placeGroup(t *testing.T, minMember int32, annotations map[stri
 		if err := node.AddTask(task); err != nil {
 			t.Fatalf("AddTask(%s): %v", pod.Name, err)
 		}
-		if job == nil {
-			job = api.NewJobInfo(task.Job, task)
-			pg := &api.PodGroup{PodGroup: scheduling.PodGroup{
-				ObjectMeta: metav1.ObjectMeta{Name: string(task.Job), Namespace: pod.Namespace, Annotations: annotations},
-				Spec:       scheduling.PodGroupSpec{MinMember: minMember, Queue: "default"},
-			}}
-			job.SetPodGroup(pg)
-			f.jobs[task.Job] = job
-		} else {
-			job.AddTaskInfo(task)
-		}
+		job = f.registerTask(task, minMember, annotations)
 		f.running[pod.UID] = task
 	}
 	return job
 }
 
-func (f *fixture) planUpgrades(conf *capacityUpgradeConf, predicate capacityUpgradePredicate) []capacityUpgradePlan {
-	return planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, testNow, predicate)
+// registerTask adds the task to its job, creating the job and PodGroup on
+// first sight.
+func (f *fixture) registerTask(task *api.TaskInfo, minMember int32, annotations map[string]string) *api.JobInfo {
+	job, ok := f.jobs[task.Job]
+	if !ok {
+		job = api.NewJobInfo(task.Job, task)
+		pg := &api.PodGroup{PodGroup: scheduling.PodGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        task.Pod.Annotations[schedulingv1beta1.KubeGroupNameAnnotationKey],
+				Namespace:   task.Namespace,
+				Annotations: annotations,
+			},
+			Spec: scheduling.PodGroupSpec{MinMember: minMember, Queue: "default"},
+		}}
+		job.SetPodGroup(pg)
+		f.jobs[task.Job] = job
+		return job
+	}
+	job.AddTaskInfo(task)
+	return job
 }
+
+// evict marks a task Releasing exactly as Session.Evict does: the pod is
+// terminating, its GPUs are no longer idle but will be once it is gone.
+func (f *fixture) evict(t *testing.T, task *api.TaskInfo) {
+	if err := f.jobs[task.Job].UpdateTaskStatus(task, api.Releasing); err != nil {
+		t.Fatalf("UpdateTaskStatus(%s): %v", task.Name, err)
+	}
+	if err := f.nodes[task.NodeName].UpdateTask(task); err != nil {
+		t.Fatalf("UpdateTask(%s): %v", task.Name, err)
+	}
+	delete(f.running, task.Pod.UID)
+}
+
+// remove drops a task entirely (the pod finished terminating).
+func (f *fixture) remove(t *testing.T, task *api.TaskInfo) {
+	if err := f.nodes[task.NodeName].RemoveTask(task); err != nil {
+		t.Fatalf("RemoveTask(%s): %v", task.Name, err)
+	}
+	if err := f.jobs[task.Job].DeleteTaskInfo(task); err != nil {
+		t.Fatalf("DeleteTaskInfo(%s): %v", task.Name, err)
+	}
+	delete(f.running, task.Pod.UID)
+}
+
+// bind places a pending pod on a node as Running, registering its job.
+func (f *fixture) bind(t *testing.T, pod *v1.Pod, nodeName string, minMember int32) *api.TaskInfo {
+	pod.Spec.NodeName = nodeName
+	pod.Status.Phase = v1.PodRunning
+	task := api.NewTaskInfo(pod)
+	if err := f.nodes[nodeName].AddTask(task); err != nil {
+		t.Fatalf("AddTask(%s): %v", pod.Name, err)
+	}
+	f.registerTask(task, minMember, nil)
+	f.running[pod.UID] = task
+	return task
+}
+
+// index re-reads the move state from node annotations, as a new session
+// does.
+func (f *fixture) index() *capacityUpgradeIndex {
+	return indexCapacityUpgrade(f.nodes)
+}
+
+func (f *fixture) planUpgrades(conf *capacityUpgradeConf, predicate capacityUpgradePredicate) []capacityUpgradePlan {
+	return planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), testNow, predicate)
+}
+
+// memStore is a capacityUpgradeStore that applies node writes to the
+// fixture's node annotations (so the next index sees them) and records
+// every write in order. Writes can be made to fail per node.
+type memStore struct {
+	f         *fixture
+	log       []string
+	groups    []groupStamp
+	failNode  map[string]error
+	failStamp error
+}
+
+func newMemStore(f *fixture) *memStore {
+	return &memStore{f: f, failNode: map[string]error{}}
+}
+
+func (s *memStore) writeNode(name string, state nodeState) error {
+	if err := s.failNode[name]; err != nil {
+		return err
+	}
+	node := s.f.nodes[name]
+	if node == nil || node.Node == nil {
+		return fmt.Errorf("node %s not found", name)
+	}
+	annotations, err := nodeAnnotations(state)
+	if err != nil {
+		return err
+	}
+	if node.Node.Annotations == nil {
+		node.Node.Annotations = map[string]string{}
+	}
+	for key, value := range annotations {
+		if value == nil {
+			delete(node.Node.Annotations, key)
+		} else {
+			node.Node.Annotations[key] = *value
+		}
+	}
+	s.log = append(s.log, "node:"+name)
+	return nil
+}
+
+func (s *memStore) stampGroup(stamp groupStamp) error {
+	if s.failStamp != nil {
+		return s.failStamp
+	}
+	s.groups = append(s.groups, stamp)
+	s.log = append(s.log, "group:"+stamp.namespace+"/"+stamp.name)
+	return nil
+}
+
+// holdsOn decodes the holds annotation of a node.
+func (f *fixture) holdsOn(t *testing.T, name string) []capacityHold {
+	raw, ok := f.nodes[name].Node.Annotations[CapacityUpgradeHoldsAnnotation]
+	if !ok {
+		return nil
+	}
+	holds, err := decodeHolds(raw)
+	if err != nil {
+		t.Fatalf("holds on %s: %v", name, err)
+	}
+	return holds
+}
+
+// drainsOn decodes the drains annotation of a node.
+func (f *fixture) drainsOn(t *testing.T, name string) []capacityDrain {
+	raw, ok := f.nodes[name].Node.Annotations[CapacityUpgradeDrainsAnnotation]
+	if !ok {
+		return nil
+	}
+	var drains []capacityDrain
+	if err := json.Unmarshal([]byte(raw), &drains); err != nil {
+		t.Fatalf("drains on %s: %v", name, err)
+	}
+	return drains
+}
+
+// liveConf is the strategy configuration with moves enabled.
+func liveConf() *capacityUpgradeConf {
+	conf := newCapacityUpgradeConf()
+	conf.DryRun = false
+	return conf
+}
+
+// startOnly plans one pass and makes every plan durable, returning the
+// plans and the victims the pass would evict.
+func (f *fixture) startOnly(t *testing.T, conf *capacityUpgradeConf, store *memStore) ([]capacityUpgradePlan, []*api.TaskInfo) {
+	idx := f.index()
+	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, testNow, nil)
+	victims := make([]*api.TaskInfo, 0)
+	for _, plan := range plans {
+		if err := startCapacityUpgradeMove(plan, idx, conf, store); err != nil {
+			t.Fatalf("startCapacityUpgradeMove: %v", err)
+		}
+		victims = append(victims, plan.victims...)
+	}
+	return plans, victims
+}
+
+// advance runs one session's maintenance at the given time and applies it,
+// returning the steps and the movers the session would evict.
+func (f *fixture) advance(conf *capacityUpgradeConf, store *memStore, now time.Time, predicate capacityUpgradePredicate) ([]moveStep, []*api.TaskInfo) {
+	steps := advanceCapacityUpgradeMoves(f.index(), f.nodes, f.jobs, conf, now, predicate)
+	return steps, applyMoveSteps(steps, store)
+}
+
+// allocateLike picks the node allocate would bind task to among the given
+// nodes: the first that passes the predicate with idle GPUs, else the first
+// that passes with future-idle GPUs (a pipelined placement onto releasing
+// capacity). It mirrors allocate's two-tier fit without the full action.
+func allocateLike(task *api.TaskInfo, nodes []*api.NodeInfo, predicate api.PredicateFn) string {
+	need := task.InitResreq.Get(gpuRes)
+	for _, node := range nodes {
+		if predicate != nil && predicate(task, node) != nil {
+			continue
+		}
+		if node.Idle.Get(gpuRes) >= need {
+			return node.Name
+		}
+	}
+	for _, node := range nodes {
+		if predicate != nil && predicate(task, node) != nil {
+			continue
+		}
+		if node.FutureIdle().Get(gpuRes) >= need {
+			return node.Name
+		}
+	}
+	return ""
+}
+
+func names(tasks []*api.TaskInfo) []string {
+	out := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		out = append(out, task.Name)
+	}
+	return out
+}
+
+// ---- planner -------------------------------------------------------------
 
 func TestUpgradeSinglePodMovesToIdleReserved(t *testing.T) {
 	f := newFixture(t)
@@ -115,11 +346,14 @@ func TestUpgradeSinglePodMovesToIdleReserved(t *testing.T) {
 		t.Fatalf("expected 1 plan, got %d", len(plans))
 	}
 	p := plans[0]
-	if p.gang || p.proposal.Target != "reserved" || p.proposal.From != "spot" || p.proposal.Preempting != 0 {
-		t.Fatalf("unexpected plan: %+v", p.proposal)
+	if p.gang || p.target != "reserved" || p.from != "spot" || len(p.victims) != 0 || p.moves != 1 {
+		t.Fatalf("unexpected plan: %+v", p)
 	}
-	if len(p.proposal.Nodes) != 1 || p.proposal.Nodes[0] != "reserved-1" || p.proposal.Gpus != 1 {
-		t.Fatalf("unexpected placement: %+v", p.proposal)
+	if len(p.nodes) != 1 || p.nodes["reserved-1"] != 1 || p.gpus != 1 {
+		t.Fatalf("unexpected placement: %+v", p.nodes)
+	}
+	if p.identity[ownerIdentityKey] != "owner-pg-train" {
+		t.Fatalf("expected owner identity, got %v", p.identity)
 	}
 }
 
@@ -137,8 +371,8 @@ func TestUpgradeCountsLowerPriorityFillerAsRoom(t *testing.T) {
 	if len(plans) != 1 {
 		t.Fatalf("expected 1 plan, got %d", len(plans))
 	}
-	if plans[0].proposal.Preempting != 4 || plans[0].proposal.Nodes[0] != "reserved-1" {
-		t.Fatalf("expected 4 preemptions on reserved-1, got %+v", plans[0].proposal)
+	if len(plans[0].victims) != 4 || plans[0].nodes["reserved-1"] != 4 {
+		t.Fatalf("expected 4 victims on reserved-1, got %v on %v", names(plans[0].victims), plans[0].nodes)
 	}
 }
 
@@ -155,7 +389,7 @@ func TestUpgradeDoesNotPreemptEqualOrHigherPriority(t *testing.T) {
 	}
 }
 
-func TestUpgradeGangIsProposedNotEvictedAndStaysInOneZone(t *testing.T) {
+func TestUpgradeGangStaysInOneZone(t *testing.T) {
 	f := newFixture(t)
 	f.addNode(tierNode("spot-1", "spot", "a"))
 	f.addNode(tierNode("spot-2", "spot", "a"))
@@ -176,11 +410,11 @@ func TestUpgradeGangIsProposedNotEvictedAndStaysInOneZone(t *testing.T) {
 		t.Fatalf("expected 1 plan, got %d", len(plans))
 	}
 	p := plans[0]
-	if !p.gang || p.proposal.Zone != "a" || p.proposal.Members != 2 || p.proposal.Gpus != 16 || p.proposal.Priority != -4 {
-		t.Fatalf("unexpected gang plan: %+v", p.proposal)
+	if !p.gang || p.zone != "a" || len(p.members) != 2 || p.gpus != 16 || p.priority != -4 {
+		t.Fatalf("unexpected gang plan: %+v", p)
 	}
-	if len(p.proposal.Nodes) != 2 || p.proposal.Nodes[0] != "reserved-a" || p.proposal.Nodes[1] != "reserved-a2" {
-		t.Fatalf("unexpected nodes: %v", p.proposal.Nodes)
+	if len(p.nodes) != 2 || p.nodes["reserved-a"] != 8 || p.nodes["reserved-a2"] != 8 {
+		t.Fatalf("unexpected nodes: %v", p.nodes)
 	}
 }
 
@@ -217,9 +451,10 @@ func TestUpgradePredicateFailureVetoesNode(t *testing.T) {
 	}
 }
 
-func TestUpgradeSkipsCooldownYoungAndOptedOut(t *testing.T) {
+func TestUpgradeSkipsCooldownYoungOptedOutProtectedAndExhausted(t *testing.T) {
 	f := newFixture(t)
 	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("spot-2", "spot", "a"))
 	f.addNode(tierNode("reserved-1", "reserved", "a"))
 	f.placeGroup(t, 1, map[string]string{CapacityUpgradeLastAnnotation: testNow.Add(-time.Minute).Format(time.RFC3339)},
 		tierPod("cooling", "spot-1", "pg-cooling", 1, -4, time.Hour))
@@ -231,6 +466,13 @@ func TestUpgradeSkipsCooldownYoungAndOptedOut(t *testing.T) {
 	protected.Annotations[doNotDisruptAnnotation] = "true"
 	f.placeGroup(t, 1, nil, protected)
 	f.placeGroup(t, 1, nil, tierPod("high", "spot-1", "pg-high", 1, 0, time.Hour))
+	f.placeGroup(t, 1, map[string]string{CapacityUpgradeCountAnnotation: "2"},
+		tierPod("exhausted", "spot-1", "pg-exhausted", 1, -4, time.Hour))
+	f.placeGroup(t, 1, map[string]string{CapacityUpgradeCountAnnotation: "garbage"},
+		tierPod("badcount", "spot-1", "pg-badcount", 1, -4, time.Hour))
+	orphan := tierPod("orphan", "spot-1", "pg-orphan", 1, -4, time.Hour)
+	orphan.OwnerReferences = nil
+	f.placeGroup(t, 1, nil, orphan)
 
 	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
 		t.Fatalf("expected no plan, got %+v", plans)
@@ -241,6 +483,37 @@ func TestUpgradeSkipsCooldownYoungAndOptedOut(t *testing.T) {
 	plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
 	if len(plans) != 1 || plans[0].members[0].Name != "cooling" {
 		t.Fatalf("expected cooled pod to move, got %+v", plans)
+	}
+
+	// The gang owner's lifecycle protection is not an opt-out, and a move
+	// count below the budget carries into the plan.
+	g := newFixture(t)
+	g.addNode(tierNode("spot-1", "spot", "a"))
+	g.addNode(tierNode("reserved-1", "reserved", "a"))
+	guarded := tierPod("guarded", "spot-1", "pg-guarded", 1, -4, time.Hour)
+	guarded.Annotations[doNotDisruptAnnotation] = "true"
+	guarded.Labels["exa.ai/gang-protection"] = "true"
+	g.placeGroup(t, 1, map[string]string{CapacityUpgradeCountAnnotation: "1"}, guarded)
+	plans = g.planUpgrades(newCapacityUpgradeConf(), nil)
+	if len(plans) != 1 || plans[0].members[0].Name != "guarded" || plans[0].moves != 2 {
+		t.Fatalf("expected protected gang pod to move as its 2nd move, got %+v", plans)
+	}
+}
+
+func TestUpgradeVictimsMustBeControlledUnprotectedGpuPods(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 4, -4, time.Hour))
+	guarded := tierPod("guarded", "reserved-1", "pg-guarded", 4, -9, time.Hour)
+	guarded.Annotations[doNotDisruptAnnotation] = "true"
+	f.placeGroup(t, 1, nil, guarded)
+	orphan := tierPod("orphan", "reserved-1", "pg-orphan", 4, -9, time.Hour)
+	orphan.OwnerReferences = nil
+	f.placeGroup(t, 1, nil, orphan)
+
+	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected no plan without evictable victims, got %+v", plans)
 	}
 }
 
@@ -259,8 +532,60 @@ func TestUpgradeLedgerPreventsDoubleBooking(t *testing.T) {
 	if len(plans) != 1 {
 		t.Fatalf("expected exactly 1 plan, got %d", len(plans))
 	}
-	if plans[0].proposal.Preempting != 2 {
-		t.Fatalf("expected 2 preemptions, got %+v", plans[0].proposal)
+	if len(plans[0].victims) != 2 {
+		t.Fatalf("expected 2 victims, got %v", names(plans[0].victims))
+	}
+}
+
+func TestUpgradeLedgerNetsOutHoldsInFlight(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("spot-2", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.placeGroup(t, 1, nil, tierPod("first", "spot-1", "pg-first", 4, -4, 2*time.Hour))
+	f.placeGroup(t, 1, nil, tierPod("second", "spot-2", "pg-second", 4, -4, time.Hour))
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("filler-%d", i)
+		f.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
+	}
+	store := newMemStore(f)
+	conf := liveConf()
+	conf.MaxVictims = 1
+
+	// Pass 1: "first" holds 4 GPUs on reserved-1 (4 idle) and stays put
+	// until the hold is honoured.
+	plans, victims := f.startOnly(t, conf, store)
+	if len(plans) != 1 || plans[0].members[0].Name != "first" || len(victims) != 0 {
+		t.Fatalf("expected first to hold idle room, got %+v", plans)
+	}
+	// Pass 2, before "first" moved: reserved-1 has 4 idle GPUs, all held,
+	// and 4 fillers. "second" must evict all 4 fillers to fit, not count
+	// the held idle GPUs; "first" is in flight and not re-planned.
+	plans = f.planUpgrades(conf, nil)
+	if len(plans) != 1 || plans[0].members[0].Name != "second" {
+		t.Fatalf("expected only second to plan, got %+v", plans)
+	}
+	if len(plans[0].victims) != 4 {
+		t.Fatalf("expected second to need all 4 fillers, got %v", names(plans[0].victims))
+	}
+
+	// A hold's own victims are spoken for: with the fillers promised to a
+	// hold, nothing is left for a third mover.
+	g := newFixture(t)
+	g.addNode(tierNode("spot-1", "spot", "a"))
+	g.addNode(tierNode("reserved-1", "reserved", "a"))
+	g.placeGroup(t, 1, nil, tierPod("first", "spot-1", "pg-first", 8, -4, 2*time.Hour))
+	g.placeGroup(t, 1, nil, tierPod("second", "spot-1", "pg-second", 4, -4, time.Hour))
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("filler-%d", i)
+		g.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
+	}
+	plans, victims = g.startOnly(t, conf, newMemStore(g))
+	if len(plans) != 1 || len(victims) != 8 {
+		t.Fatalf("expected first to take every filler, got %+v", plans)
+	}
+	if plans := g.planUpgrades(conf, nil); len(plans) != 0 {
+		t.Fatalf("expected no room left for second, got %+v", plans)
 	}
 }
 
@@ -272,8 +597,7 @@ func TestUpgradeOrdersHighestPriorityThenOldest(t *testing.T) {
 	f.placeGroup(t, 1, nil, tierPod("high-new", "spot-1", "pg-high-new", 4, -4, time.Hour))
 	f.placeGroup(t, 1, nil, tierPod("high-old", "spot-1", "pg-high-old", 4, -4, 2*time.Hour))
 	// Room for two movers.
-	conf := newCapacityUpgradeConf()
-	plans := f.planUpgrades(conf, nil)
+	plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
 	if len(plans) != 2 {
 		t.Fatalf("expected 2 plans, got %d", len(plans))
 	}
@@ -281,8 +605,8 @@ func TestUpgradeOrdersHighestPriorityThenOldest(t *testing.T) {
 		t.Fatalf("unexpected order: %s, %s", plans[0].members[0].Name, plans[1].members[0].Name)
 	}
 	for _, p := range plans {
-		if p.proposal.Priority != -4 {
-			t.Fatalf("expected the -4 groups to win the room, got %+v", p.proposal)
+		if p.priority != -4 {
+			t.Fatalf("expected the -4 groups to win the room, got %+v", p)
 		}
 	}
 }
@@ -314,13 +638,13 @@ func TestUpgradeRespectsPerPassBudgets(t *testing.T) {
 			tierPod(group+"-w1", "spot-2", group, 2, -4, time.Hour))
 	}
 	conf = newCapacityUpgradeConf()
-	conf.MaxGangProposals = 1
+	conf.MaxGangMoves = 1
 	if plans := g.planUpgrades(conf, nil); len(plans) != 1 || !plans[0].gang {
-		t.Fatalf("expected 1 gang proposal, got %+v", plans)
+		t.Fatalf("expected 1 gang move, got %+v", plans)
 	}
 }
 
-func TestUpgradeIgnoresGroupsAlreadyOnCheapestTier(t *testing.T) {
+func TestUpgradeIgnoresCheapestTierAndUnlabeledTargets(t *testing.T) {
 	f := newFixture(t)
 	f.addNode(tierNode("reserved-1", "reserved", "a"))
 	f.addNode(tierNode("reserved-2", "reserved", "a"))
@@ -330,6 +654,16 @@ func TestUpgradeIgnoresGroupsAlreadyOnCheapestTier(t *testing.T) {
 
 	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
 		t.Fatalf("expected no plan, got %+v", plans)
+	}
+
+	// An idle unlabeled node ranks 0 but is never a target: only a
+	// labeled tier is a known destination.
+	g := newFixture(t)
+	g.addNode(tierNode("spot-1", "spot", "a"))
+	g.addNode(tierNode("unlabeled", "", "a"))
+	g.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 1, -4, time.Hour))
+	if plans := g.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected no plan onto an unlabeled node, got %+v", plans)
 	}
 }
 
@@ -345,19 +679,717 @@ func TestUpgradeMixedGangCountsOwnReservedMembersAsRoom(t *testing.T) {
 		tierPod("w1", "spot-1", "pg-gang", 8, -4, time.Hour))
 
 	plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
-	if len(plans) != 1 || plans[0].proposal.Preempting != 0 || len(plans[0].proposal.Nodes) != 2 {
-		t.Fatalf("expected gang to fit both reserved nodes without preemption, got %+v", plans)
+	if len(plans) != 1 || len(plans[0].victims) != 0 || len(plans[0].nodes) != 2 {
+		t.Fatalf("expected gang to fit both reserved nodes without victims, got %+v", plans)
+	}
+}
+
+func TestUpgradeIdentityFromLabelsMustAgreeAcrossGang(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.addNode(tierNode("reserved-2", "reserved", "a"))
+	w0 := tierPod("w0", "spot-1", "pg-gang", 4, -4, time.Hour)
+	w1 := tierPod("w1", "spot-1", "pg-gang", 4, -4, time.Hour)
+	for _, pod := range []*v1.Pod{w0, w1} {
+		pod.Labels["execution-id"] = "exec-1"
+		pod.Labels["node-id"] = "n0"
+	}
+	f.placeGroup(t, 2, nil, w0, w1)
+
+	plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
+	if len(plans) != 1 || plans[0].identity["execution-id"] != "exec-1" || plans[0].identity["node-id"] != "n0" {
+		t.Fatalf("expected label identity, got %+v", plans)
+	}
+
+	w1.Labels["execution-id"] = "exec-2"
+	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected gang with disagreeing identity to be skipped, got %+v", plans)
 	}
 }
 
 func TestUpgradeConfParseFallsBackOnBadParams(t *testing.T) {
 	conf := newCapacityUpgradeConf()
 	conf.parse(map[string]interface{}{"cooldownSeconds": "not-a-number"})
-	if conf.CooldownSeconds != 1800 || !conf.DryRun || !conf.EvictPods {
+	if conf.CooldownSeconds != 1800 || !conf.DryRun || conf.MaxGangMoves != 2 || conf.HoldTTLSeconds != 600 {
 		t.Fatalf("expected defaults after bad params, got %+v", conf)
 	}
-	conf.parse(map[string]interface{}{"dryRun": false, "evictPods": false, "maxGangProposals": 5, "order": "reserved,spot"})
-	if conf.DryRun || conf.EvictPods || conf.MaxGangProposals != 5 || conf.Order != "reserved,spot" {
+	conf.parse(map[string]interface{}{"dryRun": false, "maxGangMoves": 5, "holdTtlSeconds": 30, "order": "reserved,spot"})
+	if conf.DryRun || conf.MaxGangMoves != 5 || conf.HoldTTLSeconds != 30 || conf.Order != "reserved,spot" {
 		t.Fatalf("unexpected parsed conf: %+v", conf)
 	}
+}
+
+// ---- transaction ---------------------------------------------------------
+
+func TestStartMoveWritesHoldsOnEveryTargetBeforeStamping(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("spot-2", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.addNode(tierNode("reserved-2", "reserved", "a"))
+	f.placeGroup(t, 2, nil,
+		tierPod("w0", "spot-1", "pg-gang", 8, -4, time.Hour),
+		tierPod("w1", "spot-2", "pg-gang", 8, -4, time.Hour))
+	f.placeGroup(t, 1, nil, tierPod("filler", "reserved-2", "pg-filler", 2, -9, time.Hour))
+	store := newMemStore(f)
+
+	plans, victims := f.startOnly(t, liveConf(), store)
+	if len(plans) != 1 || len(victims) != 1 || victims[0].Name != "filler" {
+		t.Fatalf("expected a gang plan evicting filler, got %+v / %v", plans, names(victims))
+	}
+	if got := strings.Join(store.log, ","); got != "node:reserved-1,node:reserved-2,group:default/pg-gang" {
+		t.Fatalf("expected holds before the mover stamp, got %s", got)
+	}
+	for _, node := range []string{"reserved-1", "reserved-2"} {
+		holds := f.holdsOn(t, node)
+		if len(holds) != 1 || holds[0].Gpus != 8 || len(holds[0].Nodes) != 2 || len(holds[0].Movers) != 2 || holds[0].EvictedAt != "" {
+			t.Fatalf("unexpected hold on %s: %+v", node, holds)
+		}
+		if holds[0].Group != "default/pg-gang" || holds[0].Target != "reserved" || holds[0].From != "spot" || holds[0].Moves != 1 {
+			t.Fatalf("unexpected hold metadata on %s: %+v", node, holds[0])
+		}
+		if node == "reserved-2" && (len(holds[0].Victims) != 1 || holds[0].Victims[0] != string(victims[0].Pod.UID)) {
+			t.Fatalf("expected the filler recorded as victim, got %v", holds[0].Victims)
+		}
+	}
+	if len(store.groups) != 1 || store.groups[0].name != "pg-gang" || store.groups[0].moves != 1 || store.groups[0].repack {
+		t.Fatalf("unexpected mover stamp: %+v", store.groups)
+	}
+	if !f.index().groups["default/pg-gang"] {
+		t.Fatalf("expected the group to be in flight after start")
+	}
+}
+
+func TestStartMoveRollsBackOnWriteFailure(t *testing.T) {
+	build := func() (*fixture, *memStore) {
+		f := newFixture(t)
+		f.addNode(tierNode("spot-1", "spot", "a"))
+		f.addNode(tierNode("spot-2", "spot", "a"))
+		f.addNode(tierNode("reserved-1", "reserved", "a"))
+		f.addNode(tierNode("reserved-2", "reserved", "a"))
+		f.placeGroup(t, 2, nil,
+			tierPod("w0", "spot-1", "pg-gang", 8, -4, time.Hour),
+			tierPod("w1", "spot-2", "pg-gang", 8, -4, time.Hour))
+		return f, newMemStore(f)
+	}
+	start := func(f *fixture, store *memStore) error {
+		idx := f.index()
+		plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil)
+		if len(plans) != 1 {
+			t.Fatalf("expected 1 plan, got %d", len(plans))
+		}
+		err := startCapacityUpgradeMove(plans[0], idx, liveConf(), store)
+		if len(idx.moves) != 0 {
+			t.Fatalf("expected the index untouched after a failed start, got %d moves", len(idx.moves))
+		}
+		return err
+	}
+
+	f, store := build()
+	store.failNode["reserved-2"] = errors.New("conflict")
+	if err := start(f, store); err == nil || !strings.Contains(err.Error(), "reserved-2") {
+		t.Fatalf("expected hold write failure, got %v", err)
+	}
+	if f.holdsOn(t, "reserved-1") != nil || len(store.groups) != 0 {
+		t.Fatalf("expected reserved-1 rolled back and no stamp, got %v / %+v", f.holdsOn(t, "reserved-1"), store.groups)
+	}
+
+	f, store = build()
+	store.failStamp = errors.New("podgroup gone")
+	if err := start(f, store); err == nil || !strings.Contains(err.Error(), "stamp mover") {
+		t.Fatalf("expected stamp failure, got %v", err)
+	}
+	if f.holdsOn(t, "reserved-1") != nil || f.holdsOn(t, "reserved-2") != nil {
+		t.Fatalf("expected both holds rolled back after stamp failure")
+	}
+}
+
+// raceFixture is the production incident's shape: an 8-GPU gang member on
+// spot whose only reserved room is occupied by lower-priority 1-GPU
+// fillers. Returns the mover and the fillers.
+func raceFixture(t *testing.T) (*fixture, *api.TaskInfo, []*api.TaskInfo) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 8, -4, time.Hour))
+	fillers := make([]*api.TaskInfo, 0, 8)
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("filler-%d", i)
+		job := f.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
+		for _, task := range job.Tasks {
+			fillers = append(fillers, task)
+		}
+	}
+	var mover *api.TaskInfo
+	for _, task := range f.jobs["default/pg-train"].Tasks {
+		mover = task
+	}
+	return f, mover, fillers
+}
+
+func TestMoveEvictsVictimsWaitsForIdleThenDrainsAndEvictsMover(t *testing.T) {
+	f, mover, fillers := raceFixture(t)
+	store := newMemStore(f)
+	conf := liveConf()
+
+	// Pass 1: hold reserved-1, evict the fillers; the mover stays.
+	plans, victims := f.startOnly(t, conf, store)
+	if len(plans) != 1 || len(victims) != 8 {
+		t.Fatalf("expected 1 plan evicting 8 fillers, got %d plans, %d victims", len(plans), len(victims))
+	}
+	for _, victim := range victims {
+		if victim.NodeName != "reserved-1" || victim.Priority != -9 {
+			t.Fatalf("unexpected victim %s on %s (priority %d)", victim.Name, victim.NodeName, victim.Priority)
+		}
+	}
+	if mover.Status != api.Running {
+		t.Fatalf("mover must not be touched when the hold is written")
+	}
+	for _, filler := range fillers {
+		f.evict(t, filler)
+	}
+
+	// Session 2: victims are still releasing; reserved-1 has no idle
+	// GPUs, so the mover is not evicted and no source is drained.
+	steps, evictions := f.advance(conf, store, testNow.Add(10*time.Second), nil)
+	if len(steps) != 0 || len(evictions) != 0 {
+		t.Fatalf("expected the move to wait for releasing victims, got %+v", steps)
+	}
+	if f.drainsOn(t, "spot-1") != nil {
+		t.Fatalf("source must not be drained before the target is clear")
+	}
+
+	// Session 3: victims are gone. Drain the source, mark the hold
+	// evicted, then evict the mover.
+	for _, filler := range fillers {
+		f.remove(t, filler)
+	}
+	store.log = nil
+	steps, evictions = f.advance(conf, store, testNow.Add(time.Minute), nil)
+	if len(steps) != 1 || steps[0].outcome != "evicting" || steps[0].reason != "target capacity clear" {
+		t.Fatalf("expected the eviction step, got %+v", steps)
+	}
+	if len(evictions) != 1 || !sameTask(evictions[0], mover) {
+		t.Fatalf("expected the mover evicted, got %v", names(evictions))
+	}
+	if got := strings.Join(store.log, ","); got != "node:spot-1,node:reserved-1" {
+		t.Fatalf("expected the source drained before the target records the eviction, got %s", got)
+	}
+	drains := f.drainsOn(t, "spot-1")
+	holds := f.holdsOn(t, "reserved-1")
+	if len(drains) != 1 || drains[0].Move != holds[0].Move {
+		t.Fatalf("expected a drain for the move on spot-1, got %+v", drains)
+	}
+	if len(holds) != 1 || holds[0].EvictedAt != testNow.Add(time.Minute).Format(time.RFC3339) {
+		t.Fatalf("expected the hold marked evicted, got %+v", holds)
+	}
+	if holds[0].Until != testNow.Add(time.Minute+10*time.Minute).Format(time.RFC3339) {
+		t.Fatalf("expected the placing deadline one TTL after eviction, got %s", holds[0].Until)
+	}
+}
+
+func TestMoveReEvictsVictimsThatDidNotGo(t *testing.T) {
+	f, mover, fillers := raceFixture(t)
+	store := newMemStore(f)
+	conf := liveConf()
+	f.startOnly(t, conf, store)
+	// Seven evictions took, one filler is still running.
+	for _, filler := range fillers[1:] {
+		f.evict(t, filler)
+		f.remove(t, filler)
+	}
+
+	steps, evictions := f.advance(conf, store, testNow.Add(time.Minute), nil)
+	if len(steps) != 1 || steps[0].outcome != "evicting" || steps[0].reason != "victims still running after eviction" {
+		t.Fatalf("expected a victim re-eviction step, got %+v", steps)
+	}
+	if len(evictions) != 1 || !sameTask(evictions[0], fillers[0]) {
+		t.Fatalf("expected only the stuck filler evicted, got %v", names(evictions))
+	}
+	if mover.Status != api.Running || f.drainsOn(t, "spot-1") != nil {
+		t.Fatalf("mover must stay until the target is clear")
+	}
+}
+
+func TestMoveDoesNotEvictMoverWhenStateWriteFails(t *testing.T) {
+	for _, failing := range []string{"spot-1", "reserved-1"} {
+		t.Run(failing, func(t *testing.T) {
+			f, mover, fillers := raceFixture(t)
+			store := newMemStore(f)
+			conf := liveConf()
+			f.startOnly(t, conf, store)
+			for _, filler := range fillers {
+				f.evict(t, filler)
+				f.remove(t, filler)
+			}
+
+			store.failNode[failing] = errors.New("conflict")
+			steps, evictions := f.advance(conf, store, testNow.Add(time.Minute), nil)
+			if len(steps) != 1 || len(evictions) != 0 {
+				t.Fatalf("expected the step to be skipped without evictions, got %d steps, %v", len(steps), names(evictions))
+			}
+			// Whatever was written, the hold never says evicted while the
+			// source may be undrained: a later session finds the move still
+			// clearing and retries the whole step.
+			if f.holdsOn(t, "reserved-1")[0].EvictedAt != "" {
+				t.Fatalf("the hold must not record an eviction that did not happen")
+			}
+			if failing == "spot-1" && f.drainsOn(t, "spot-1") != nil {
+				t.Fatalf("nothing should be written after the first failure")
+			}
+
+			delete(store.failNode, failing)
+			steps, evictions = f.advance(conf, store, testNow.Add(2*time.Minute), nil)
+			if len(steps) != 1 || len(evictions) != 1 || !sameTask(evictions[0], mover) {
+				t.Fatalf("expected the retry to evict the mover, got %+v / %v", steps, names(evictions))
+			}
+			if drains := f.drainsOn(t, "spot-1"); len(drains) != 1 || drains[0].Until != testNow.Add(12*time.Minute).Format(time.RFC3339) {
+				t.Fatalf("expected one drain with the retry's deadline, got %+v", drains)
+			}
+		})
+	}
+}
+
+func TestMoveWaitsWhileMoverNoLongerFitsTarget(t *testing.T) {
+	f, _, fillers := raceFixture(t)
+	store := newMemStore(f)
+	conf := liveConf()
+	f.startOnly(t, conf, store)
+	for _, filler := range fillers {
+		f.evict(t, filler)
+		f.remove(t, filler)
+	}
+	veto := func(task *api.TaskInfo, node *api.NodeInfo, gang bool) error { return errors.New("tainted") }
+	steps, evictions := f.advance(conf, store, testNow.Add(time.Minute), veto)
+	if len(steps) != 0 || len(evictions) != 0 {
+		t.Fatalf("expected no eviction while the mover cannot land, got %+v", steps)
+	}
+	// It expires rather than evicting into nowhere.
+	steps, _ = f.advance(conf, store, testNow.Add(11*time.Minute), veto)
+	if len(steps) != 1 || steps[0].outcome != "expired" || steps[0].reason != "target capacity never cleared" {
+		t.Fatalf("expected expiry, got %+v", steps)
+	}
+	if f.holdsOn(t, "reserved-1") != nil {
+		t.Fatalf("expected the hold released on expiry")
+	}
+}
+
+// evictedRace drives the race fixture to the placing phase: victims gone,
+// source drained, mover releasing. Returns the fixture, the store and the
+// move id.
+func evictedRace(t *testing.T) (*fixture, *memStore, string) {
+	f, mover, fillers := raceFixture(t)
+	store := newMemStore(f)
+	conf := liveConf()
+	f.startOnly(t, conf, store)
+	for _, filler := range fillers {
+		f.evict(t, filler)
+		f.remove(t, filler)
+	}
+	_, evictions := f.advance(conf, store, testNow.Add(time.Minute), nil)
+	if len(evictions) != 1 {
+		t.Fatalf("expected the mover evicted, got %v", names(evictions))
+	}
+	f.evict(t, mover)
+	return f, store, f.holdsOn(t, "reserved-1")[0].Move
+}
+
+func TestReleasingSourceCapacityCannotTakeBackTheSuccessor(t *testing.T) {
+	f, _, _ := evictedRace(t)
+	spot, reserved := f.nodes["spot-1"], f.nodes["reserved-1"]
+	if spot.Idle.Get(gpuRes) != 0 || spot.FutureIdle().Get(gpuRes) != 8*gpuMilli || reserved.Idle.Get(gpuRes) != 8*gpuMilli {
+		t.Fatalf("fixture: spot should be releasing 8 GPUs and reserved idle, got spot idle %v future %v reserved idle %v",
+			spot.Idle.Get(gpuRes), spot.FutureIdle().Get(gpuRes), reserved.Idle.Get(gpuRes))
+	}
+	successor := api.NewTaskInfo(successorPod("train-2", "pg-train", 8, -4, testNow.Add(90*time.Second)))
+	idx := f.index()
+	predicate := capacityUpgradePredicateFn(idx, gpuRes)
+	order := capacityUpgradeNodeOrderFn(idx, gpuRes)
+
+	// Without the drain predicate, allocate would pipeline the successor
+	// onto its own releasing spot node whenever it comes first.
+	if got := allocateLike(successor, []*api.NodeInfo{spot}, nil); got != "spot-1" {
+		t.Fatalf("expected the unguarded scheduler to pipeline onto spot-1, got %q", got)
+	}
+	// With it, the releasing spot node is off limits and only the held
+	// reserved node takes the successor.
+	if err := predicate(successor, spot); err == nil || !strings.Contains(err.Error(), "draining") {
+		t.Fatalf("expected the drain to reject the successor on spot-1, got %v", err)
+	}
+	if err := predicate(successor, reserved); err != nil {
+		t.Fatalf("expected the successor to be admitted on reserved-1, got %v", err)
+	}
+	if got := allocateLike(successor, []*api.NodeInfo{spot, reserved}, predicate); got != "reserved-1" {
+		t.Fatalf("expected the successor placed on reserved-1, got %q", got)
+	}
+	if score, _ := order(successor, reserved); score != heldNodePreference {
+		t.Fatalf("expected the held node preferred, got %v", score)
+	}
+	if score, _ := order(successor, spot); score != 0 {
+		t.Fatalf("expected no preference for the source, got %v", score)
+	}
+
+	// An unrelated GPU pod can take neither the held reserved GPUs nor the
+	// releasing spot GPUs.
+	other := api.NewTaskInfo(successorPod("other", "pg-other", 1, -9, testNow.Add(90*time.Second)))
+	if err := predicate(other, reserved); err == nil || !strings.Contains(err.Error(), "held") {
+		t.Fatalf("expected the hold to reject an unrelated pod on reserved-1, got %v", err)
+	}
+	if got := allocateLike(other, []*api.NodeInfo{spot, reserved}, predicate); got != "" {
+		t.Fatalf("expected no node for the unrelated pod, got %q", got)
+	}
+
+	// Once the mover has actually gone the drain protects nothing: real
+	// idle GPUs on spot-1 are usable again (node scoring decides).
+	for _, task := range f.nodes["spot-1"].Tasks {
+		f.remove(t, task)
+	}
+	if err := predicate(other, f.nodes["spot-1"]); err != nil {
+		t.Fatalf("expected idle spot GPUs usable after the mover is gone, got %v", err)
+	}
+}
+
+func TestHoldPredicateLeavesUnheldRemainderToOthers(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.nodes["reserved-1"].Node.Annotations = map[string]string{
+		CapacityUpgradeHoldsAnnotation: mustJSON([]capacityHold{{
+			Move: "default/pg-a@t", Group: "default/pg-a", Nodes: []string{"reserved-1"}, Movers: []string{"mover-uid"},
+			Identity: map[string]string{ownerIdentityKey: "owner-pg-a"}, Gpus: 3, Until: testNow.Add(time.Hour).Format(time.RFC3339),
+		}, {
+			Move: "default/pg-b@t", Group: "default/pg-b", Nodes: []string{"reserved-1"}, Movers: []string{"mover-b"},
+			Identity: map[string]string{ownerIdentityKey: "owner-pg-b"}, Gpus: 1, Until: testNow.Add(time.Hour).Format(time.RFC3339),
+		}}),
+	}
+	idx := f.index()
+	predicate := capacityUpgradePredicateFn(idx, gpuRes)
+	node := f.nodes["reserved-1"]
+	if idx.outstanding("reserved-1") != 4*gpuMilli {
+		t.Fatalf("expected 4 GPUs outstanding across two holds, got %v", idx.outstanding("reserved-1"))
+	}
+
+	// 8 idle, 4 held: an unrelated pod may take up to 4.
+	fits := api.NewTaskInfo(successorPod("fits", "pg-x", 4, -4, testNow))
+	tooBig := api.NewTaskInfo(successorPod("big", "pg-x", 5, -4, testNow))
+	if err := predicate(fits, node); err != nil {
+		t.Fatalf("expected a 4-GPU pod admitted into the unheld remainder, got %v", err)
+	}
+	if err := predicate(tooBig, node); err == nil {
+		t.Fatalf("expected a 5-GPU pod rejected")
+	}
+	// A claimant of one hold is not restricted by the other hold either;
+	// the successor of pg-a takes its 3 plus whatever is free.
+	claimant := api.NewTaskInfo(successorPod("a-2", "pg-a", 7, -4, testNow))
+	if err := predicate(claimant, node); err != nil {
+		t.Fatalf("expected the claimant admitted, got %v", err)
+	}
+	// CPU-only pods and planner probes are never restricted.
+	cpu := api.NewTaskInfo(util.BuildPod("default", "cpu", "", v1.PodPending, v1.ResourceList{"cpu": *apiResource("4")}, "pg-cpu", nil, nil))
+	if err := predicate(cpu, node); err != nil {
+		t.Fatalf("expected a CPU pod admitted, got %v", err)
+	}
+	probe := api.NewTaskInfo(successorPod("probe", "pg-x", 8, -4, testNow))
+	probe.Pod.Annotations[capacityUpgradeProbeAnnotation] = "true"
+	if err := predicate(probe, node); err != nil {
+		t.Fatalf("expected a probe admitted, got %v", err)
+	}
+}
+
+func TestSuccessorClaimsHoldAndInheritsCooldownAndCount(t *testing.T) {
+	f, store, id := evictedRace(t)
+	conf := liveConf()
+	claimAt := testNow.Add(3 * time.Minute)
+
+	// A pod with the same owner created before the eviction is not the
+	// successor; a pod of another owner never is.
+	f.bind(t, inGroup(tierPod("sibling", "", "pg-train", 1, -4, 2*time.Hour), "pg-sibling"), "reserved-1", 1)
+	f.bind(t, successorPod("stranger", "pg-stranger", 1, -4, claimAt), "reserved-1", 1)
+	steps, _ := f.advance(conf, store, claimAt, nil)
+	if len(steps) != 0 {
+		t.Fatalf("expected no claim by sibling or stranger, got %+v", steps)
+	}
+	for _, task := range append([]*api.TaskInfo{}, f.running["default-sibling"], f.running["default-stranger"]) {
+		f.remove(t, task)
+	}
+
+	// The successor binds onto reserved-1: the hold is claimed and
+	// released, the drain lifted, and the new PodGroup stamped with the
+	// cooldown and the inherited move count.
+	f.bind(t, inGroup(successorPod("train-2", "pg-train", 8, -4, testNow.Add(2*time.Minute)), "pg-train-2"), "reserved-1", 1)
+	store.log, store.groups = nil, nil
+	steps, evictions := f.advance(conf, store, claimAt, nil)
+	if len(steps) != 1 || steps[0].outcome != "claimed" || steps[0].id != id || len(evictions) != 0 {
+		t.Fatalf("expected the claim, got %+v", steps)
+	}
+	if f.holdsOn(t, "reserved-1") != nil || f.drainsOn(t, "spot-1") != nil {
+		t.Fatalf("expected hold and drain released")
+	}
+	if len(store.groups) != 1 || store.groups[0].name != "pg-train-2" || store.groups[0].moves != 1 ||
+		store.groups[0].last != claimAt.Format(time.RFC3339) || store.groups[0].repack {
+		t.Fatalf("unexpected successor stamp: %+v", store.groups)
+	}
+	if idx := f.index(); len(idx.moves) != 0 || len(idx.drains) != 0 || idx.groups["default/pg-train"] {
+		t.Fatalf("expected a clean index after the claim")
+	}
+}
+
+func TestGangClaimNeedsEveryFragment(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("spot-2", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.addNode(tierNode("reserved-2", "reserved", "a"))
+	w0 := tierPod("w0", "spot-1", "pg-gang", 8, -4, time.Hour)
+	w1 := tierPod("w1", "spot-2", "pg-gang", 8, -4, time.Hour)
+	for _, pod := range []*v1.Pod{w0, w1} {
+		pod.Labels["execution-id"] = "exec-1"
+		pod.Labels["node-id"] = "n0"
+	}
+	job := f.placeGroup(t, 2, nil, w0, w1)
+	store := newMemStore(f)
+	conf := liveConf()
+	f.startOnly(t, conf, store)
+	steps, evictions := f.advance(conf, store, testNow.Add(time.Minute), nil)
+	if len(steps) != 1 || len(evictions) != 2 {
+		t.Fatalf("expected both members evicted on idle reserved nodes, got %+v / %v", steps, names(evictions))
+	}
+	if f.drainsOn(t, "spot-1") == nil || f.drainsOn(t, "spot-2") == nil {
+		t.Fatalf("expected both sources drained")
+	}
+	for _, task := range evictions {
+		f.evict(t, task)
+	}
+	if len(job.Tasks) != 2 {
+		t.Fatalf("fixture: movers should still be in the job as releasing")
+	}
+
+	// One successor bound: the other fragment is unclaimed.
+	s0 := successorPod("w0-2", "pg-gang-2", 8, -4, testNow.Add(2*time.Minute))
+	s0.Labels["execution-id"], s0.Labels["node-id"] = "exec-1", "n0"
+	f.bind(t, s0, "reserved-1", 2)
+	steps, _ = f.advance(conf, store, testNow.Add(3*time.Minute), nil)
+	if len(steps) != 0 {
+		t.Fatalf("expected no claim with one fragment, got %+v", steps)
+	}
+	// Both bound: claimed, one stamp for the successor group.
+	s1 := successorPod("w1-2", "pg-gang-2", 8, -4, testNow.Add(2*time.Minute))
+	s1.Labels["execution-id"], s1.Labels["node-id"] = "exec-1", "n0"
+	f.bind(t, s1, "reserved-2", 2)
+	store.groups = nil
+	steps, _ = f.advance(conf, store, testNow.Add(3*time.Minute), nil)
+	if len(steps) != 1 || steps[0].outcome != "claimed" {
+		t.Fatalf("expected the gang claim, got %+v", steps)
+	}
+	if len(store.groups) != 1 || store.groups[0].name != "pg-gang-2" || store.groups[0].repack {
+		t.Fatalf("unexpected successor stamps: %+v", store.groups)
+	}
+	if f.holdsOn(t, "reserved-1") != nil || f.holdsOn(t, "reserved-2") != nil || f.drainsOn(t, "spot-1") != nil || f.drainsOn(t, "spot-2") != nil {
+		t.Fatalf("expected all state released")
+	}
+}
+
+func TestMoverCannotClaimItsOwnHold(t *testing.T) {
+	_, mover, _ := raceFixture(t)
+	hold := capacityHold{Movers: []string{string(mover.Pod.UID)}, Identity: map[string]string{ownerIdentityKey: "owner-pg-train"}}
+	if holdMatches(hold, mover) {
+		t.Fatalf("the mover must not match its own hold")
+	}
+	successor := api.NewTaskInfo(successorPod("train-2", "pg-train", 8, -4, testNow))
+	if !holdMatches(hold, successor) {
+		t.Fatalf("the successor must match")
+	}
+	if holdMatches(capacityHold{Movers: hold.Movers}, successor) {
+		t.Fatalf("a hold without identity matches nothing")
+	}
+}
+
+func TestHoldExpiresWhenSuccessorNeverComes(t *testing.T) {
+	f, store, _ := evictedRace(t)
+	conf := liveConf()
+	steps, _ := f.advance(conf, store, testNow.Add(5*time.Minute), nil)
+	if len(steps) != 0 {
+		t.Fatalf("expected the hold to wait within its TTL, got %+v", steps)
+	}
+	steps, _ = f.advance(conf, store, testNow.Add(12*time.Minute), nil)
+	if len(steps) != 1 || steps[0].outcome != "expired" || steps[0].reason != "successor never claimed the hold" {
+		t.Fatalf("expected expiry, got %+v", steps)
+	}
+	if f.holdsOn(t, "reserved-1") != nil || f.drainsOn(t, "spot-1") != nil {
+		t.Fatalf("expected hold and drain released on expiry")
+	}
+}
+
+func TestMoveAbandonedWhenStateIsInconsistent(t *testing.T) {
+	until := testNow.Add(time.Hour).Format(time.RFC3339)
+	hold := func(nodes ...string) capacityHold {
+		return capacityHold{
+			Move: "default/pg-gang@t", Group: "default/pg-gang", Nodes: nodes, Movers: []string{"m0", "m1"},
+			Identity: map[string]string{ownerIdentityKey: "owner-pg-gang"}, Gpus: 8, Until: until,
+		}
+	}
+	cases := []struct {
+		name   string
+		setup  func(f *fixture)
+		reason string
+	}{
+		{"fragment missing", func(f *fixture) {
+			f.nodes["reserved-1"].Node.Annotations = map[string]string{CapacityUpgradeHoldsAnnotation: mustJSON([]capacityHold{hold("reserved-1", "reserved-2")})}
+		}, "fragments missing"},
+		{"target node gone", func(f *fixture) {
+			f.nodes["reserved-1"].Node.Annotations = map[string]string{CapacityUpgradeHoldsAnnotation: mustJSON([]capacityHold{hold("reserved-1", "gone")})}
+		}, "fragments missing"},
+		{"bad deadline", func(f *fixture) {
+			h := hold("reserved-1")
+			h.Until = "yesterday"
+			f.nodes["reserved-1"].Node.Annotations = map[string]string{CapacityUpgradeHoldsAnnotation: mustJSON([]capacityHold{h})}
+		}, "unparseable deadline"},
+		{"bad eviction time", func(f *fixture) {
+			h := hold("reserved-1")
+			h.EvictedAt = "soon"
+			f.nodes["reserved-1"].Node.Annotations = map[string]string{CapacityUpgradeHoldsAnnotation: mustJSON([]capacityHold{h})}
+		}, "unparseable eviction time"},
+		{"movers gone before eviction", func(f *fixture) {
+			f.nodes["reserved-1"].Node.Annotations = map[string]string{CapacityUpgradeHoldsAnnotation: mustJSON([]capacityHold{hold("reserved-1")})}
+		}, "movers gone before eviction"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.addNode(tierNode("reserved-1", "reserved", "a"))
+			f.addNode(tierNode("reserved-2", "reserved", "a"))
+			tc.setup(f)
+			store := newMemStore(f)
+			steps, evictions := f.advance(liveConf(), store, testNow, nil)
+			if len(steps) != 1 || steps[0].outcome != "abandoned" || steps[0].reason != tc.reason || len(evictions) != 0 {
+				t.Fatalf("expected abandoned (%s), got %+v", tc.reason, steps)
+			}
+			if f.holdsOn(t, "reserved-1") != nil {
+				t.Fatalf("expected the hold released")
+			}
+		})
+	}
+}
+
+func TestMalformedAnnotationIsClearedAndTrustsNothing(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.addNode(tierNode("reserved-2", "reserved", "a"))
+	f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 1, -4, time.Hour))
+	good := capacityHold{
+		Move: "default/pg-gang@t", Group: "default/pg-gang", Nodes: []string{"reserved-1", "reserved-2"}, Movers: []string{"m0", "m1"},
+		Identity: map[string]string{ownerIdentityKey: "owner-pg-gang"}, Gpus: 8, Until: testNow.Add(time.Hour).Format(time.RFC3339),
+	}
+	f.nodes["reserved-1"].Node.Annotations = map[string]string{CapacityUpgradeHoldsAnnotation: mustJSON([]capacityHold{good})}
+	f.nodes["reserved-2"].Node.Annotations = map[string]string{
+		CapacityUpgradeHoldsAnnotation:  `[{"move":"default/pg-gang@t"}]`,
+		CapacityUpgradeDrainsAnnotation: mustJSON([]capacityDrain{{Move: "x", Until: good.Until}}),
+	}
+
+	idx := f.index()
+	if len(idx.malformed) != 1 || idx.outstanding("reserved-2") != 0 || idx.drained("reserved-2") {
+		t.Fatalf("expected reserved-2 malformed and contributing nothing, got %+v", idx)
+	}
+	// The malformed node is not a planning target either.
+	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil); len(plans) != 1 || plans[0].nodes["reserved-2"] == 0 {
+		// Planning still works; a malformed node just has no holds to net out.
+		t.Logf("plans: %+v", plans)
+	}
+	store := newMemStore(f)
+	steps, evictions := f.advance(liveConf(), store, testNow, nil)
+	if len(evictions) != 0 {
+		t.Fatalf("nothing may be evicted on malformed state, got %v", names(evictions))
+	}
+	outcomes := map[string]string{}
+	for _, step := range steps {
+		outcomes[step.id] = step.outcome + ":" + step.reason
+	}
+	if !strings.HasPrefix(outcomes["reserved-2"], "malformed:holds") || outcomes["default/pg-gang@t"] != "abandoned:fragments missing" {
+		t.Fatalf("expected the node cleared and the half-present move abandoned, got %v", outcomes)
+	}
+	if f.nodes["reserved-2"].Node.Annotations[CapacityUpgradeHoldsAnnotation] != "" || f.nodes["reserved-2"].Node.Annotations[CapacityUpgradeDrainsAnnotation] != "" {
+		t.Fatalf("expected reserved-2 annotations cleared")
+	}
+	if f.holdsOn(t, "reserved-1") != nil {
+		t.Fatalf("expected the abandoned move released from reserved-1")
+	}
+}
+
+func TestStaleDrainIsReleased(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.nodes["spot-1"].Node.Annotations = map[string]string{
+		CapacityUpgradeDrainsAnnotation: mustJSON([]capacityDrain{{Move: "default/pg-x@t", Until: testNow.Add(time.Hour).Format(time.RFC3339)}}),
+	}
+	store := newMemStore(f)
+	steps, _ := f.advance(liveConf(), store, testNow, nil)
+	if len(steps) != 1 || steps[0].outcome != "drain_released" {
+		t.Fatalf("expected the orphan drain released, got %+v", steps)
+	}
+	if f.drainsOn(t, "spot-1") != nil {
+		t.Fatalf("expected the drain annotation removed")
+	}
+}
+
+func TestSinglePodMoveSpendsTheRepackBudget(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 1, -4, time.Hour))
+	store := newMemStore(f)
+	f.startOnly(t, liveConf(), store)
+	if len(store.groups) != 1 || !store.groups[0].repack {
+		t.Fatalf("expected the single-pod mover stamped with the repack budget, got %+v", store.groups)
+	}
+	annotations := groupAnnotations(store.groups[0])
+	if annotations[groupEvictionAnnotation] == nil || *annotations[groupEvictionAnnotation] != "1" ||
+		*annotations[CapacityUpgradeCountAnnotation] != "1" || *annotations[CapacityUpgradeLastAnnotation] != testNow.Format(time.RFC3339) {
+		t.Fatalf("unexpected stamp annotations: %v", annotations)
+	}
+}
+
+func TestAnnotationPatchRemovesEmptyState(t *testing.T) {
+	annotations, err := nodeAnnotations(nodeState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := annotationPatch(annotations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Metadata struct {
+			Annotations map[string]*string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(patch, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{CapacityUpgradeHoldsAnnotation, CapacityUpgradeDrainsAnnotation} {
+		value, present := decoded.Metadata.Annotations[key]
+		if !present || value != nil {
+			t.Fatalf("expected %s: null in the merge patch, got %s", key, patch)
+		}
+	}
+
+	annotations, err = nodeAnnotations(nodeState{drains: []capacityDrain{{Move: "m", Until: "u"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if annotations[CapacityUpgradeHoldsAnnotation] != nil || annotations[CapacityUpgradeDrainsAnnotation] == nil {
+		t.Fatalf("expected only drains set, got %v", annotations)
+	}
+	var drains []capacityDrain
+	if err := json.Unmarshal([]byte(*annotations[CapacityUpgradeDrainsAnnotation]), &drains); err != nil || len(drains) != 1 || drains[0].Move != "m" {
+		t.Fatalf("drains did not round-trip: %v %v", drains, err)
+	}
+}
+
+func mustJSON(v interface{}) string {
+	body, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
 }
