@@ -761,6 +761,93 @@ func TestUpgradeIdentityFromLabelsMustAgreeAcrossGang(t *testing.T) {
 	}
 }
 
+func TestParseIdentitySets(t *testing.T) {
+	got := parseIdentitySets(" exa-run-name , node-id ;; execution-id,node-id; ,")
+	want := [][]string{{"exa-run-name", "node-id"}, {"execution-id", "node-id"}}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if strings.Join(got[i], ",") != strings.Join(want[i], ",") {
+			t.Fatalf("expected %v, got %v", want, got)
+		}
+	}
+	if sets := parseIdentitySets(""); len(sets) != 0 {
+		t.Fatalf("expected no sets from an empty list, got %v", sets)
+	}
+}
+
+func TestPodIdentityPrefersTheFirstCompleteSet(t *testing.T) {
+	sets := newCapacityUpgradeConf().identityLabels()
+	pod := tierPod("w0", "spot-1", "pg-gang", 8, -4, time.Hour)
+	pod.Labels["execution-id"], pod.Labels["node-id"] = "exec-1", "n0"
+	if id, ok := podIdentity(pod, sets); !ok || len(id) != 2 || id["execution-id"] != "exec-1" || id["node-id"] != "n0" {
+		t.Fatalf("expected the execution identity without a run name, got %v %v", id, ok)
+	}
+	pod.Labels["exa-run-name"] = "sam-probe"
+	id, ok := podIdentity(pod, sets)
+	if !ok || len(id) != 2 || id["exa-run-name"] != "sam-probe" || id["node-id"] != "n0" {
+		t.Fatalf("expected the run identity to take precedence, got %v %v", id, ok)
+	}
+	if _, present := id["execution-id"]; present {
+		t.Fatalf("a run identity must not pin the execution: %v", id)
+	}
+	pod.Labels["exa-run-name"] = ""
+	delete(pod.Labels, "node-id")
+	if id, ok := podIdentity(pod, sets); !ok || id[ownerIdentityKey] != "owner-pg-gang" {
+		t.Fatalf("expected the owner fallback without a complete label set, got %v %v", id, ok)
+	}
+}
+
+// A run relaunched by its launcher comes back as a new execution: the
+// successor carries the mover's run name but a fresh execution id, and must
+// still be the one admitted onto, and claiming, the held capacity.
+func TestSuccessorUnderNewExecutionClaimsByRunName(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("spot-2", "spot", "a"))
+	reserved := f.addNode(tierNode("reserved-1", "reserved", "a"))
+	w0 := tierPod("w0", "spot-1", "pg-gang", 8, -4, time.Hour)
+	w1 := tierPod("w1", "spot-2", "pg-gang", 8, -4, time.Hour)
+	for _, pod := range []*v1.Pod{w0, w1} {
+		pod.Labels["exa-run-name"], pod.Labels["execution-id"], pod.Labels["node-id"] = "sam-probe", "exec-1", "n0"
+	}
+	f.placeGroup(t, 2, nil, w0, w1)
+	f.addNode(tierNode("reserved-2", "reserved", "a"))
+	store := newMemStore(f)
+	conf := liveConf()
+	plans, _ := f.startOnly(t, conf, store)
+	if len(plans) != 1 || plans[0].identity["exa-run-name"] != "sam-probe" || plans[0].identity["execution-id"] != "" {
+		t.Fatalf("expected a run-name identity, got %+v", plans)
+	}
+	_, evictions := f.advance(conf, store, testNow.Add(time.Minute), nil)
+	for _, task := range evictions {
+		f.evict(t, task)
+	}
+
+	idx := f.index()
+	predicate := capacityUpgradePredicateFn(idx, gpuRes)
+	stranger := api.NewTaskInfo(successorPod("other", "pg-other", 8, -4, testNow.Add(2*time.Minute)))
+	stranger.Pod.Labels["exa-run-name"], stranger.Pod.Labels["node-id"] = "sam-other", "n0"
+	if err := predicate(stranger, reserved); err == nil {
+		t.Fatalf("expected a pod of another run to be kept off the held node")
+	}
+	s0 := successorPod("w0-2", "pg-gang-2", 8, -4, testNow.Add(2*time.Minute))
+	s0.Labels["exa-run-name"], s0.Labels["execution-id"], s0.Labels["node-id"] = "sam-probe", "exec-2", "n0"
+	if err := predicate(api.NewTaskInfo(s0), reserved); err != nil {
+		t.Fatalf("expected the relaunched successor to be admitted, got %v", err)
+	}
+
+	f.bind(t, s0, "reserved-1", 2)
+	s1 := successorPod("w1-2", "pg-gang-2", 8, -4, testNow.Add(2*time.Minute))
+	s1.Labels["exa-run-name"], s1.Labels["execution-id"], s1.Labels["node-id"] = "sam-probe", "exec-2", "n0"
+	f.bind(t, s1, "reserved-2", 2)
+	steps, _ := f.advance(conf, store, testNow.Add(3*time.Minute), nil)
+	if len(steps) != 1 || steps[0].outcome != "claimed" {
+		t.Fatalf("expected the relaunched gang to claim the hold, got %+v", steps)
+	}
+}
+
 func TestUpgradeConfParseFallsBackOnBadParams(t *testing.T) {
 	conf := newCapacityUpgradeConf()
 	conf.parse(map[string]interface{}{"cooldownSeconds": "not-a-number"})

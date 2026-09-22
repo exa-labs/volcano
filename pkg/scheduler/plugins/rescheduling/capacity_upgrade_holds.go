@@ -350,21 +350,14 @@ func identityMatches(identity map[string]string, pod *v1.Pod) bool {
 }
 
 // podIdentity derives the label set the pod's successor will carry: the
-// configured identity labels when the pod has all of them, else its
+// first configured identity label set the pod carries in full, else its
 // controller owner's UID. A pod with neither has no identity and cannot be
 // moved, since its successor could never be recognised.
-func podIdentity(pod *v1.Pod, identityLabels []string) (map[string]string, bool) {
-	identity := map[string]string{}
-	for _, key := range identityLabels {
-		value, ok := pod.Labels[key]
-		if !ok || value == "" {
-			identity = nil
-			break
+func podIdentity(pod *v1.Pod, identitySets [][]string) (map[string]string, bool) {
+	for _, keys := range identitySets {
+		if identity, ok := labelIdentity(pod, keys); ok {
+			return identity, true
 		}
-		identity[key] = value
-	}
-	if len(identity) > 0 {
-		return identity, true
 	}
 	owner := metav1.GetControllerOf(pod)
 	if owner == nil || owner.UID == "" {
@@ -373,12 +366,29 @@ func podIdentity(pod *v1.Pod, identityLabels []string) (map[string]string, bool)
 	return map[string]string{ownerIdentityKey: string(owner.UID)}, true
 }
 
+// labelIdentity is the pod's values for keys, or false when any is missing
+// or empty.
+func labelIdentity(pod *v1.Pod, keys []string) (map[string]string, bool) {
+	if len(keys) == 0 {
+		return nil, false
+	}
+	identity := make(map[string]string, len(keys))
+	for _, key := range keys {
+		value, ok := pod.Labels[key]
+		if !ok || value == "" {
+			return nil, false
+		}
+		identity[key] = value
+	}
+	return identity, true
+}
+
 // groupIdentity is the identity shared by every member, or false when the
 // members disagree (the successor could not be told from a sibling gang).
-func groupIdentity(members []*api.TaskInfo, identityLabels []string) (map[string]string, bool) {
+func groupIdentity(members []*api.TaskInfo, identitySets [][]string) (map[string]string, bool) {
 	var identity map[string]string
 	for _, member := range members {
-		id, ok := podIdentity(member.Pod, identityLabels)
+		id, ok := podIdentity(member.Pod, identitySets)
 		if !ok {
 			return nil, false
 		}
@@ -1012,15 +1022,23 @@ func podGroupMoves(pg *api.PodGroup, conf *capacityUpgradeConf) int {
 	return count
 }
 
-// splitIdentityLabels parses the comma-separated identity label list.
-func splitIdentityLabels(raw string) []string {
-	labels := make([]string, 0)
-	for _, part := range strings.Split(raw, ",") {
-		if part = strings.TrimSpace(part); part != "" {
-			labels = append(labels, part)
+// parseIdentitySets parses the identity label configuration: alternatives
+// separated by ";", each a comma-separated label set. Empty sets are
+// dropped.
+func parseIdentitySets(raw string) [][]string {
+	sets := make([][]string, 0)
+	for _, alternative := range strings.Split(raw, ";") {
+		labels := make([]string, 0)
+		for _, part := range strings.Split(alternative, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				labels = append(labels, part)
+			}
+		}
+		if len(labels) > 0 {
+			sets = append(sets, labels)
 		}
 	}
-	return labels
+	return sets
 }
 
 // moveID names a move after its mover PodGroup and start time.
