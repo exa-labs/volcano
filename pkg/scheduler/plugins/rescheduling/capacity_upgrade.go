@@ -66,7 +66,7 @@ var DefaultCapacityUpgradeConf = map[string]interface{}{
 	"zoneLabel":         "topology.kubernetes.io/zone",
 	"optOutLabel":       "exa.ai/capacity-upgrade-eligible",
 	"protectedLabel":    "exa.ai/gang-protection",
-	"identityLabels":    "execution-id,node-id",
+	"identityLabels":    "exa-run-name,node-id;execution-id,node-id",
 	"cooldownSeconds":   1800,
 	"minPodAgeSeconds":  600,
 	"holdTtlSeconds":    600,
@@ -106,9 +106,13 @@ type capacityUpgradeConf struct {
 	// by the gang's owner, not an opt-out from scheduler-driven moves.
 	// Any other pod carrying do-not-disrupt is never moved or evicted.
 	ProtectedLabel string `mapstructure:"protectedLabel"`
-	// IdentityLabels (comma-separated) identify a workload across restarts:
-	// a successor carrying the mover's values may claim its hold. Pods
-	// without them are identified by their controller owner.
+	// IdentityLabels identify a workload across restarts: a successor
+	// carrying the mover's values may claim its hold. Alternatives are
+	// separated by ";", each a comma-separated label set; a pod is identified
+	// by the first set it carries in full, so a run-level name that survives
+	// a relaunch under a new execution takes precedence over the execution
+	// id, which only survives an in-place retry. Pods carrying none are
+	// identified by their controller owner.
 	IdentityLabels string `mapstructure:"identityLabels"`
 	// CooldownSeconds holds a PodGroup after a move so a job that bounces
 	// between tiers is not moved again immediately.
@@ -151,8 +155,8 @@ func (c *capacityUpgradeConf) ranker() *capacitycost.Ranker {
 	return capacitycost.NewRanker(c.NodeLabelKey, c.Order, c.UnlabeledRank)
 }
 
-func (c *capacityUpgradeConf) identityLabels() []string {
-	return splitIdentityLabels(c.IdentityLabels)
+func (c *capacityUpgradeConf) identityLabels() [][]string {
+	return parseIdentitySets(c.IdentityLabels)
 }
 
 // loadCapacityUpgradeConf builds the strategy configuration from the
@@ -464,7 +468,7 @@ func planCapacityUpgrades(
 		return candidates[i].job.UID < candidates[j].job.UID
 	})
 
-	ledger := newUpgradeLedger(nodes, idx, conf, gpu)
+	ledger := newUpgradeLedger(nodes, running, idx, conf, gpu)
 	plans := make([]capacityUpgradePlan, 0)
 	evictions, gangs := 0, 0
 	for _, cand := range candidates {
@@ -700,7 +704,13 @@ type upgradeLedger struct {
 // victim) and is not a successor claiming a hold on its node. A node's idle
 // GPUs net of its holds may be negative while a hold's victims are still
 // releasing; a plan then has to evict that much more to place there.
-func newUpgradeLedger(nodes map[string]*api.NodeInfo, idx *capacityUpgradeIndex, conf *capacityUpgradeConf, gpu v1.ResourceName) *upgradeLedger {
+//
+// Preemptable tasks are the session-side tasks (from running), never the
+// node-local clones in node.Tasks: Session.Evict flips the victim it is
+// handed to Releasing before NodeInfo.UpdateTask reconciles it against the
+// node's copy, so evicting the node copy itself makes RemoveTask subtract
+// from an empty Releasing and panic.
+func newUpgradeLedger(nodes map[string]*api.NodeInfo, running map[types.UID]*api.TaskInfo, idx *capacityUpgradeIndex, conf *capacityUpgradeConf, gpu v1.ResourceName) *upgradeLedger {
 	ledger := &upgradeLedger{
 		idle:        make(map[string]*api.Resource, len(nodes)),
 		preemptable: make(map[string][]*api.TaskInfo, len(nodes)),
@@ -729,7 +739,11 @@ func newUpgradeLedger(nodes map[string]*api.NodeInfo, idx *capacityUpgradeIndex,
 			if idx.claimant(node.Name, task) {
 				continue
 			}
-			tasks = append(tasks, task)
+			sessionTask, isRunning := running[task.Pod.UID]
+			if !isRunning || sessionTask.Status != api.Running {
+				continue
+			}
+			tasks = append(tasks, sessionTask)
 		}
 		// Cheapest to preempt first: lowest priority, then smallest.
 		sort.Slice(tasks, func(i, j int) bool {
