@@ -464,7 +464,7 @@ func planCapacityUpgrades(
 		return candidates[i].job.UID < candidates[j].job.UID
 	})
 
-	ledger := newUpgradeLedger(nodes, idx, conf, gpu)
+	ledger := newUpgradeLedger(nodes, running, idx, conf, gpu)
 	plans := make([]capacityUpgradePlan, 0)
 	evictions, gangs := 0, 0
 	for _, cand := range candidates {
@@ -700,7 +700,13 @@ type upgradeLedger struct {
 // victim) and is not a successor claiming a hold on its node. A node's idle
 // GPUs net of its holds may be negative while a hold's victims are still
 // releasing; a plan then has to evict that much more to place there.
-func newUpgradeLedger(nodes map[string]*api.NodeInfo, idx *capacityUpgradeIndex, conf *capacityUpgradeConf, gpu v1.ResourceName) *upgradeLedger {
+//
+// Preemptable tasks are the session-side tasks (from running), never the
+// node-local clones in node.Tasks: Session.Evict flips the victim it is
+// handed to Releasing before NodeInfo.UpdateTask reconciles it against the
+// node's copy, so evicting the node copy itself makes RemoveTask subtract
+// from an empty Releasing and panic.
+func newUpgradeLedger(nodes map[string]*api.NodeInfo, running map[types.UID]*api.TaskInfo, idx *capacityUpgradeIndex, conf *capacityUpgradeConf, gpu v1.ResourceName) *upgradeLedger {
 	ledger := &upgradeLedger{
 		idle:        make(map[string]*api.Resource, len(nodes)),
 		preemptable: make(map[string][]*api.TaskInfo, len(nodes)),
@@ -729,7 +735,11 @@ func newUpgradeLedger(nodes map[string]*api.NodeInfo, idx *capacityUpgradeIndex,
 			if idx.claimant(node.Name, task) {
 				continue
 			}
-			tasks = append(tasks, task)
+			sessionTask, isRunning := running[task.Pod.UID]
+			if !isRunning || sessionTask.Status != api.Running {
+				continue
+			}
+			tasks = append(tasks, sessionTask)
 		}
 		// Cheapest to preempt first: lowest priority, then smallest.
 		sort.Slice(tasks, func(i, j int) bool {

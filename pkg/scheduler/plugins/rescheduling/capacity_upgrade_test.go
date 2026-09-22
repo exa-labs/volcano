@@ -109,7 +109,8 @@ func sameTask(a, b *api.TaskInfo) bool {
 }
 
 // placeGroup binds pods to their nodes and registers them as one job whose
-// PodGroup has minMember members and the given annotations.
+// PodGroup has minMember members and the given annotations. As in a session
+// snapshot, the node holds a clone of the job's task.
 func (f *fixture) placeGroup(t *testing.T, minMember int32, annotations map[string]string, pods ...*v1.Pod) *api.JobInfo {
 	var job *api.JobInfo
 	for _, pod := range pods {
@@ -118,7 +119,7 @@ func (f *fixture) placeGroup(t *testing.T, minMember int32, annotations map[stri
 			t.Fatalf("pod %s placed on unknown node %s", pod.Name, pod.Spec.NodeName)
 		}
 		task := api.NewTaskInfo(pod)
-		if err := node.AddTask(task); err != nil {
+		if err := node.AddTask(task.Clone()); err != nil {
 			t.Fatalf("AddTask(%s): %v", pod.Name, err)
 		}
 		job = f.registerTask(task, minMember, annotations)
@@ -177,7 +178,7 @@ func (f *fixture) bind(t *testing.T, pod *v1.Pod, nodeName string, minMember int
 	pod.Spec.NodeName = nodeName
 	pod.Status.Phase = v1.PodRunning
 	task := api.NewTaskInfo(pod)
-	if err := f.nodes[nodeName].AddTask(task); err != nil {
+	if err := f.nodes[nodeName].AddTask(task.Clone()); err != nil {
 		t.Fatalf("AddTask(%s): %v", pod.Name, err)
 	}
 	f.registerTask(task, minMember, nil)
@@ -373,6 +374,58 @@ func TestUpgradeCountsLowerPriorityFillerAsRoom(t *testing.T) {
 	}
 	if len(plans[0].victims) != 4 || plans[0].nodes["reserved-1"] != 4 {
 		t.Fatalf("expected 4 victims on reserved-1, got %v on %v", names(plans[0].victims), plans[0].nodes)
+	}
+}
+
+// Session.Evict flips the victim it is handed to Releasing (via
+// JobInfo.UpdateTaskStatus) before NodeInfo.UpdateTask reads the node's copy
+// back out of node.Tasks. A plan that carried the node-local clone would flip
+// that copy itself, and RemoveTask would then subtract from an empty
+// ni.Releasing and panic. Victims must be the session-side tasks, and
+// replaying Session.Evict's bookkeeping on them must leave the target node
+// consistent.
+func TestUpgradeVictimsAreSessionTasksAndEvictionAccountingHolds(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	reserved := f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 2, -4, time.Hour))
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("filler-%d", i)
+		f.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
+	}
+
+	plans, victims := f.startOnly(t, liveConf(), newMemStore(f))
+	if len(plans) != 1 || len(victims) != 2 {
+		t.Fatalf("expected 1 plan with 2 victims, got %d plans, victims %v", len(plans), names(victims))
+	}
+	for _, victim := range victims {
+		if victim != f.running[victim.Pod.UID] || victim != f.jobs[victim.Job].Tasks[victim.UID] {
+			t.Fatalf("victim %s is not the session task", victim.Name)
+		}
+		if victim == reserved.Tasks[api.PodKey(victim.Pod)] {
+			t.Fatalf("victim %s aliases the node-local task copy", victim.Name)
+		}
+	}
+
+	for _, victim := range victims {
+		if err := f.jobs[victim.Job].UpdateTaskStatus(victim, api.Releasing); err != nil {
+			t.Fatalf("UpdateTaskStatus(%s): %v", victim.Name, err)
+		}
+		if err := reserved.UpdateTask(victim); err != nil {
+			t.Fatalf("UpdateTask(%s): %v", victim.Name, err)
+		}
+	}
+	if got := reserved.Releasing.Get(gpuRes); got != 2000 {
+		t.Fatalf("expected 2 GPUs releasing on reserved-1, got %v", got)
+	}
+	if got := reserved.Used.Get(gpuRes); got != 8000 {
+		t.Fatalf("expected 8 GPUs still used on reserved-1, got %v", got)
+	}
+	if got := reserved.Idle.Get(gpuRes); got != 0 {
+		t.Fatalf("expected 0 GPUs idle on reserved-1, got %v", got)
+	}
+	if got := reserved.FutureIdle().Get(gpuRes); got != 2000 {
+		t.Fatalf("expected 2 GPUs future-idle on reserved-1, got %v", got)
 	}
 }
 
