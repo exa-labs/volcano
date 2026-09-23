@@ -74,6 +74,14 @@ var (
 		}, []string{"kind", "role"},
 	)
 
+	capacityUpgradeCooldownSkips = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "volcano",
+			Name:      "capacity_upgrade_cooldown_skips_total",
+			Help:      "Workloads left alone because the ledger shows this strategy restarted them within the cooldown, by the role they were considered for: mover (not upgraded again) or victim (not evicted again). Counted once per pass per workload.",
+		}, []string{"role"},
+	)
+
 	capacityUpgradeHoldOutcomes = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: "volcano",

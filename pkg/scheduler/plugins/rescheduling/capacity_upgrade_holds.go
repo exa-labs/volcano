@@ -29,6 +29,13 @@ package rescheduling
 //     GPU pod use only the node's real idle GPUs, never the ones still held by
 //     terminating pods, so the successor cannot be pipelined back onto the
 //     capacity its predecessor is releasing.
+//   - A ledger on a node (CapacityUpgradeLedgerAnnotation) records, per
+//     workload identity, when this strategy last restarted the workload (as
+//     a mover or as a victim) and how many times it has been upgraded. Pods
+//     come back under fresh PodGroups after an eviction, so the cooldown and
+//     the move budget are keyed on the identity a successor keeps rather than
+//     on the PodGroup; a workload restarted once is neither upgraded nor
+//     evicted again until its cooldown has passed.
 //
 // A move advances through phases derived from that state every session:
 // clearing (holds written, victims evicted, waiting for their GPUs to become
@@ -65,6 +72,10 @@ const (
 	// CapacityUpgradeCountAnnotation is the number of moves a PodGroup (and
 	// the PodGroups it succeeded) has been through; it bounds restarts.
 	CapacityUpgradeCountAnnotation = "exa.ai/capacity-upgrade-count"
+	// CapacityUpgradeLedgerAnnotation carries the JSON list of
+	// workloadRecord entries on a node: the workloads a move on this node
+	// restarted (its victims, and the mover that took their place).
+	CapacityUpgradeLedgerAnnotation = "exa.ai/capacity-upgrade-ledger"
 	// capacityUpgradeProbeAnnotation marks the in-memory probe tasks the
 	// planner evaluates against target nodes so the hold predicates do not
 	// treat them as foreign pods.
@@ -114,6 +125,65 @@ type capacityDrain struct {
 	Until string `json:"until"`
 }
 
+// workloadRecord is one workload's capacity-upgrade history.
+type workloadRecord struct {
+	// Identity is the label set the workload's pods carry across restarts
+	// (see podIdentity).
+	Identity map[string]string `json:"identity"`
+	// Last is the RFC3339 time this strategy last restarted the workload,
+	// as a mover or as a victim; it starts the cooldown.
+	Last string `json:"last"`
+	// Moves is how many times the workload has been upgraded.
+	Moves int `json:"moves"`
+}
+
+// identityKey is the canonical string form of an identity, for indexing.
+func identityKey(identity map[string]string) string {
+	keys := make([]string, 0, len(identity))
+	for key := range identity {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+identity[key])
+	}
+	return strings.Join(parts, ",")
+}
+
+// mergeRecord folds b into a for the same identity: the later restart and
+// the higher move count win, so no copy of a record can unlock a restart
+// another copy forbids.
+func mergeRecord(a, b workloadRecord) workloadRecord {
+	if b.Last > a.Last {
+		a.Last = b.Last
+	}
+	if b.Moves > a.Moves {
+		a.Moves = b.Moves
+	}
+	return a
+}
+
+// upsertRecord replaces the record with the same identity in records, or
+// appends it, returning a new slice.
+func upsertRecord(records []workloadRecord, record workloadRecord) []workloadRecord {
+	key := identityKey(record.Identity)
+	out := make([]workloadRecord, 0, len(records)+1)
+	replaced := false
+	for _, existing := range records {
+		if identityKey(existing.Identity) == key {
+			out = append(out, mergeRecord(existing, record))
+			replaced = true
+			continue
+		}
+		out = append(out, existing)
+	}
+	if !replaced {
+		out = append(out, record)
+	}
+	return out
+}
+
 // gang reports whether the move restarts more than one pod.
 func (h capacityHold) gang() bool { return len(h.Movers) > 1 }
 
@@ -151,7 +221,11 @@ func (m *capacityUpgradeMove) complete() bool {
 type capacityUpgradeIndex struct {
 	holds  map[string][]capacityHold
 	drains map[string][]capacityDrain
-	moves  map[string]*capacityUpgradeMove
+	// ledger holds each node's workload records as written.
+	ledger map[string][]workloadRecord
+	// records is the cluster-wide view of ledger, merged by identity.
+	records map[string]workloadRecord
+	moves   map[string]*capacityUpgradeMove
 	// groups marks mover PodGroups with a move in flight.
 	groups map[string]bool
 	// movers marks pods a move in flight evicts.
@@ -167,6 +241,8 @@ func newCapacityUpgradeIndex() *capacityUpgradeIndex {
 	return &capacityUpgradeIndex{
 		holds:     map[string][]capacityHold{},
 		drains:    map[string][]capacityDrain{},
+		ledger:    map[string][]workloadRecord{},
+		records:   map[string]workloadRecord{},
 		moves:     map[string]*capacityUpgradeMove{},
 		groups:    map[string]bool{},
 		movers:    map[types.UID]bool{},
@@ -175,14 +251,26 @@ func newCapacityUpgradeIndex() *capacityUpgradeIndex {
 	}
 }
 
-// indexCapacityUpgrade decodes every node's hold and drain annotations. A
-// node whose annotation does not decode is recorded as malformed and
-// contributes nothing; maintenance clears it.
+// indexCapacityUpgrade decodes every node's hold, drain and ledger
+// annotations. A node whose hold or drain annotation does not decode is
+// recorded as malformed and contributes no hold or drain; maintenance clears
+// those. Its ledger is kept when it decodes, since a record can only ever
+// delay a restart; a ledger that does not decode is dropped with the node.
 func indexCapacityUpgrade(nodes map[string]*api.NodeInfo) *capacityUpgradeIndex {
 	idx := newCapacityUpgradeIndex()
 	for _, node := range nodes {
 		if node.Node == nil {
 			continue
+		}
+		if raw, ok := node.Node.Annotations[CapacityUpgradeLedgerAnnotation]; ok && raw != "" {
+			records, err := decodeLedger(raw)
+			if err != nil {
+				idx.malformed[node.Name] = fmt.Sprintf("ledger: %v", err)
+				continue
+			}
+			for _, record := range records {
+				idx.addRecord(node.Name, record)
+			}
 		}
 		var holds []capacityHold
 		var drains []capacityDrain
@@ -208,6 +296,94 @@ func indexCapacityUpgrade(nodes map[string]*api.NodeInfo) *capacityUpgradeIndex 
 		}
 	}
 	return idx
+}
+
+// decodeLedger parses a node's ledger annotation; a record without an
+// identity or a restart time could never be matched or expire, so it makes
+// the annotation malformed.
+func decodeLedger(raw string) ([]workloadRecord, error) {
+	var records []workloadRecord
+	if err := json.Unmarshal([]byte(raw), &records); err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		if len(record.Identity) == 0 || record.Last == "" {
+			return nil, fmt.Errorf("record missing identity or last restart time")
+		}
+	}
+	return records, nil
+}
+
+// addRecord files a node's record and folds it into the merged view.
+func (idx *capacityUpgradeIndex) addRecord(node string, record workloadRecord) {
+	idx.ledger[node] = upsertRecord(idx.ledger[node], record)
+	key := identityKey(record.Identity)
+	if existing, ok := idx.records[key]; ok {
+		record = mergeRecord(existing, record)
+	}
+	idx.records[key] = record
+}
+
+// record returns the merged record for an identity.
+func (idx *capacityUpgradeIndex) record(identity map[string]string) (workloadRecord, bool) {
+	record, ok := idx.records[identityKey(identity)]
+	return record, ok
+}
+
+// restartedWithin reports whether this strategy restarted the identity less
+// than cooldown ago. A record whose time does not parse, or lies in the
+// future, counts as a recent restart: a bad record can delay a restart but
+// never unlock one.
+func (idx *capacityUpgradeIndex) restartedWithin(identity map[string]string, now time.Time, cooldown time.Duration) bool {
+	record, ok := idx.record(identity)
+	if !ok {
+		return false
+	}
+	last, err := time.Parse(time.RFC3339, record.Last)
+	if err != nil || last.After(now) {
+		return true
+	}
+	return now.Sub(last) < cooldown
+}
+
+// restartRecord is the record a restart at now leaves for an identity: the
+// merged history with its clock reset, and the move count raised to moves
+// when that is higher (a victim keeps its count, a mover spends one).
+func (idx *capacityUpgradeIndex) restartRecord(identity map[string]string, now time.Time, moves int) workloadRecord {
+	record := workloadRecord{Identity: identity, Last: now.UTC().Format(time.RFC3339), Moves: moves}
+	if existing, ok := idx.record(identity); ok {
+		record = mergeRecord(existing, record)
+	}
+	return record
+}
+
+// prune drops the records that protect nothing any more: their cooldown has
+// passed and no pod on the cluster carries their identity, so the move
+// count they hold can never apply again. The node writes that follow
+// persist the pruned view; a node that is never written again keeps its
+// stale records, which is harmless.
+func (idx *capacityUpgradeIndex) prune(now time.Time, cooldown time.Duration, alive map[string]bool) {
+	for node, records := range idx.ledger {
+		kept := records[:0:0]
+		for _, record := range records {
+			key := identityKey(record.Identity)
+			if alive[key] || idx.restartedWithin(record.Identity, now, cooldown) {
+				kept = append(kept, record)
+				continue
+			}
+			delete(idx.records, key)
+		}
+		if len(kept) == 0 {
+			delete(idx.ledger, node)
+		} else {
+			idx.ledger[node] = kept
+		}
+	}
+}
+
+// state is the node's current desired annotation state.
+func (idx *capacityUpgradeIndex) state(node string) nodeState {
+	return nodeState{holds: idx.holds[node], drains: idx.drains[node], ledger: idx.ledger[node]}
 }
 
 // decodeHolds parses a node's hold annotation; any fragment that cannot
@@ -488,6 +664,7 @@ func capacityUpgradeNodeOrderFn(idx *capacityUpgradeIndex, gpu v1.ResourceName) 
 type nodeState struct {
 	holds  []capacityHold
 	drains []capacityDrain
+	ledger []workloadRecord
 }
 
 // groupStamp is a PodGroup cooldown/count update; repack also spends the
@@ -541,7 +718,7 @@ func advanceCapacityUpgradeMoves(
 		step := moveStep{id: node, outcome: "malformed", reason: reason, nodes: map[string]nodeState{}}
 		delete(idx.holds, node)
 		delete(idx.drains, node)
-		step.nodes[node] = nodeState{}
+		step.nodes[node] = idx.state(node)
 		steps = append(steps, step)
 	}
 
@@ -586,7 +763,7 @@ func advanceCapacityUpgradeMoves(
 		}
 		if step.outcome != "" {
 			for _, node := range idx.removeMove(id) {
-				step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
+				step.nodes[node] = idx.state(node)
 			}
 			steps = append(steps, step)
 			continue
@@ -631,7 +808,7 @@ func advanceCapacityUpgradeMoves(
 					return step.groups[i].namespace+"/"+step.groups[i].name < step.groups[j].namespace+"/"+step.groups[j].name
 				})
 				for _, node := range idx.removeMove(id) {
-					step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
+					step.nodes[node] = idx.state(node)
 				}
 				steps = append(steps, step)
 				continue
@@ -650,7 +827,7 @@ func advanceCapacityUpgradeMoves(
 			// job finished or was deleted); nothing can claim the hold.
 			step.outcome, step.reason = "abandoned", "movers gone before eviction"
 			for _, node := range idx.removeMove(id) {
-				step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
+				step.nodes[node] = idx.state(node)
 			}
 			steps = append(steps, step)
 			continue
@@ -713,7 +890,7 @@ func advanceCapacityUpgradeMoves(
 			touched[node] = true
 		}
 		for node := range touched {
-			step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
+			step.nodes[node] = idx.state(node)
 		}
 		step.hold = hold
 		step.victims, step.evicting = movers, "mover"
@@ -735,7 +912,7 @@ func advanceCapacityUpgradeMoves(
 			idx.drains[node] = kept
 			steps = append(steps, moveStep{
 				id: node, outcome: "drain_released", reason: "move finished",
-				nodes: map[string]nodeState{node: {holds: idx.holds[node], drains: kept}},
+				nodes: map[string]nodeState{node: idx.state(node)},
 			})
 		}
 	}
@@ -940,6 +1117,7 @@ func nodeAnnotations(state nodeState) (map[string]*string, error) {
 	annotations := map[string]*string{
 		CapacityUpgradeHoldsAnnotation:  nil,
 		CapacityUpgradeDrainsAnnotation: nil,
+		CapacityUpgradeLedgerAnnotation: nil,
 	}
 	if len(state.holds) > 0 {
 		body, err := json.Marshal(state.holds)
@@ -956,6 +1134,14 @@ func nodeAnnotations(state nodeState) (map[string]*string, error) {
 		}
 		value := string(body)
 		annotations[CapacityUpgradeDrainsAnnotation] = &value
+	}
+	if len(state.ledger) > 0 {
+		body, err := json.Marshal(state.ledger)
+		if err != nil {
+			return nil, fmt.Errorf("encode ledger: %w", err)
+		}
+		value := string(body)
+		annotations[CapacityUpgradeLedgerAnnotation] = &value
 	}
 	return annotations, nil
 }

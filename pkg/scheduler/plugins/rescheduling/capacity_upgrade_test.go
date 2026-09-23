@@ -848,6 +848,230 @@ func TestSuccessorUnderNewExecutionClaimsByRunName(t *testing.T) {
 	}
 }
 
+// runPod labels a pod with a run-name identity, as Flyte tasks are.
+func runPod(pod *v1.Pod, run string) *v1.Pod {
+	pod.Labels["exa-run-name"], pod.Labels["node-id"] = run, "n0"
+	return pod
+}
+
+// onlyTask returns the single task of a job.
+func (f *fixture) onlyTask(t *testing.T, job string) *api.TaskInfo {
+	tasks := f.jobs[api.JobID(job)].Tasks
+	if len(tasks) != 1 {
+		t.Fatalf("expected one task in %s, got %d", job, len(tasks))
+	}
+	for _, task := range tasks {
+		return task
+	}
+	return nil
+}
+
+// ledgerOn decodes the ledger annotation of a node, keyed by identity.
+func (f *fixture) ledgerOn(t *testing.T, name string) map[string]workloadRecord {
+	out := map[string]workloadRecord{}
+	raw, ok := f.nodes[name].Node.Annotations[CapacityUpgradeLedgerAnnotation]
+	if !ok {
+		return out
+	}
+	records, err := decodeLedger(raw)
+	if err != nil {
+		t.Fatalf("ledger on %s: %v", name, err)
+	}
+	for _, record := range records {
+		out[identityKey(record.Identity)] = record
+	}
+	return out
+}
+
+// fullReserved is a spot mover that can only reach reserved by evicting a
+// lower-priority run: train (8 GPUs, -4) on spot-1, low (8 GPUs, -9) filling
+// reserved-1, and a priority-0 job filling reserved-2 that is never a victim.
+func fullReserved(t *testing.T) *fixture {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("spot-2", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.addNode(tierNode("reserved-2", "reserved", "a"))
+	f.placeGroup(t, 1, nil, runPod(tierPod("train", "spot-1", "pg-train", 8, -4, time.Hour), "train-run"))
+	f.placeGroup(t, 1, nil, runPod(tierPod("low", "reserved-1", "pg-low", 8, -9, time.Hour), "low-run"))
+	f.placeGroup(t, 1, nil, tierPod("top", "reserved-2", "pg-top", 8, 0, time.Hour))
+	return f
+}
+
+func TestStartMoveRecordsMoverAndVictimsInTheLedger(t *testing.T) {
+	f := fullReserved(t)
+	store := newMemStore(f)
+	plans, victims := f.startOnly(t, liveConf(), store)
+	if len(plans) != 1 || len(victims) != 1 || victims[0].Name != "low" {
+		t.Fatalf("expected train to displace low, got %+v", plans)
+	}
+	ledger := f.ledgerOn(t, "reserved-1")
+	stamp := testNow.Format(time.RFC3339)
+	mover, victim := ledger["exa-run-name=train-run,node-id=n0"], ledger["exa-run-name=low-run,node-id=n0"]
+	if mover.Last != stamp || mover.Moves != 1 {
+		t.Fatalf("expected the mover recorded with its first move, got %+v", ledger)
+	}
+	if victim.Last != stamp || victim.Moves != 0 {
+		t.Fatalf("expected the victim recorded without spending a move, got %+v", ledger)
+	}
+	if len(f.ledgerOn(t, "spot-1")) != 0 {
+		t.Fatalf("expected no ledger on the source node")
+	}
+}
+
+func TestDisplacedVictimIsNotUpgradedWithinCooldown(t *testing.T) {
+	f := fullReserved(t)
+	store := newMemStore(f)
+	_, victims := f.startOnly(t, liveConf(), store)
+	f.evict(t, victims[0])
+	f.remove(t, victims[0])
+	// The victim's successor comes back under a fresh PodGroup on spot, and
+	// reserved-2 frees up: a plain age check would upgrade it right away.
+	f.remove(t, f.onlyTask(t, "default/pg-top"))
+	low2 := runPod(tierPod("low-2", "spot-2", "pg-low-2", 8, -9, 0), "low-run")
+	f.placeGroup(t, 1, nil, low2)
+
+	conf := liveConf()
+	during := testNow.Add(20 * time.Minute)
+	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), during, nil); len(plans) != 0 {
+		t.Fatalf("expected the displaced run to sit out its cooldown, got %+v", plans)
+	}
+	after := testNow.Add(31 * time.Minute)
+	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), after, nil)
+	if len(plans) != 1 || plans[0].members[0].Name != "low-2" || plans[0].moves != 1 {
+		t.Fatalf("expected the displaced run to move once cooled, got %+v", plans)
+	}
+}
+
+func TestDisplacedVictimIsNotEvictedAgainWithinCooldown(t *testing.T) {
+	f := fullReserved(t)
+	store := newMemStore(f)
+	_, victims := f.startOnly(t, liveConf(), store)
+	f.evict(t, victims[0])
+	f.remove(t, victims[0])
+	// The victim's successor lands on reserved-2 (freed meanwhile) under a
+	// fresh PodGroup; another spot mover would displace it again.
+	f.remove(t, f.onlyTask(t, "default/pg-top"))
+	f.placeGroup(t, 1, nil, runPod(tierPod("low-2", "reserved-2", "pg-low-2", 8, -9, 0), "low-run"))
+	f.placeGroup(t, 1, nil, runPod(tierPod("train-2", "spot-2", "pg-train-2", 8, -4, time.Hour), "train-2-run"))
+
+	conf := liveConf()
+	during := testNow.Add(20 * time.Minute)
+	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), during, nil); len(plans) != 0 {
+		t.Fatalf("expected the displaced run to be shielded from eviction, got %+v", plans)
+	}
+	after := testNow.Add(31 * time.Minute)
+	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), after, nil)
+	if len(plans) != 1 || plans[0].members[0].Name != "train-2" || len(plans[0].victims) != 1 || plans[0].victims[0].Name != "low-2" {
+		t.Fatalf("expected train-2 to displace the cooled run, got %+v", plans)
+	}
+}
+
+func TestMoveBudgetFollowsTheRunAcrossFreshPodGroups(t *testing.T) {
+	f := fullReserved(t)
+	store := newMemStore(f)
+	conf := liveConf()
+	f.startOnly(t, conf, store)
+	// The mover comes back on spot under a fresh, unannotated PodGroup (its
+	// hold expired); the ledger still says it has moved once.
+	f.remove(t, f.onlyTask(t, "default/pg-train"))
+	f.remove(t, f.onlyTask(t, "default/pg-top"))
+	f.placeGroup(t, 1, nil, runPod(tierPod("train-2", "spot-2", "pg-train-2", 8, -4, 0), "train-run"))
+
+	second := testNow.Add(31 * time.Minute)
+	idx := f.index()
+	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, second, nil)
+	if len(plans) != 1 || plans[0].members[0].Name != "train-2" || plans[0].moves != 2 {
+		t.Fatalf("expected the second move to count as such, got %+v", plans)
+	}
+	if err := startCapacityUpgradeMove(plans[0], idx, conf, store); err != nil {
+		t.Fatalf("startCapacityUpgradeMove: %v", err)
+	}
+	if record := f.ledgerOn(t, "reserved-2")["exa-run-name=train-run,node-id=n0"]; record.Moves != 2 {
+		t.Fatalf("expected the ledger to carry two moves, got %+v", record)
+	}
+
+	f.remove(t, f.onlyTask(t, "default/pg-train-2"))
+	f.addNode(tierNode("reserved-3", "reserved", "a"))
+	f.placeGroup(t, 1, nil, runPod(tierPod("train-3", "spot-1", "pg-train-3", 8, -4, 0), "train-run"))
+	third := testNow.Add(62 * time.Minute)
+	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), third, nil); len(plans) != 0 {
+		t.Fatalf("expected the run's budget to be spent, got %+v", plans)
+	}
+}
+
+func TestLedgerPrunesOnlyCooledRunsNobodyCarries(t *testing.T) {
+	f := fullReserved(t)
+	store := newMemStore(f)
+	f.startOnly(t, liveConf(), store)
+	// The mover finishes for good; the victim comes back on spot.
+	f.remove(t, f.onlyTask(t, "default/pg-train"))
+	f.placeGroup(t, 1, nil, runPod(tierPod("low-2", "spot-2", "pg-low-2", 8, -9, 0), "low-run"))
+
+	conf := liveConf()
+	idx := f.index()
+	idx.prune(testNow.Add(10*time.Minute), conf.cooldown(), liveIdentities(f.nodes, conf.identityLabels()))
+	if len(idx.ledger["reserved-1"]) != 2 {
+		t.Fatalf("expected both records kept inside the cooldown, got %+v", idx.ledger)
+	}
+	idx.prune(testNow.Add(time.Hour), conf.cooldown(), liveIdentities(f.nodes, conf.identityLabels()))
+	records := idx.ledger["reserved-1"]
+	if len(records) != 1 || records[0].Identity["exa-run-name"] != "low-run" {
+		t.Fatalf("expected only the run still on the cluster to be kept, got %+v", records)
+	}
+	if _, ok := idx.record(map[string]string{"exa-run-name": "train-run", "node-id": "n0"}); ok {
+		t.Fatalf("expected the pruned run to leave the merged view")
+	}
+	if err := store.writeNode("reserved-1", idx.state("reserved-1")); err != nil {
+		t.Fatalf("writeNode: %v", err)
+	}
+	if ledger := f.ledgerOn(t, "reserved-1"); len(ledger) != 1 {
+		t.Fatalf("expected the pruned ledger to be written, got %+v", ledger)
+	}
+}
+
+func TestMalformedLedgerRecordDelaysButNeverUnlocks(t *testing.T) {
+	f := fullReserved(t)
+	f.nodes["reserved-2"].Node.Annotations = map[string]string{
+		CapacityUpgradeLedgerAnnotation: `[{"identity":{"exa-run-name":"train-run","node-id":"n0"},"last":"soon","moves":0}]`,
+	}
+	idx := f.index()
+	if idx.restartedWithin(map[string]string{"exa-run-name": "train-run", "node-id": "n0"}, testNow, time.Hour) != true {
+		t.Fatalf("expected an unparsable restart time to count as recent")
+	}
+	if plans := f.planUpgrades(liveConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected the run with a bad record to wait, got %+v", plans)
+	}
+
+	f.nodes["reserved-2"].Node.Annotations[CapacityUpgradeLedgerAnnotation] = `[{"moves":1}]`
+	idx = f.index()
+	if _, malformed := idx.malformed["reserved-2"]; !malformed {
+		t.Fatalf("expected a record without identity to make the node malformed")
+	}
+}
+
+func TestMalformedHoldsKeepTheNodeLedger(t *testing.T) {
+	f := fullReserved(t)
+	f.nodes["reserved-2"].Node.Annotations = map[string]string{
+		CapacityUpgradeHoldsAnnotation:  `{not json`,
+		CapacityUpgradeLedgerAnnotation: `[{"identity":{"exa-run-name":"low-run","node-id":"n0"},"last":"` + testNow.Format(time.RFC3339) + `","moves":0}]`,
+	}
+	store := newMemStore(f)
+	steps, _ := f.advance(liveConf(), store, testNow.Add(time.Minute), nil)
+	if len(steps) != 1 || steps[0].outcome != "malformed" {
+		t.Fatalf("expected the node to be cleared as malformed, got %+v", steps)
+	}
+	if ledger := f.ledgerOn(t, "reserved-2"); len(ledger) != 1 {
+		t.Fatalf("expected the ledger to survive clearing the holds, got %+v", ledger)
+	}
+	if _, ok := f.nodes["reserved-2"].Node.Annotations[CapacityUpgradeHoldsAnnotation]; ok {
+		t.Fatalf("expected the malformed holds to be cleared")
+	}
+	if plans := f.planUpgrades(liveConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected low to stay shielded by the surviving record, got %+v", plans)
+	}
+}
+
 func TestUpgradeConfParseFallsBackOnBadParams(t *testing.T) {
 	conf := newCapacityUpgradeConf()
 	conf.parse(map[string]interface{}{"cooldownSeconds": "not-a-number"})
