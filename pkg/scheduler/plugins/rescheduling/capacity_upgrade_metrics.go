@@ -62,7 +62,7 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: "volcano",
 			Name:      "capacity_upgrade_stamp_failures_total",
-			Help:      "Cluster read/write failures, by kind: ledger (ConfigMap unreadable or unwritable, skips the move or the whole planning pass), mover (PodGroup cooldown/budget, skips the move), hold (node hold/drain state, skips or delays the step), successor (cooldown carry-over lost).",
+			Help:      "Cluster write failures, by kind: mover (PodGroup cooldown/budget, skips the move), hold (node hold/drain state, skips or delays the step), successor (cooldown carry-over lost).",
 		}, []string{"kind"},
 	)
 
@@ -78,7 +78,7 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: "volcano",
 			Name:      "capacity_upgrade_cooldown_skips_total",
-			Help:      "Workloads left alone because the ledger shows this strategy restarted them within the cooldown, by the role they were considered for: mover (not upgraded again) or victim (not evicted again). Counted once per pass per workload.",
+			Help:      "Pods left alone because they are a recent restart (started within the cooldown, not the first attempt of their workload), by the role they were considered for: mover (not upgraded) or victim (not evicted). Counted once per pass per pod.",
 		}, []string{"role"},
 	)
 

@@ -73,10 +73,6 @@ type fixture struct {
 	nodes   map[string]*api.NodeInfo
 	jobs    map[api.JobID]*api.JobInfo
 	running map[types.UID]*api.TaskInfo
-	// ledger and ledgerVersion stand in for the capacity-upgrade ledger
-	// ConfigMap.
-	ledger        []workloadRecord
-	ledgerVersion string
 }
 
 func newFixture(t *testing.T) *fixture {

@@ -39,19 +39,19 @@ import (
 // < on-demand by default); nodes without the label have no tier and are
 // neither sources nor targets. A PodGroup is a candidate when at least one
 // member runs above the cheapest tier, every member is at or below the
-// victim priority ceiling, old enough, not opted out, its cooldown has
+// victim priority ceiling, old enough, not opted out, its cooldown clock has
 // expired and its move budget is not spent. Fit is proven per pass against a
 // shared ledger of the target tier's idle capacity plus what evicting
 // strictly lower-priority pods there would free, net of capacity already
 // held by moves in flight.
 //
-// Every restart this strategy causes, of a mover or of a victim, is recorded
-// against the workload's identity (the labels its successor keeps, see
-// podIdentity) in a ledger ConfigMap. A workload restarted less than
-// cooldownSeconds ago is neither a candidate nor a victim, and its upgrade
-// count persists across the fresh PodGroups its successors get, so a
-// low-priority pod cannot be bounced between tiers by a chain of
-// higher-priority arrivals faster than once per cooldown.
+// Restarts are not recorded anywhere; they are read off the pods (see
+// capacity_upgrade_restart.go). A pod that is a recent restart, of
+// anything, by anyone, is neither moved nor evicted until the cooldown since
+// it started has passed, and a workload's attempt index counts towards its
+// move budget, so a low-priority pod cannot be bounced between tiers by a
+// chain of higher-priority arrivals faster than once per cooldown, and not
+// indefinitely.
 //
 // The strategy owns the whole move as a transaction (see
 // capacity_upgrade_holds.go): it writes a hold for the mover onto each
@@ -75,6 +75,7 @@ var DefaultCapacityUpgradeConf = map[string]interface{}{
 	"optOutLabel":       "exa.ai/capacity-upgrade-eligible",
 	"protectedLabel":    "exa.ai/gang-protection",
 	"identityLabels":    "exa-run-name,node-id;execution-id,node-id",
+	"attemptLabel":      "node-id",
 	"cooldownSeconds":   1800,
 	"minPodAgeSeconds":  600,
 	"holdTtlSeconds":    600,
@@ -122,9 +123,14 @@ type capacityUpgradeConf struct {
 	// id, which only survives an in-place retry. Pods carrying none are
 	// identified by their controller owner.
 	IdentityLabels string `mapstructure:"identityLabels"`
-	// CooldownSeconds is how long after this strategy restarts a workload
-	// (as a mover or a victim) the workload is neither moved nor evicted
-	// again.
+	// AttemptLabel is the label whose value precedes the attempt index in
+	// the name Flyte gives a pod (or the PyTorchJob owning it):
+	// <execution>-<value>-<attempt>. The attempt tells a restart from a
+	// first start and counts towards the move budget.
+	AttemptLabel string `mapstructure:"attemptLabel"`
+	// CooldownSeconds is how long a PodGroup is held after a move, and how
+	// long after starting a restarted pod is neither moved nor evicted, so a
+	// job that bounces between tiers is not moved again immediately.
 	CooldownSeconds int `mapstructure:"cooldownSeconds"`
 	// MinPodAgeSeconds keeps freshly started pods in place: a pod younger
 	// than this has done too little work to be worth restarting.
@@ -136,8 +142,9 @@ type capacityUpgradeConf struct {
 	MaxVictims int `mapstructure:"maxVictims"`
 	// MaxGangMoves caps gang moves started per pass.
 	MaxGangMoves int `mapstructure:"maxGangMoves"`
-	// MaxMovesPerGroup caps how often a workload (one identity, across the
-	// PodGroups its restarts create) is upgraded by this strategy.
+	// MaxMovesPerGroup caps how often a workload (a PodGroup and the
+	// PodGroups that succeed it) is restarted by this strategy; a workload's
+	// attempt index counts as moves already spent.
 	MaxMovesPerGroup int `mapstructure:"maxMovesPerGroup"`
 	// MaxVictimPriority is the highest pod priority still movable; pods
 	// without an explicit priority count as 0.
@@ -280,39 +287,13 @@ func sessionPredicate() capacityUpgradePredicate {
 // written earlier in the session is honoured by everything that runs after.
 var sessionCapacityUpgrade *capacityUpgradeIndex
 
-// capacityUpgradeSessionIndex returns the session's index, reading the
-// ledger and decoding the node annotations on first use and dropping the
-// ledger records no pod on the cluster can inherit any more. A ledger that
-// cannot be read leaves the index unable to plan (see ledgerErr).
+// capacityUpgradeSessionIndex returns the session's index, decoding the
+// node annotations on first use.
 func capacityUpgradeSessionIndex() *capacityUpgradeIndex {
 	if sessionCapacityUpgrade == nil {
-		ledger, err := sessionStore{}.readLedger()
-		idx := indexCapacityUpgrade(Session.Nodes, ledger)
-		idx.ledgerErr = err
-		if len(idx.records) > 0 {
-			conf := loadCapacityUpgradeConf()
-			idx.prune(time.Now(), conf.cooldown(), liveIdentities(Session.Nodes, conf.identityLabels()))
-		}
-		sessionCapacityUpgrade = idx
+		sessionCapacityUpgrade = indexCapacityUpgrade(Session.Nodes)
 	}
 	return sessionCapacityUpgrade
-}
-
-// liveIdentities is the set of identity keys carried by every pod on the
-// cluster's nodes.
-func liveIdentities(nodes map[string]*api.NodeInfo, identitySets [][]string) map[string]bool {
-	alive := make(map[string]bool)
-	for _, node := range nodes {
-		for _, task := range node.Tasks {
-			if task.Pod == nil {
-				continue
-			}
-			if identity, ok := podIdentity(task.Pod, identitySets); ok {
-				alive[identityKey(identity)] = true
-			}
-		}
-	}
-	return alive
 }
 
 // victimsFnForCapacityUpgradeMoves advances the moves in flight; it runs in
@@ -351,11 +332,6 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	}
 
 	idx := capacityUpgradeSessionIndex()
-	if idx.ledgerErr != nil {
-		klog.Errorf("capacityUpgrade: not planning, ledger unavailable: %v", idx.ledgerErr)
-		capacityUpgradeStampFailures.WithLabelValues("ledger").Inc()
-		return nil
-	}
 	plans := planCapacityUpgrades(Session.Nodes, Session.Jobs, running, conf, idx, time.Now(), sessionPredicate())
 
 	victims := make([]*api.TaskInfo, 0)
@@ -383,26 +359,17 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 		plan.observe("held")
 		victims = append(victims, plan.victims...)
 	}
-	if idx.pruned && !conf.DryRun {
-		if err := idx.commitLedger(idx.ledgerRecords(), sessionStore{}); err != nil {
-			// The stale records only delay restarts; the next pass prunes again.
-			klog.Errorf("capacityUpgrade: persist pruned ledger: %v", err)
-			capacityUpgradeStampFailures.WithLabelValues("ledger").Inc()
-		}
-	}
 	return victims
 }
 
-// startCapacityUpgradeMove makes the move durable: it records the restarts
-// the move causes (the mover's and every victim's) in the ledger, writes a
-// hold fragment onto every target node, then stamps the mover's cooldown and
+// startCapacityUpgradeMove makes the move durable: it writes a hold
+// fragment onto every target node, then stamps the mover's cooldown and
 // budget. Nothing is evicted unless every write succeeded; a write failure
-// rolls back the fragments already written. The ledger records stay: a
-// record for a restart that did not happen only delays that workload's next
-// one. A fragment that cannot be rolled back is a durable hold like any
-// other, so maintenance carries it on (the hold itself records the move
-// count the successor inherits) or expires it. The index is updated so later
-// plans in the pass see the new holds and records.
+// rolls back the fragments already written. A fragment that cannot be
+// rolled back is a durable hold like any other, so maintenance carries it
+// on (the hold itself records the move count the successor inherits) or
+// expires it. The index is updated so later plans in the pass see the new
+// holds.
 func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeIndex, conf *capacityUpgradeConf, store capacityUpgradeStore) error {
 	pg := plan.job.PodGroup
 	at := plan.at.UTC().Format(time.RFC3339)
@@ -418,10 +385,6 @@ func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeInde
 	}
 	names := plan.nodeNames()
 	until := plan.at.Add(time.Duration(conf.HoldTTLSeconds) * time.Second).UTC().Format(time.RFC3339)
-	if err := idx.commitLedger(moveRecords(plan, idx, conf.identityLabels()), store); err != nil {
-		capacityUpgradeStampFailures.WithLabelValues("ledger").Inc()
-		return fmt.Errorf("record restarts for %s: %w", id, err)
-	}
 	fragment := func(name string) capacityHold {
 		return capacityHold{
 			Move: id, Group: group, Nodes: names, Movers: movers, Victims: victims, Identity: plan.identity,
@@ -432,7 +395,7 @@ func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeInde
 	written := make([]string, 0, len(names))
 	rollback := func() {
 		for _, done := range written {
-			if rerr := store.writeNode(done, idx.state(done)); rerr != nil {
+			if rerr := store.writeNode(done, nodeState{holds: idx.holds[done], drains: idx.drains[done]}); rerr != nil {
 				klog.Errorf("capacityUpgrade: roll back hold on %s for %s: %v", done, id, rerr)
 			}
 		}
@@ -457,20 +420,6 @@ func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeInde
 	return nil
 }
 
-// moveRecords is the ledger once the move's restarts are recorded: the
-// mover's record with this move spent, and a record for every victim. A
-// victim without an identity leaves no record; it has no controller either,
-// so it is never chosen as a victim.
-func moveRecords(plan capacityUpgradePlan, idx *capacityUpgradeIndex, identitySets [][]string) []workloadRecord {
-	records := upsertRecord(idx.ledgerRecords(), idx.restartRecord(plan.identity, plan.at, plan.moves))
-	for _, victim := range plan.victims {
-		if identity, ok := podIdentity(victim.Pod, identitySets); ok {
-			records = upsertRecord(records, idx.restartRecord(identity, plan.at, 0))
-		}
-	}
-	return records
-}
-
 // stampCapacityUpgradeMover records the cooldown clock and move count on the
 // mover's PodGroup, and for a single pod spends the shared repack eviction
 // cap so gpuFragmentation does not move the replacement again in the same
@@ -490,8 +439,7 @@ func stampCapacityUpgradeMover(plan capacityUpgradePlan, store capacityUpgradeSt
 // tier that fits the whole group (within one zone, for gangs) wins. Fit is
 // simulated first-fit-decreasing over a ledger shared by every plan in the
 // pass and seeded with the holds in flight, so two plans cannot claim the
-// same capacity. Without a readable ledger nothing is planned: the cooldowns
-// it holds are what keeps a move from restarting the same workload again.
+// same capacity.
 func planCapacityUpgrades(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -503,7 +451,7 @@ func planCapacityUpgrades(
 ) []capacityUpgradePlan {
 	gpu := v1.ResourceName(conf.GpuResource)
 	ranker := conf.ranker()
-	if ranker.MaxRank() <= 0 || idx.ledgerErr != nil {
+	if ranker.MaxRank() <= 0 {
 		return nil
 	}
 
@@ -617,14 +565,14 @@ type capacityUpgradeCandidate struct {
 
 // capacityUpgradeCandidateFor decides whether a job may move and gathers
 // what the planner needs. Every GPU member must be running, controlled,
-// old enough, at or below the priority ceiling, not opted out and not
-// disruption-protected (unless the protection is the owner's lifecycle
-// protection); at least one must run above the cheapest tier; no move for
-// the group may be in flight and its members must share an identity. The
-// cooldown must have expired and the budget must remain both on the
-// PodGroup and in the ledger for that identity, whichever is stricter. A
-// gang (minMember > 1) moves whole; a PodGroup of independent pods moves its
-// single most expensive, oldest member.
+// old enough, not a recent restart, at or below the priority ceiling, not
+// opted out and not disruption-protected (unless the protection is the
+// owner's lifecycle protection); at least one must run above the cheapest
+// tier; the group's cooldown must have expired, its budget (the PodGroup's
+// move count or the members' attempt index, whichever is higher) must
+// remain, no move for it may be in flight and its members must share an
+// identity. A gang (minMember > 1) moves whole; a PodGroup of independent
+// pods moves its single most expensive, oldest member.
 func capacityUpgradeCandidateFor(
 	job *api.JobInfo,
 	nodes map[string]*api.NodeInfo,
@@ -650,6 +598,7 @@ func capacityUpgradeCandidateFor(
 		return cand, false
 	}
 	minAge := time.Duration(conf.MinPodAgeSeconds) * time.Second
+	cooldown := conf.cooldown()
 	ranks := map[types.UID]int{}
 	for _, task := range job.Tasks {
 		if task.Pod == nil {
@@ -679,6 +628,13 @@ func capacityUpgradeCandidateFor(
 		started := podStartTime(task.Pod)
 		if started.IsZero() || now.Sub(started) < minAge {
 			return cand, false
+		}
+		if recentlyRestarted(task.Pod, conf.AttemptLabel, now, cooldown) {
+			capacityUpgradeCooldownSkips.WithLabelValues("mover").Inc()
+			return cand, false
+		}
+		if attempt, _, ok := workloadAttempt(task.Pod, conf.AttemptLabel); ok && attempt > cand.moves {
+			cand.moves = attempt
 		}
 		node, ok := nodes[task.NodeName]
 		if !ok || node.Node == nil {
@@ -724,6 +680,9 @@ func capacityUpgradeCandidateFor(
 		cand.priority = pick.Priority
 		cand.started = podStartTime(pick.Pod)
 	}
+	if conf.MaxMovesPerGroup > 0 && cand.moves >= conf.MaxMovesPerGroup {
+		return cand, false
+	}
 	for _, member := range cand.members {
 		cand.gpus += taskGpu(member, gpu)
 	}
@@ -732,16 +691,6 @@ func capacityUpgradeCandidateFor(
 		return cand, false
 	}
 	cand.identity = identity
-	if idx.restartedWithin(identity, now, conf.cooldown()) {
-		capacityUpgradeCooldownSkips.WithLabelValues("mover").Inc()
-		return cand, false
-	}
-	if record, ok := idx.record(identity); ok && record.Moves > cand.moves {
-		cand.moves = record.Moves
-	}
-	if conf.MaxMovesPerGroup > 0 && cand.moves >= conf.MaxMovesPerGroup {
-		return cand, false
-	}
 	return cand, true
 }
 
@@ -783,11 +732,11 @@ type upgradeLedger struct {
 
 // newUpgradeLedger seeds the ledger from the session. A running task is
 // evictable when it occupies GPUs, has a controller to recreate it, is not
-// disruption-protected, is not spoken for by a move in flight (as mover or
-// victim), is not a successor claiming a hold on its node and was not
-// restarted by this strategy within the cooldown. A node's idle
-// GPUs net of its holds may be negative while a hold's victims are still
-// releasing; a plan then has to evict that much more to place there.
+// disruption-protected, is not a recent restart, is not spoken for by a move
+// in flight (as mover or victim) and is not a successor claiming a hold on
+// its node. A node's idle GPUs net of its holds may be negative while a
+// hold's victims are still releasing; a plan then has to evict that much
+// more to place there.
 //
 // Preemptable tasks are the session-side tasks (from running), never the
 // node-local clones in node.Tasks: Session.Evict flips the victim it is
@@ -795,7 +744,6 @@ type upgradeLedger struct {
 // node's copy, so evicting the node copy itself makes RemoveTask subtract
 // from an empty Releasing and panic.
 func newUpgradeLedger(nodes map[string]*api.NodeInfo, running map[types.UID]*api.TaskInfo, idx *capacityUpgradeIndex, conf *capacityUpgradeConf, gpu v1.ResourceName, now time.Time) *upgradeLedger {
-	identitySets := conf.identityLabels()
 	cooldown := conf.cooldown()
 	ledger := &upgradeLedger{
 		idle:        make(map[string]*api.Resource, len(nodes)),
@@ -829,7 +777,7 @@ func newUpgradeLedger(nodes map[string]*api.NodeInfo, running map[types.UID]*api
 			if !isRunning || sessionTask.Status != api.Running {
 				continue
 			}
-			if identity, ok := podIdentity(task.Pod, identitySets); ok && idx.restartedWithin(identity, now, cooldown) {
+			if recentlyRestarted(task.Pod, conf.AttemptLabel, now, cooldown) {
 				capacityUpgradeCooldownSkips.WithLabelValues("victim").Inc()
 				continue
 			}

@@ -20,14 +20,13 @@ package rescheduling
 // move where, in what order, with which victims) and the move transaction
 // (holds, drains, sequencing, claims, failure paths). The transaction tests
 // drive a move through the same steps the scheduler would across sessions,
-// re-reading the state from node annotations and the ledger each time as a
-// new session does.
+// re-reading the state from node annotations each time as a new session
+// does.
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -187,10 +186,10 @@ func (f *fixture) bind(t *testing.T, pod *v1.Pod, nodeName string, minMember int
 	return task
 }
 
-// index re-reads the move state from node annotations and the ledger, as a
-// new session does.
+// index re-reads the move state from node annotations, as a new session
+// does.
 func (f *fixture) index() *capacityUpgradeIndex {
-	return indexCapacityUpgrade(f.nodes, capacityLedger{records: f.ledger, version: f.ledgerVersion})
+	return indexCapacityUpgrade(f.nodes)
 }
 
 func (f *fixture) planUpgrades(conf *capacityUpgradeConf, predicate capacityUpgradePredicate) []capacityUpgradePlan {
@@ -198,16 +197,14 @@ func (f *fixture) planUpgrades(conf *capacityUpgradeConf, predicate capacityUpgr
 }
 
 // memStore is a capacityUpgradeStore that applies node writes to the
-// fixture's node annotations and ledger writes to the fixture's ledger (so
-// the next index sees them) and records every write in order. Writes can be
-// made to fail per node, for the PodGroup stamp and for the ledger.
+// fixture's node annotations (so the next index sees them) and records
+// every write in order. Writes can be made to fail per node.
 type memStore struct {
-	f          *fixture
-	log        []string
-	groups     []groupStamp
-	failNode   map[string]error
-	failStamp  error
-	failLedger error
+	f         *fixture
+	log       []string
+	groups    []groupStamp
+	failNode  map[string]error
+	failStamp error
 }
 
 func newMemStore(f *fixture) *memStore {
@@ -247,45 +244,6 @@ func (s *memStore) stampGroup(stamp groupStamp) error {
 	s.groups = append(s.groups, stamp)
 	s.log = append(s.log, "group:"+stamp.namespace+"/"+stamp.name)
 	return nil
-}
-
-func (s *memStore) readLedger() (capacityLedger, error) {
-	if s.failLedger != nil {
-		return capacityLedger{}, s.failLedger
-	}
-	return capacityLedger{records: append([]workloadRecord{}, s.f.ledger...), version: s.f.ledgerVersion}, nil
-}
-
-// writeLedger round-trips the records through JSON, as the ConfigMap does,
-// and enforces the version like the API server would.
-func (s *memStore) writeLedger(records []workloadRecord, version string) (string, error) {
-	if s.failLedger != nil {
-		return "", s.failLedger
-	}
-	if version != s.f.ledgerVersion {
-		return "", fmt.Errorf("ledger version %q, want %q", version, s.f.ledgerVersion)
-	}
-	body, err := json.Marshal(records)
-	if err != nil {
-		return "", err
-	}
-	decoded, err := decodeLedger(string(body))
-	if err != nil {
-		return "", err
-	}
-	s.f.ledger = decoded
-	s.f.ledgerVersion = strconv.Itoa(len(s.log) + 1)
-	s.log = append(s.log, "ledger")
-	return s.f.ledgerVersion, nil
-}
-
-// ledgerByIdentity is the fixture's ledger keyed by identity.
-func (f *fixture) ledgerByIdentity() map[string]workloadRecord {
-	out := map[string]workloadRecord{}
-	for _, record := range f.ledger {
-		out[identityKey(record.Identity)] = record
-	}
-	return out
 }
 
 // holdsOn decodes the holds annotation of a node.
@@ -803,6 +761,230 @@ func TestUpgradeIdentityFromLabelsMustAgreeAcrossGang(t *testing.T) {
 	}
 }
 
+// ---- restarts read off the pods -------------------------------------------
+
+// flytePod names a pod the way Flyte does, <execution>-<node-id>-<attempt>,
+// and labels it with its node-id.
+func flytePod(execution, nodeID string, attempt int, nodeName, group string, gpus int64, priority int32, age time.Duration) *v1.Pod {
+	pod := tierPod(fmt.Sprintf("%s-%s-%d", execution, nodeID, attempt), nodeName, group, gpus, priority, age)
+	pod.Labels["execution-id"] = execution
+	pod.Labels["node-id"] = nodeID
+	return pod
+}
+
+// pytorchWorker names a pod the way the PyTorchJob Flyte creates for a gang
+// does: the job carries the attempt, the pod carries the replica.
+func pytorchWorker(execution, nodeID string, attempt, replica int, nodeName, group string, gpus int64, priority int32, age time.Duration) *v1.Pod {
+	job := fmt.Sprintf("%s-%s-%d", execution, nodeID, attempt)
+	pod := tierPod(fmt.Sprintf("%s-worker-%d", job, replica), nodeName, group, gpus, priority, age)
+	pod.Labels["execution-id"] = execution
+	pod.Labels["node-id"] = nodeID
+	pod.OwnerReferences[0].Kind = "PyTorchJob"
+	pod.OwnerReferences[0].Name = job
+	return pod
+}
+
+func TestWorkloadAttempt(t *testing.T) {
+	cases := []struct {
+		name       string
+		pod        *v1.Pod
+		attempt    int
+		direct, ok bool
+	}{
+		{"first attempt", flytePod("exec", "n0", 0, "spot-1", "pg", 1, -4, time.Hour), 0, true, true},
+		{"retried", flytePod("exec", "n0", 2, "spot-1", "pg", 1, -4, time.Hour), 2, true, true},
+		{"dynamic node", flytePod("exec-n1-0", "dn2", 13, "spot-1", "pg", 1, -4, time.Hour), 13, true, true},
+		{"gang worker reads the job's attempt", pytorchWorker("exec", "n0", 1, 3, "spot-1", "pg", 1, -4, time.Hour), 1, false, true},
+		{"no node-id label", tierPod("exec-n0-2", "spot-1", "pg", 1, -4, time.Hour), 0, false, false},
+		{"replica index is not an attempt", func() *v1.Pod {
+			pod := tierPod("exec-n0-1-worker-3", "spot-1", "pg", 1, -4, time.Hour)
+			pod.Labels["node-id"] = "n0"
+			return pod
+		}(), 0, false, false},
+		{"node-id mismatch", func() *v1.Pod {
+			pod := flytePod("exec", "n0", 1, "spot-1", "pg", 1, -4, time.Hour)
+			pod.Labels["node-id"] = "n1"
+			return pod
+		}(), 0, false, false},
+		{"no attempt suffix", func() *v1.Pod {
+			pod := tierPod("exec-n0", "spot-1", "pg", 1, -4, time.Hour)
+			pod.Labels["node-id"] = "n0"
+			return pod
+		}(), 0, false, false},
+	}
+	for _, c := range cases {
+		attempt, direct, ok := workloadAttempt(c.pod, "node-id")
+		if attempt != c.attempt || direct != c.direct || ok != c.ok {
+			t.Errorf("%s: got (%d, %v, %v), want (%d, %v, %v)", c.name, attempt, direct, ok, c.attempt, c.direct, c.ok)
+		}
+	}
+}
+
+// A pod that restarted within the cooldown is not evicted again, whoever
+// restarted it; only a pod its own name proves to be a first attempt is.
+func TestRecentRestartIsNotAVictim(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.placeGroup(t, 1, nil, flytePod("mover", "n0", 0, "spot-1", "pg-mover", 8, -4, time.Hour))
+	f.placeGroup(t, 1, nil, flytePod("retried", "n0", 1, "reserved-1", "pg-retried", 1, -9, 5*time.Minute))
+	f.placeGroup(t, 1, nil, flytePod("fresh", "n0", 0, "reserved-1", "pg-fresh", 1, -9, 5*time.Minute))
+	f.placeGroup(t, 1, nil, flytePod("settled", "n0", 3, "reserved-1", "pg-settled", 1, -9, time.Hour))
+	f.placeGroup(t, 2, nil,
+		pytorchWorker("gang", "n0", 0, 0, "reserved-1", "pg-gang", 1, -9, 5*time.Minute),
+		pytorchWorker("gang", "n0", 0, 1, "reserved-1", "pg-gang", 1, -9, 5*time.Minute))
+	f.placeGroup(t, 1, nil, tierPod("nameless", "reserved-1", "pg-nameless", 1, -9, 5*time.Minute))
+
+	ledger := newUpgradeLedger(f.nodes, f.running, f.index(), newCapacityUpgradeConf(), gpuRes, testNow)
+	got := names(ledger.preemptable["reserved-1"])
+	want := []string{"fresh-n0-0", "settled-n0-3"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("preemptable on reserved-1: got %v, want %v", got, want)
+	}
+
+	// The 8-GPU mover needs every GPU on reserved-1; the recent restarts
+	// there are not up for eviction, so it does not fit.
+	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected no plan while recent restarts occupy the target, got %+v", plans)
+	}
+}
+
+// A pod that restarted within the cooldown is not upgraded either, so a
+// victim landing back on spot cannot immediately become a mover; a first
+// attempt only has to be past minPodAge.
+func TestRecentRestartIsNotAMover(t *testing.T) {
+	conf := newCapacityUpgradeConf()
+	place := func(pod *v1.Pod, minMember int32, more ...*v1.Pod) *fixture {
+		f := newFixture(t)
+		f.addNode(tierNode("spot-1", "spot", "a"))
+		f.addNode(tierNode("reserved-1", "reserved", "a"))
+		f.placeGroup(t, minMember, nil, append([]*v1.Pod{pod}, more...)...)
+		return f
+	}
+	age := 20 * time.Minute
+	cases := []struct {
+		name  string
+		f     *fixture
+		moves bool
+	}{
+		{"first attempt past minPodAge", place(flytePod("a", "n0", 0, "spot-1", "pg-a", 1, -4, age), 1), true},
+		{"retried within cooldown", place(flytePod("b", "n0", 1, "spot-1", "pg-b", 1, -4, age), 1), false},
+		{"retried past cooldown", place(flytePod("c", "n0", 1, "spot-1", "pg-c", 1, -4, time.Hour), 1), true},
+		{"gang within cooldown", place(
+			pytorchWorker("g", "n0", 0, 0, "spot-1", "pg-g", 4, -4, age), 2,
+			pytorchWorker("g", "n0", 0, 1, "spot-1", "pg-g", 4, -4, age)), false},
+		{"gang past cooldown", place(
+			pytorchWorker("h", "n0", 0, 0, "spot-1", "pg-h", 4, -4, time.Hour), 2,
+			pytorchWorker("h", "n0", 0, 1, "spot-1", "pg-h", 4, -4, time.Hour)), true},
+		{"unknown attempt within cooldown", place(tierPod("nameless", "spot-1", "pg-n", 1, -4, age), 1), false},
+	}
+	for _, c := range cases {
+		plans := c.f.planUpgrades(conf, nil)
+		if (len(plans) == 1) != c.moves {
+			t.Errorf("%s: expected moves=%v, got %+v", c.name, c.moves, plans)
+		}
+	}
+}
+
+// The attempt index spends the move budget as the PodGroup count does, so a
+// workload restarted maxMovesPerGroup times is not upgraded even under a
+// fresh PodGroup.
+func TestAttemptSpendsTheMoveBudget(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.placeGroup(t, 1, nil, flytePod("spent", "n0", 2, "spot-1", "pg-spent", 1, -4, time.Hour))
+	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected attempt 2 to exhaust the budget, got %+v", plans)
+	}
+
+	g := newFixture(t)
+	g.addNode(tierNode("spot-1", "spot", "a"))
+	g.addNode(tierNode("reserved-1", "reserved", "a"))
+	g.placeGroup(t, 1, nil, flytePod("once", "n0", 1, "spot-1", "pg-once", 1, -4, time.Hour))
+	plans := g.planUpgrades(newCapacityUpgradeConf(), nil)
+	if len(plans) != 1 || plans[0].moves != 2 {
+		t.Fatalf("expected attempt 1 to move as its 2nd move, got %+v", plans)
+	}
+
+	// The PodGroup count and the attempt do not add up; the higher one
+	// counts.
+	h := newFixture(t)
+	h.addNode(tierNode("spot-1", "spot", "a"))
+	h.addNode(tierNode("reserved-1", "reserved", "a"))
+	h.placeGroup(t, 1, map[string]string{CapacityUpgradeCountAnnotation: "1"},
+		flytePod("both", "n0", 1, "spot-1", "pg-both", 1, -4, time.Hour))
+	plans = h.planUpgrades(newCapacityUpgradeConf(), nil)
+	if len(plans) != 1 || plans[0].moves != 2 {
+		t.Fatalf("expected count 1 + attempt 1 to move as its 2nd move, got %+v", plans)
+	}
+}
+
+// The live churn: a victim's successor gets a fresh PodGroup, lands back on
+// spot and, with nothing remembered about it, was upgraded onto reserved 10
+// minutes later only to be evicted again. Its attempt now keeps it out of
+// both roles for the cooldown.
+func TestVictimSuccessorIsNeitherMoverNorVictimUntilCooled(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("spot-2", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.addNode(tierNode("reserved-2", "reserved", "a"))
+	f.placeGroup(t, 1, nil, flytePod("mover", "n0", 0, "spot-1", "pg-mover", 8, -4, time.Hour))
+	victim := f.placeGroup(t, 1, nil, flytePod("low", "n0", 0, "reserved-1", "pg-low", 1, -9, time.Hour))
+	busy := f.placeGroup(t, 1, nil, flytePod("busy", "n0", 0, "reserved-2", "pg-busy", 8, 0, time.Hour))
+	store := newMemStore(f)
+	plans, victims := f.startOnly(t, liveConf(), store)
+	if len(plans) != 1 || len(victims) != 1 || victims[0].Name != "low-n0-0" {
+		t.Fatalf("expected the low pod to be evicted for the mover, got %+v / %v", plans, names(victims))
+	}
+	f.evict(t, victims[0])
+	f.remove(t, victims[0])
+	delete(f.jobs, victim.UID)
+	// reserved-2 frees up for whatever comes next.
+	for _, task := range busy.Tasks {
+		f.remove(t, task)
+	}
+	delete(f.jobs, busy.UID)
+
+	// Flyte retries the victim; it lands on spot under a fresh PodGroup.
+	successor := flytePod("low", "n0", 1, "spot-2", "pg-low-2", 1, -9, 0)
+	started := metav1.NewTime(testNow.Add(time.Minute))
+	successor.Status.StartTime = &started
+	successor.CreationTimestamp = started
+	f.placeGroup(t, 1, nil, successor)
+	// A higher-priority pod appears on spot with room for it on reserved-2.
+	f.placeGroup(t, 1, nil, flytePod("other", "n0", 0, "spot-2", "pg-other", 1, -4, time.Hour))
+
+	for _, later := range []time.Duration{15 * time.Minute, 30 * time.Minute} {
+		now := testNow.Add(later)
+		plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, newCapacityUpgradeConf(), f.index(), now, nil)
+		for _, plan := range plans {
+			if plan.members[0].Name == "low-n0-1" {
+				t.Fatalf("at +%v the successor was upgraded again: %+v", later, plan)
+			}
+			for _, v := range plan.victims {
+				if v.Name == "low-n0-1" {
+					t.Fatalf("at +%v the successor was evicted again: %+v", later, plan)
+				}
+			}
+		}
+	}
+
+	// Once cooled it is an ordinary spot pod again, with one move spent.
+	now := testNow.Add(32 * time.Minute)
+	plans = planCapacityUpgrades(f.nodes, f.jobs, f.running, newCapacityUpgradeConf(), f.index(), now, nil)
+	var upgraded *capacityUpgradePlan
+	for i := range plans {
+		if plans[i].members[0].Name == "low-n0-1" {
+			upgraded = &plans[i]
+		}
+	}
+	if upgraded == nil || upgraded.moves != 2 {
+		t.Fatalf("expected the cooled successor to move as its 2nd move, got %+v", plans)
+	}
+}
+
 func TestParseIdentitySets(t *testing.T) {
 	got := parseIdentitySets(" exa-run-name , node-id ;; execution-id,node-id; ,")
 	want := [][]string{{"exa-run-name", "node-id"}, {"execution-id", "node-id"}}
@@ -890,266 +1072,6 @@ func TestSuccessorUnderNewExecutionClaimsByRunName(t *testing.T) {
 	}
 }
 
-// runPod labels a pod with a run-name identity, as Flyte tasks are.
-func runPod(pod *v1.Pod, run string) *v1.Pod {
-	pod.Labels["exa-run-name"], pod.Labels["node-id"] = run, "n0"
-	return pod
-}
-
-// onlyTask returns the single task of a job.
-func (f *fixture) onlyTask(t *testing.T, job string) *api.TaskInfo {
-	tasks := f.jobs[api.JobID(job)].Tasks
-	if len(tasks) != 1 {
-		t.Fatalf("expected one task in %s, got %d", job, len(tasks))
-	}
-	for _, task := range tasks {
-		return task
-	}
-	return nil
-}
-
-// fullReserved is a spot mover that can only reach reserved by evicting a
-// lower-priority run: train (8 GPUs, -4) on spot-1, low (8 GPUs, -9) filling
-// reserved-1, and a priority-0 job filling reserved-2 that is never a victim.
-func fullReserved(t *testing.T) *fixture {
-	f := newFixture(t)
-	f.addNode(tierNode("spot-1", "spot", "a"))
-	f.addNode(tierNode("spot-2", "spot", "a"))
-	f.addNode(tierNode("reserved-1", "reserved", "a"))
-	f.addNode(tierNode("reserved-2", "reserved", "a"))
-	f.placeGroup(t, 1, nil, runPod(tierPod("train", "spot-1", "pg-train", 8, -4, time.Hour), "train-run"))
-	f.placeGroup(t, 1, nil, runPod(tierPod("low", "reserved-1", "pg-low", 8, -9, time.Hour), "low-run"))
-	f.placeGroup(t, 1, nil, tierPod("top", "reserved-2", "pg-top", 8, 0, time.Hour))
-	return f
-}
-
-func TestStartMoveRecordsMoverAndVictimsInTheLedger(t *testing.T) {
-	f := fullReserved(t)
-	store := newMemStore(f)
-	plans, victims := f.startOnly(t, liveConf(), store)
-	if len(plans) != 1 || len(victims) != 1 || victims[0].Name != "low" {
-		t.Fatalf("expected train to displace low, got %+v", plans)
-	}
-	ledger := f.ledgerByIdentity()
-	stamp := testNow.Format(time.RFC3339)
-	mover, victim := ledger["exa-run-name=train-run,node-id=n0"], ledger["exa-run-name=low-run,node-id=n0"]
-	if mover.Last != stamp || mover.Moves != 1 {
-		t.Fatalf("expected the mover recorded with its first move, got %+v", ledger)
-	}
-	if victim.Last != stamp || victim.Moves != 0 {
-		t.Fatalf("expected the victim recorded without spending a move, got %+v", ledger)
-	}
-	if len(store.log) < 2 || store.log[0] != "ledger" || store.log[1] != "node:reserved-1" {
-		t.Fatalf("expected the ledger written before the hold, got %v", store.log)
-	}
-}
-
-func TestStartMoveNeedsTheLedgerWrittenFirst(t *testing.T) {
-	f := fullReserved(t)
-	store := newMemStore(f)
-	store.failLedger = fmt.Errorf("configmaps is forbidden")
-	conf := liveConf()
-	idx := f.index()
-	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, testNow, nil)
-	if len(plans) != 1 {
-		t.Fatalf("expected one plan, got %+v", plans)
-	}
-	if err := startCapacityUpgradeMove(plans[0], idx, conf, store); err == nil {
-		t.Fatalf("expected the move to fail without a ledger write")
-	}
-	if len(store.log) != 0 || len(f.holdsOn(t, "reserved-1")) != 0 || len(idx.moves) != 0 {
-		t.Fatalf("expected nothing written or indexed after the ledger failed, got %v", store.log)
-	}
-}
-
-func TestUnreadableLedgerStopsPlanning(t *testing.T) {
-	f := fullReserved(t)
-	idx := f.index()
-	idx.ledgerErr = fmt.Errorf("configmaps is forbidden")
-	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil); len(plans) != 0 {
-		t.Fatalf("expected no plan without the ledger, got %+v", plans)
-	}
-}
-
-func TestDisplacedVictimIsNotUpgradedWithinCooldown(t *testing.T) {
-	f := fullReserved(t)
-	store := newMemStore(f)
-	_, victims := f.startOnly(t, liveConf(), store)
-	f.evict(t, victims[0])
-	f.remove(t, victims[0])
-	// The victim's successor comes back under a fresh PodGroup on spot, and
-	// reserved-2 frees up: a plain age check would upgrade it right away.
-	f.remove(t, f.onlyTask(t, "default/pg-top"))
-	low2 := runPod(tierPod("low-2", "spot-2", "pg-low-2", 8, -9, 0), "low-run")
-	f.placeGroup(t, 1, nil, low2)
-
-	conf := liveConf()
-	during := testNow.Add(20 * time.Minute)
-	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), during, nil); len(plans) != 0 {
-		t.Fatalf("expected the displaced run to sit out its cooldown, got %+v", plans)
-	}
-	after := testNow.Add(31 * time.Minute)
-	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), after, nil)
-	if len(plans) != 1 || plans[0].members[0].Name != "low-2" || plans[0].moves != 1 {
-		t.Fatalf("expected the displaced run to move once cooled, got %+v", plans)
-	}
-}
-
-func TestDisplacedVictimIsNotEvictedAgainWithinCooldown(t *testing.T) {
-	f := fullReserved(t)
-	store := newMemStore(f)
-	_, victims := f.startOnly(t, liveConf(), store)
-	f.evict(t, victims[0])
-	f.remove(t, victims[0])
-	// The victim's successor lands on reserved-2 (freed meanwhile) under a
-	// fresh PodGroup; another spot mover would displace it again.
-	f.remove(t, f.onlyTask(t, "default/pg-top"))
-	f.placeGroup(t, 1, nil, runPod(tierPod("low-2", "reserved-2", "pg-low-2", 8, -9, 0), "low-run"))
-	f.placeGroup(t, 1, nil, runPod(tierPod("train-2", "spot-2", "pg-train-2", 8, -4, time.Hour), "train-2-run"))
-
-	conf := liveConf()
-	during := testNow.Add(20 * time.Minute)
-	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), during, nil); len(plans) != 0 {
-		t.Fatalf("expected the displaced run to be shielded from eviction, got %+v", plans)
-	}
-	after := testNow.Add(31 * time.Minute)
-	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), after, nil)
-	if len(plans) != 1 || plans[0].members[0].Name != "train-2" || len(plans[0].victims) != 1 || plans[0].victims[0].Name != "low-2" {
-		t.Fatalf("expected train-2 to displace the cooled run, got %+v", plans)
-	}
-}
-
-func TestMoveBudgetFollowsTheRunAcrossFreshPodGroups(t *testing.T) {
-	f := fullReserved(t)
-	store := newMemStore(f)
-	conf := liveConf()
-	f.startOnly(t, conf, store)
-	// The mover comes back on spot under a fresh, unannotated PodGroup (its
-	// hold expired); the ledger still says it has moved once.
-	f.remove(t, f.onlyTask(t, "default/pg-train"))
-	f.remove(t, f.onlyTask(t, "default/pg-top"))
-	f.placeGroup(t, 1, nil, runPod(tierPod("train-2", "spot-2", "pg-train-2", 8, -4, 0), "train-run"))
-
-	second := testNow.Add(31 * time.Minute)
-	idx := f.index()
-	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, second, nil)
-	if len(plans) != 1 || plans[0].members[0].Name != "train-2" || plans[0].moves != 2 {
-		t.Fatalf("expected the second move to count as such, got %+v", plans)
-	}
-	if err := startCapacityUpgradeMove(plans[0], idx, conf, store); err != nil {
-		t.Fatalf("startCapacityUpgradeMove: %v", err)
-	}
-	if record := f.ledgerByIdentity()["exa-run-name=train-run,node-id=n0"]; record.Moves != 2 {
-		t.Fatalf("expected the ledger to carry two moves, got %+v", record)
-	}
-
-	f.remove(t, f.onlyTask(t, "default/pg-train-2"))
-	f.addNode(tierNode("reserved-3", "reserved", "a"))
-	f.placeGroup(t, 1, nil, runPod(tierPod("train-3", "spot-1", "pg-train-3", 8, -4, 0), "train-run"))
-	third := testNow.Add(62 * time.Minute)
-	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), third, nil); len(plans) != 0 {
-		t.Fatalf("expected the run's budget to be spent, got %+v", plans)
-	}
-}
-
-func TestLedgerPrunesOnlyCooledRunsNobodyCarries(t *testing.T) {
-	f := fullReserved(t)
-	store := newMemStore(f)
-	f.startOnly(t, liveConf(), store)
-	// The mover finishes for good; the victim comes back on spot.
-	f.remove(t, f.onlyTask(t, "default/pg-train"))
-	f.placeGroup(t, 1, nil, runPod(tierPod("low-2", "spot-2", "pg-low-2", 8, -9, 0), "low-run"))
-
-	conf := liveConf()
-	idx := f.index()
-	idx.prune(testNow.Add(10*time.Minute), conf.cooldown(), liveIdentities(f.nodes, conf.identityLabels()))
-	if len(idx.ledgerRecords()) != 2 || idx.pruned {
-		t.Fatalf("expected both records kept inside the cooldown, got %+v", idx.ledgerRecords())
-	}
-	idx.prune(testNow.Add(time.Hour), conf.cooldown(), liveIdentities(f.nodes, conf.identityLabels()))
-	records := idx.ledgerRecords()
-	if len(records) != 1 || records[0].Identity["exa-run-name"] != "low-run" || !idx.pruned {
-		t.Fatalf("expected only the run still on the cluster to be kept, got %+v", records)
-	}
-	if _, ok := idx.record(map[string]string{"exa-run-name": "train-run", "node-id": "n0"}); ok {
-		t.Fatalf("expected the pruned run to leave the ledger view")
-	}
-	if err := idx.commitLedger(idx.ledgerRecords(), store); err != nil {
-		t.Fatalf("commitLedger: %v", err)
-	}
-	if ledger := f.ledgerByIdentity(); len(ledger) != 1 || idx.pruned {
-		t.Fatalf("expected the pruned ledger to be written, got %+v", ledger)
-	}
-}
-
-func TestMalformedLedgerRecordDelaysButNeverUnlocks(t *testing.T) {
-	f := fullReserved(t)
-	f.ledger = []workloadRecord{{Identity: map[string]string{"exa-run-name": "train-run", "node-id": "n0"}, Last: "soon"}}
-	idx := f.index()
-	if idx.restartedWithin(map[string]string{"exa-run-name": "train-run", "node-id": "n0"}, testNow, time.Hour) != true {
-		t.Fatalf("expected an unparsable restart time to count as recent")
-	}
-	if plans := f.planUpgrades(liveConf(), nil); len(plans) != 0 {
-		t.Fatalf("expected the run with a bad record to wait, got %+v", plans)
-	}
-
-	for _, raw := range []string{`[{"moves":1}]`, `[{"identity":{"a":"b"}}]`, `{not json`} {
-		if _, err := decodeLedger(raw); err == nil {
-			t.Fatalf("expected %s to be rejected", raw)
-		}
-	}
-	if records, err := decodeLedger(""); err != nil || len(records) != 0 {
-		t.Fatalf("expected an empty ledger to decode to nothing, got %+v, %v", records, err)
-	}
-}
-
-func TestMalformedHoldsLeaveTheLedgerAlone(t *testing.T) {
-	f := fullReserved(t)
-	f.nodes["reserved-2"].Node.Annotations = map[string]string{CapacityUpgradeHoldsAnnotation: `{not json`}
-	f.ledger = []workloadRecord{{Identity: map[string]string{"exa-run-name": "low-run", "node-id": "n0"}, Last: testNow.Format(time.RFC3339)}}
-	store := newMemStore(f)
-	steps, _ := f.advance(liveConf(), store, testNow.Add(time.Minute), nil)
-	if len(steps) != 1 || steps[0].outcome != "malformed" {
-		t.Fatalf("expected the node to be cleared as malformed, got %+v", steps)
-	}
-	if _, ok := f.nodes["reserved-2"].Node.Annotations[CapacityUpgradeHoldsAnnotation]; ok {
-		t.Fatalf("expected the malformed holds to be cleared")
-	}
-	if len(f.ledger) != 1 || len(store.log) != 1 {
-		t.Fatalf("expected maintenance to leave the ledger untouched, got %+v, %v", f.ledger, store.log)
-	}
-	if plans := f.planUpgrades(liveConf(), nil); len(plans) != 0 {
-		t.Fatalf("expected low to stay shielded by the ledger, got %+v", plans)
-	}
-}
-
-func TestLedgerOutlivesTheNodesItWasWrittenFor(t *testing.T) {
-	f := fullReserved(t)
-	store := newMemStore(f)
-	_, victims := f.startOnly(t, liveConf(), store)
-	f.evict(t, victims[0])
-	f.remove(t, victims[0])
-	// Every node that took part in the move is gone; the victim comes back on
-	// a brand-new spot node with reserved room to move into.
-	f.remove(t, f.onlyTask(t, "default/pg-train"))
-	f.remove(t, f.onlyTask(t, "default/pg-top"))
-	for _, name := range []string{"spot-1", "reserved-1", "reserved-2"} {
-		delete(f.nodes, name)
-	}
-	f.addNode(tierNode("spot-3", "spot", "a"))
-	f.addNode(tierNode("reserved-3", "reserved", "a"))
-	f.placeGroup(t, 1, nil, runPod(tierPod("low-2", "spot-3", "pg-low-2", 8, -9, 0), "low-run"))
-
-	conf := liveConf()
-	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), testNow.Add(20*time.Minute), nil); len(plans) != 0 {
-		t.Fatalf("expected the displaced run to sit out its cooldown, got %+v", plans)
-	}
-	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), testNow.Add(31*time.Minute), nil)
-	if len(plans) != 1 || plans[0].members[0].Name != "low-2" || plans[0].nodeNames()[0] != "reserved-3" {
-		t.Fatalf("expected the displaced run to move once cooled, got %+v", plans)
-	}
-}
-
 func TestUpgradeConfParseFallsBackOnBadParams(t *testing.T) {
 	conf := newCapacityUpgradeConf()
 	conf.parse(map[string]interface{}{"cooldownSeconds": "not-a-number"})
@@ -1180,8 +1102,8 @@ func TestStartMoveWritesHoldsOnEveryTargetBeforeStamping(t *testing.T) {
 	if len(plans) != 1 || len(victims) != 1 || victims[0].Name != "filler" {
 		t.Fatalf("expected a gang plan evicting filler, got %+v / %v", plans, names(victims))
 	}
-	if got := strings.Join(store.log, ","); got != "ledger,node:reserved-1,node:reserved-2,group:default/pg-gang" {
-		t.Fatalf("expected the ledger, then holds, then the mover stamp, got %s", got)
+	if got := strings.Join(store.log, ","); got != "node:reserved-1,node:reserved-2,group:default/pg-gang" {
+		t.Fatalf("expected holds before the mover stamp, got %s", got)
 	}
 	for _, node := range []string{"reserved-1", "reserved-2"} {
 		holds := f.holdsOn(t, node)
@@ -1235,13 +1157,6 @@ func TestStartMoveRollsBackOnWriteFailure(t *testing.T) {
 	}
 	if f.holdsOn(t, "reserved-1") != nil || len(store.groups) != 0 {
 		t.Fatalf("expected reserved-1 rolled back and no stamp, got %v / %+v", f.holdsOn(t, "reserved-1"), store.groups)
-	}
-	// The ledger record stays: it can only delay this gang's next move.
-	if record, ok := f.ledgerByIdentity()["exa.ai/owner-uid=owner-pg-gang"]; !ok || record.Moves != 1 {
-		t.Fatalf("expected the mover's record kept after rollback, got %+v", f.ledger)
-	}
-	if plans := f.planUpgrades(liveConf(), nil); len(plans) != 0 {
-		t.Fatalf("expected the gang to wait out the cooldown after a failed start, got %+v", plans)
 	}
 
 	f, store = build()

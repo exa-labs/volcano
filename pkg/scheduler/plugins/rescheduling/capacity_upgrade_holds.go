@@ -29,16 +29,6 @@ package rescheduling
 //     GPU pod use only the node's real idle GPUs, never the ones still held by
 //     terminating pods, so the successor cannot be pipelined back onto the
 //     capacity its predecessor is releasing.
-//   - A ledger in a ConfigMap (CapacityUpgradeLedgerName, in the
-//     scheduler's own namespace) records, per workload identity, when this
-//     strategy last restarted the workload (as a mover or as a victim) and
-//     how many times it has been upgraded. Pods come back under fresh
-//     PodGroups after an eviction, so the cooldown and the move budget are
-//     keyed on the identity a successor keeps rather than on the PodGroup; a
-//     workload restarted once is neither upgraded nor evicted again until its
-//     cooldown has passed. The ledger is not node state: nodes come and go
-//     with the workloads, the ledger must outlive both, and it is written
-//     before anything a move restarts is evicted.
 //
 // A move advances through phases derived from that state every session:
 // clearing (holds written, victims evicted, waiting for their GPUs to become
@@ -52,14 +42,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -77,16 +65,6 @@ const (
 	// CapacityUpgradeCountAnnotation is the number of moves a PodGroup (and
 	// the PodGroups it succeeded) has been through; it bounds restarts.
 	CapacityUpgradeCountAnnotation = "exa.ai/capacity-upgrade-count"
-	// CapacityUpgradeLedgerName is the ConfigMap, in the scheduler's own
-	// namespace, that carries the ledger: every workload this strategy has
-	// restarted, as CapacityUpgradeLedgerKey, a JSON list of workloadRecord.
-	CapacityUpgradeLedgerName = "capacity-upgrade-ledger"
-	CapacityUpgradeLedgerKey  = "ledger"
-	// ledgerFallbackNamespace is where the ledger lives when the scheduler
-	// runs outside a pod and its namespace cannot be read.
-	ledgerFallbackNamespace = "volcano-system"
-	// serviceAccountNamespaceFile is where a pod finds its own namespace.
-	serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 	// capacityUpgradeProbeAnnotation marks the in-memory probe tasks the
 	// planner evaluates against target nodes so the hold predicates do not
 	// treat them as foreign pods.
@@ -136,65 +114,6 @@ type capacityDrain struct {
 	Until string `json:"until"`
 }
 
-// workloadRecord is one workload's capacity-upgrade history.
-type workloadRecord struct {
-	// Identity is the label set the workload's pods carry across restarts
-	// (see podIdentity).
-	Identity map[string]string `json:"identity"`
-	// Last is the RFC3339 time this strategy last restarted the workload,
-	// as a mover or as a victim; it starts the cooldown.
-	Last string `json:"last"`
-	// Moves is how many times the workload has been upgraded.
-	Moves int `json:"moves"`
-}
-
-// identityKey is the canonical string form of an identity, for indexing.
-func identityKey(identity map[string]string) string {
-	keys := make([]string, 0, len(identity))
-	for key := range identity {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, key := range keys {
-		parts = append(parts, key+"="+identity[key])
-	}
-	return strings.Join(parts, ",")
-}
-
-// mergeRecord folds b into a for the same identity: the later restart and
-// the higher move count win, so no copy of a record can unlock a restart
-// another copy forbids.
-func mergeRecord(a, b workloadRecord) workloadRecord {
-	if b.Last > a.Last {
-		a.Last = b.Last
-	}
-	if b.Moves > a.Moves {
-		a.Moves = b.Moves
-	}
-	return a
-}
-
-// upsertRecord replaces the record with the same identity in records, or
-// appends it, returning a new slice.
-func upsertRecord(records []workloadRecord, record workloadRecord) []workloadRecord {
-	key := identityKey(record.Identity)
-	out := make([]workloadRecord, 0, len(records)+1)
-	replaced := false
-	for _, existing := range records {
-		if identityKey(existing.Identity) == key {
-			out = append(out, mergeRecord(existing, record))
-			replaced = true
-			continue
-		}
-		out = append(out, existing)
-	}
-	if !replaced {
-		out = append(out, record)
-	}
-	return out
-}
-
 // gang reports whether the move restarts more than one pod.
 func (h capacityHold) gang() bool { return len(h.Movers) > 1 }
 
@@ -227,29 +146,11 @@ func (m *capacityUpgradeMove) complete() bool {
 	return len(m.fragments) == len(m.hold.Nodes)
 }
 
-// capacityLedger is the ledger as read from its ConfigMap.
-type capacityLedger struct {
-	records []workloadRecord
-	// version is the ConfigMap's resourceVersion, empty when it does not
-	// exist yet; a write must be based on the version it read.
-	version string
-}
-
 // capacityUpgradeIndex is the cluster's capacity-upgrade state as read from
-// node annotations and the ledger at session open.
+// node annotations at session open.
 type capacityUpgradeIndex struct {
 	holds  map[string][]capacityHold
 	drains map[string][]capacityDrain
-	// records is the ledger keyed by identity.
-	records map[string]workloadRecord
-	// ledgerVersion is the version the ledger records were read at.
-	ledgerVersion string
-	// ledgerErr is set when the ledger could not be read or decoded. No
-	// move may start without knowing who was restarted recently, so
-	// planning is off for the session; moves in flight still advance.
-	ledgerErr error
-	// pruned is set when prune dropped records the cluster still carries.
-	pruned bool
 	moves  map[string]*capacityUpgradeMove
 	// groups marks mover PodGroups with a move in flight.
 	groups map[string]bool
@@ -266,7 +167,6 @@ func newCapacityUpgradeIndex() *capacityUpgradeIndex {
 	return &capacityUpgradeIndex{
 		holds:     map[string][]capacityHold{},
 		drains:    map[string][]capacityDrain{},
-		records:   map[string]workloadRecord{},
 		moves:     map[string]*capacityUpgradeMove{},
 		groups:    map[string]bool{},
 		movers:    map[types.UID]bool{},
@@ -275,16 +175,11 @@ func newCapacityUpgradeIndex() *capacityUpgradeIndex {
 	}
 }
 
-// indexCapacityUpgrade decodes every node's hold and drain annotations and
-// files the ledger. A node whose hold or drain annotation does not decode is
-// recorded as malformed and contributes no hold or drain; maintenance clears
-// those. The ledger is independent of any node, so it is unaffected.
-func indexCapacityUpgrade(nodes map[string]*api.NodeInfo, ledger capacityLedger) *capacityUpgradeIndex {
+// indexCapacityUpgrade decodes every node's hold and drain annotations. A
+// node whose annotation does not decode is recorded as malformed and
+// contributes nothing; maintenance clears it.
+func indexCapacityUpgrade(nodes map[string]*api.NodeInfo) *capacityUpgradeIndex {
 	idx := newCapacityUpgradeIndex()
-	idx.ledgerVersion = ledger.version
-	for _, record := range ledger.records {
-		idx.addRecord(record)
-	}
 	for _, node := range nodes {
 		if node.Node == nil {
 			continue
@@ -313,120 +208,6 @@ func indexCapacityUpgrade(nodes map[string]*api.NodeInfo, ledger capacityLedger)
 		}
 	}
 	return idx
-}
-
-// decodeLedger parses the ledger's JSON; a record without an identity or a
-// restart time could never be matched or expire, so it makes the ledger
-// malformed. An empty ledger decodes to no records.
-func decodeLedger(raw string) ([]workloadRecord, error) {
-	if strings.TrimSpace(raw) == "" {
-		return nil, nil
-	}
-	var records []workloadRecord
-	if err := json.Unmarshal([]byte(raw), &records); err != nil {
-		return nil, err
-	}
-	for _, record := range records {
-		if len(record.Identity) == 0 || record.Last == "" {
-			return nil, fmt.Errorf("record missing identity or last restart time")
-		}
-	}
-	return records, nil
-}
-
-// addRecord folds a record into the ledger view.
-func (idx *capacityUpgradeIndex) addRecord(record workloadRecord) {
-	key := identityKey(record.Identity)
-	if existing, ok := idx.records[key]; ok {
-		record = mergeRecord(existing, record)
-	}
-	idx.records[key] = record
-}
-
-// record returns the merged record for an identity.
-func (idx *capacityUpgradeIndex) record(identity map[string]string) (workloadRecord, bool) {
-	record, ok := idx.records[identityKey(identity)]
-	return record, ok
-}
-
-// restartedWithin reports whether this strategy restarted the identity less
-// than cooldown ago. A record whose time does not parse, or lies in the
-// future, counts as a recent restart: a bad record can delay a restart but
-// never unlock one.
-func (idx *capacityUpgradeIndex) restartedWithin(identity map[string]string, now time.Time, cooldown time.Duration) bool {
-	record, ok := idx.record(identity)
-	if !ok {
-		return false
-	}
-	last, err := time.Parse(time.RFC3339, record.Last)
-	if err != nil || last.After(now) {
-		return true
-	}
-	return now.Sub(last) < cooldown
-}
-
-// restartRecord is the record a restart at now leaves for an identity: the
-// merged history with its clock reset, and the move count raised to moves
-// when that is higher (a victim keeps its count, a mover spends one).
-func (idx *capacityUpgradeIndex) restartRecord(identity map[string]string, now time.Time, moves int) workloadRecord {
-	record := workloadRecord{Identity: identity, Last: now.UTC().Format(time.RFC3339), Moves: moves}
-	if existing, ok := idx.record(identity); ok {
-		record = mergeRecord(existing, record)
-	}
-	return record
-}
-
-// prune drops the records that protect nothing any more: their cooldown has
-// passed and no pod on the cluster carries their identity, so the move
-// count they hold can never apply again. The next ledger write persists the
-// pruned view.
-func (idx *capacityUpgradeIndex) prune(now time.Time, cooldown time.Duration, alive map[string]bool) {
-	for key, record := range idx.records {
-		if alive[key] || idx.restartedWithin(record.Identity, now, cooldown) {
-			continue
-		}
-		delete(idx.records, key)
-		idx.pruned = true
-	}
-}
-
-// ledgerRecords is the ledger as it would be written: every record, in
-// identity order.
-func (idx *capacityUpgradeIndex) ledgerRecords() []workloadRecord {
-	keys := make([]string, 0, len(idx.records))
-	for key := range idx.records {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	records := make([]workloadRecord, 0, len(keys))
-	for _, key := range keys {
-		records = append(records, idx.records[key])
-	}
-	return records
-}
-
-// commitLedger writes records as the whole ledger and, once they are
-// durable, makes them the index's view. Writing happens before anything the
-// records describe is evicted, so a restart is never carried out without
-// being remembered; the reverse (remembered, not carried out) only delays
-// that workload's next restart.
-func (idx *capacityUpgradeIndex) commitLedger(records []workloadRecord, store capacityUpgradeStore) error {
-	version, err := store.writeLedger(records, idx.ledgerVersion)
-	if err != nil {
-		return err
-	}
-	idx.ledgerVersion = version
-	idx.pruned = false
-	idx.records = make(map[string]workloadRecord, len(records))
-	for _, record := range records {
-		idx.addRecord(record)
-	}
-	return nil
-}
-
-// state is the node's current desired annotation state.
-func (idx *capacityUpgradeIndex) state(node string) nodeState {
-	return nodeState{holds: idx.holds[node], drains: idx.drains[node]}
 }
 
 // decodeHolds parses a node's hold annotation; any fragment that cannot
@@ -760,7 +541,7 @@ func advanceCapacityUpgradeMoves(
 		step := moveStep{id: node, outcome: "malformed", reason: reason, nodes: map[string]nodeState{}}
 		delete(idx.holds, node)
 		delete(idx.drains, node)
-		step.nodes[node] = idx.state(node)
+		step.nodes[node] = nodeState{}
 		steps = append(steps, step)
 	}
 
@@ -805,7 +586,7 @@ func advanceCapacityUpgradeMoves(
 		}
 		if step.outcome != "" {
 			for _, node := range idx.removeMove(id) {
-				step.nodes[node] = idx.state(node)
+				step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
 			}
 			steps = append(steps, step)
 			continue
@@ -850,7 +631,7 @@ func advanceCapacityUpgradeMoves(
 					return step.groups[i].namespace+"/"+step.groups[i].name < step.groups[j].namespace+"/"+step.groups[j].name
 				})
 				for _, node := range idx.removeMove(id) {
-					step.nodes[node] = idx.state(node)
+					step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
 				}
 				steps = append(steps, step)
 				continue
@@ -869,7 +650,7 @@ func advanceCapacityUpgradeMoves(
 			// job finished or was deleted); nothing can claim the hold.
 			step.outcome, step.reason = "abandoned", "movers gone before eviction"
 			for _, node := range idx.removeMove(id) {
-				step.nodes[node] = idx.state(node)
+				step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
 			}
 			steps = append(steps, step)
 			continue
@@ -932,7 +713,7 @@ func advanceCapacityUpgradeMoves(
 			touched[node] = true
 		}
 		for node := range touched {
-			step.nodes[node] = idx.state(node)
+			step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
 		}
 		step.hold = hold
 		step.victims, step.evicting = movers, "mover"
@@ -954,7 +735,7 @@ func advanceCapacityUpgradeMoves(
 			idx.drains[node] = kept
 			steps = append(steps, moveStep{
 				id: node, outcome: "drain_released", reason: "move finished",
-				nodes: map[string]nodeState{node: idx.state(node)},
+				nodes: map[string]nodeState{node: {holds: idx.holds[node], drains: kept}},
 			})
 		}
 	}
@@ -1072,17 +853,10 @@ func moversFit(move *capacityUpgradeMove, nodes map[string]*api.NodeInfo, movers
 	return true
 }
 
-// capacityUpgradeStore reads and writes capacity-upgrade state on the
-// cluster.
+// capacityUpgradeStore writes capacity-upgrade state to the cluster.
 type capacityUpgradeStore interface {
 	writeNode(name string, state nodeState) error
 	stampGroup(stamp groupStamp) error
-	// readLedger returns the ledger; a missing ledger is empty, a ledger
-	// that cannot be read or decoded is an error.
-	readLedger() (capacityLedger, error)
-	// writeLedger replaces the ledger, provided it is still at version (an
-	// empty version creates it), and returns the version written.
-	writeLedger(records []workloadRecord, version string) (string, error)
 }
 
 // applyMoveSteps executes steps in order: node state first, then PodGroup
@@ -1232,63 +1006,6 @@ func (sessionStore) stampGroup(stamp groupStamp) error {
 		return fmt.Errorf("stamp podgroup %s/%s: %w", stamp.namespace, stamp.name, err)
 	}
 	return nil
-}
-
-// ledgerNamespace is the namespace the ledger ConfigMap lives in: the
-// scheduler's own, read from its service account mount.
-func ledgerNamespace() string {
-	raw, err := os.ReadFile(serviceAccountNamespaceFile)
-	if err != nil {
-		return ledgerFallbackNamespace
-	}
-	if namespace := strings.TrimSpace(string(raw)); namespace != "" {
-		return namespace
-	}
-	return ledgerFallbackNamespace
-}
-
-func (sessionStore) readLedger() (capacityLedger, error) {
-	namespace := ledgerNamespace()
-	cm, err := Session.KubeClient().CoreV1().ConfigMaps(namespace).Get(
-		context.TODO(), CapacityUpgradeLedgerName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return capacityLedger{}, nil
-	}
-	if err != nil {
-		return capacityLedger{}, fmt.Errorf("read ledger %s/%s: %w", namespace, CapacityUpgradeLedgerName, err)
-	}
-	records, err := decodeLedger(cm.Data[CapacityUpgradeLedgerKey])
-	if err != nil {
-		return capacityLedger{}, fmt.Errorf("decode ledger %s/%s: %w", namespace, CapacityUpgradeLedgerName, err)
-	}
-	return capacityLedger{records: records, version: cm.ResourceVersion}, nil
-}
-
-// writeLedger replaces the ledger ConfigMap, creating it when the session
-// read none. The write is conditional on the version read this session, so
-// a concurrent writer (or a lost create race) fails the write; the caller
-// skips its move and the next session re-reads and retries.
-func (sessionStore) writeLedger(records []workloadRecord, version string) (string, error) {
-	body, err := json.Marshal(records)
-	if err != nil {
-		return "", fmt.Errorf("encode ledger: %w", err)
-	}
-	namespace := ledgerNamespace()
-	cm := &v1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: CapacityUpgradeLedgerName, ResourceVersion: version},
-		Data:       map[string]string{CapacityUpgradeLedgerKey: string(body)},
-	}
-	client := Session.KubeClient().CoreV1().ConfigMaps(namespace)
-	var written *v1.ConfigMap
-	if version == "" {
-		written, err = client.Create(context.TODO(), cm, metav1.CreateOptions{})
-	} else {
-		written, err = client.Update(context.TODO(), cm, metav1.UpdateOptions{})
-	}
-	if err != nil {
-		return "", fmt.Errorf("write ledger %s/%s: %w", namespace, CapacityUpgradeLedgerName, err)
-	}
-	return written.ResourceVersion, nil
 }
 
 // podGroupMoves is the PodGroup's move count; a malformed count is treated
