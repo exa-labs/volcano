@@ -47,7 +47,7 @@ import (
 //
 // Every restart this strategy causes, of a mover or of a victim, is recorded
 // against the workload's identity (the labels its successor keeps, see
-// podIdentity) in a cluster-side ledger. A workload restarted less than
+// podIdentity) in a ledger ConfigMap. A workload restarted less than
 // cooldownSeconds ago is neither a candidate nor a victim, and its upgrade
 // count persists across the fresh PodGroups its successors get, so a
 // low-priority pod cannot be bounced between tiers by a chain of
@@ -280,12 +280,15 @@ func sessionPredicate() capacityUpgradePredicate {
 // written earlier in the session is honoured by everything that runs after.
 var sessionCapacityUpgrade *capacityUpgradeIndex
 
-// capacityUpgradeSessionIndex returns the session's index, decoding the
-// node annotations on first use and dropping the ledger records no pod on
-// the cluster can inherit any more.
+// capacityUpgradeSessionIndex returns the session's index, reading the
+// ledger and decoding the node annotations on first use and dropping the
+// ledger records no pod on the cluster can inherit any more. A ledger that
+// cannot be read leaves the index unable to plan (see ledgerErr).
 func capacityUpgradeSessionIndex() *capacityUpgradeIndex {
 	if sessionCapacityUpgrade == nil {
-		idx := indexCapacityUpgrade(Session.Nodes)
+		ledger, err := sessionStore{}.readLedger()
+		idx := indexCapacityUpgrade(Session.Nodes, ledger)
+		idx.ledgerErr = err
 		if len(idx.records) > 0 {
 			conf := loadCapacityUpgradeConf()
 			idx.prune(time.Now(), conf.cooldown(), liveIdentities(Session.Nodes, conf.identityLabels()))
@@ -348,6 +351,11 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	}
 
 	idx := capacityUpgradeSessionIndex()
+	if idx.ledgerErr != nil {
+		klog.Errorf("capacityUpgrade: not planning, ledger unavailable: %v", idx.ledgerErr)
+		capacityUpgradeStampFailures.WithLabelValues("ledger").Inc()
+		return nil
+	}
 	plans := planCapacityUpgrades(Session.Nodes, Session.Jobs, running, conf, idx, time.Now(), sessionPredicate())
 
 	victims := make([]*api.TaskInfo, 0)
@@ -375,19 +383,26 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 		plan.observe("held")
 		victims = append(victims, plan.victims...)
 	}
+	if idx.pruned && !conf.DryRun {
+		if err := idx.commitLedger(idx.ledgerRecords(), sessionStore{}); err != nil {
+			// The stale records only delay restarts; the next pass prunes again.
+			klog.Errorf("capacityUpgrade: persist pruned ledger: %v", err)
+			capacityUpgradeStampFailures.WithLabelValues("ledger").Inc()
+		}
+	}
 	return victims
 }
 
-// startCapacityUpgradeMove makes the move durable: it writes a hold
-// fragment onto every target node, together with the ledger records of the
-// restarts the move causes (each victim's on the node it is evicted from,
-// the mover's on every target node), then stamps the mover's cooldown and
+// startCapacityUpgradeMove makes the move durable: it records the restarts
+// the move causes (the mover's and every victim's) in the ledger, writes a
+// hold fragment onto every target node, then stamps the mover's cooldown and
 // budget. Nothing is evicted unless every write succeeded; a write failure
-// rolls back the fragments already written. A fragment that cannot be
-// rolled back is a durable hold like any other, so maintenance carries it
-// on (the hold itself records the move count the successor inherits) or
-// expires it. The index is updated so later plans in the pass see the new
-// holds and records.
+// rolls back the fragments already written. The ledger records stay: a
+// record for a restart that did not happen only delays that workload's next
+// one. A fragment that cannot be rolled back is a durable hold like any
+// other, so maintenance carries it on (the hold itself records the move
+// count the successor inherits) or expires it. The index is updated so later
+// plans in the pass see the new holds and records.
 func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeIndex, conf *capacityUpgradeConf, store capacityUpgradeStore) error {
 	pg := plan.job.PodGroup
 	at := plan.at.UTC().Format(time.RFC3339)
@@ -403,7 +418,10 @@ func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeInde
 	}
 	names := plan.nodeNames()
 	until := plan.at.Add(time.Duration(conf.HoldTTLSeconds) * time.Second).UTC().Format(time.RFC3339)
-	ledgers := moveLedgers(plan, idx, conf.identityLabels())
+	if err := idx.commitLedger(moveRecords(plan, idx, conf.identityLabels()), store); err != nil {
+		capacityUpgradeStampFailures.WithLabelValues("ledger").Inc()
+		return fmt.Errorf("record restarts for %s: %w", id, err)
+	}
 	fragment := func(name string) capacityHold {
 		return capacityHold{
 			Move: id, Group: group, Nodes: names, Movers: movers, Victims: victims, Identity: plan.identity,
@@ -421,7 +439,7 @@ func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeInde
 	}
 	for _, name := range names {
 		holds := append(append([]capacityHold{}, idx.holds[name]...), fragment(name))
-		if err := store.writeNode(name, nodeState{holds: holds, drains: idx.drains[name], ledger: ledgers[name]}); err != nil {
+		if err := store.writeNode(name, nodeState{holds: holds, drains: idx.drains[name]}); err != nil {
 			capacityUpgradeStampFailures.WithLabelValues("hold").Inc()
 			rollback()
 			return fmt.Errorf("hold %s on %s (at %s): %w", id, name, at, err)
@@ -436,32 +454,21 @@ func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeInde
 	for _, name := range names {
 		idx.addHold(name, fragment(name))
 	}
-	for _, name := range names {
-		for _, record := range ledgers[name] {
-			idx.addRecord(name, record)
-		}
-	}
 	return nil
 }
 
-// moveLedgers is each target node's ledger once the move's restarts are
-// recorded: the mover's record on every target node, each victim's on the
-// node it is evicted from. A victim without an identity leaves no record; it
-// has no controller either, so it is never chosen as a victim.
-func moveLedgers(plan capacityUpgradePlan, idx *capacityUpgradeIndex, identitySets [][]string) map[string][]workloadRecord {
-	ledgers := make(map[string][]workloadRecord, len(plan.nodes))
-	for name := range plan.nodes {
-		ledgers[name] = upsertRecord(append([]workloadRecord{}, idx.ledger[name]...), idx.restartRecord(plan.identity, plan.at, plan.moves))
-	}
+// moveRecords is the ledger once the move's restarts are recorded: the
+// mover's record with this move spent, and a record for every victim. A
+// victim without an identity leaves no record; it has no controller either,
+// so it is never chosen as a victim.
+func moveRecords(plan capacityUpgradePlan, idx *capacityUpgradeIndex, identitySets [][]string) []workloadRecord {
+	records := upsertRecord(idx.ledgerRecords(), idx.restartRecord(plan.identity, plan.at, plan.moves))
 	for _, victim := range plan.victims {
-		if _, target := ledgers[victim.NodeName]; !target {
-			continue
-		}
 		if identity, ok := podIdentity(victim.Pod, identitySets); ok {
-			ledgers[victim.NodeName] = upsertRecord(ledgers[victim.NodeName], idx.restartRecord(identity, plan.at, 0))
+			records = upsertRecord(records, idx.restartRecord(identity, plan.at, 0))
 		}
 	}
-	return ledgers
+	return records
 }
 
 // stampCapacityUpgradeMover records the cooldown clock and move count on the
@@ -483,7 +490,8 @@ func stampCapacityUpgradeMover(plan capacityUpgradePlan, store capacityUpgradeSt
 // tier that fits the whole group (within one zone, for gangs) wins. Fit is
 // simulated first-fit-decreasing over a ledger shared by every plan in the
 // pass and seeded with the holds in flight, so two plans cannot claim the
-// same capacity.
+// same capacity. Without a readable ledger nothing is planned: the cooldowns
+// it holds are what keeps a move from restarting the same workload again.
 func planCapacityUpgrades(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -495,7 +503,7 @@ func planCapacityUpgrades(
 ) []capacityUpgradePlan {
 	gpu := v1.ResourceName(conf.GpuResource)
 	ranker := conf.ranker()
-	if ranker.MaxRank() <= 0 {
+	if ranker.MaxRank() <= 0 || idx.ledgerErr != nil {
 		return nil
 	}
 

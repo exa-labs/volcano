@@ -62,7 +62,7 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: "volcano",
 			Name:      "capacity_upgrade_stamp_failures_total",
-			Help:      "Cluster write failures, by kind: mover (PodGroup cooldown/budget, skips the move), hold (node hold/drain state, skips or delays the step), successor (cooldown carry-over lost).",
+			Help:      "Cluster read/write failures, by kind: ledger (ConfigMap unreadable or unwritable, skips the move or the whole planning pass), mover (PodGroup cooldown/budget, skips the move), hold (node hold/drain state, skips or delays the step), successor (cooldown carry-over lost).",
 		}, []string{"kind"},
 	)
 

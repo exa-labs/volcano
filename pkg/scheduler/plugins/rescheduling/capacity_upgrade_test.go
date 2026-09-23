@@ -20,13 +20,14 @@ package rescheduling
 // move where, in what order, with which victims) and the move transaction
 // (holds, drains, sequencing, claims, failure paths). The transaction tests
 // drive a move through the same steps the scheduler would across sessions,
-// re-reading the state from node annotations each time as a new session
-// does.
+// re-reading the state from node annotations and the ledger each time as a
+// new session does.
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -186,10 +187,10 @@ func (f *fixture) bind(t *testing.T, pod *v1.Pod, nodeName string, minMember int
 	return task
 }
 
-// index re-reads the move state from node annotations, as a new session
-// does.
+// index re-reads the move state from node annotations and the ledger, as a
+// new session does.
 func (f *fixture) index() *capacityUpgradeIndex {
-	return indexCapacityUpgrade(f.nodes)
+	return indexCapacityUpgrade(f.nodes, capacityLedger{records: f.ledger, version: f.ledgerVersion})
 }
 
 func (f *fixture) planUpgrades(conf *capacityUpgradeConf, predicate capacityUpgradePredicate) []capacityUpgradePlan {
@@ -197,14 +198,16 @@ func (f *fixture) planUpgrades(conf *capacityUpgradeConf, predicate capacityUpgr
 }
 
 // memStore is a capacityUpgradeStore that applies node writes to the
-// fixture's node annotations (so the next index sees them) and records
-// every write in order. Writes can be made to fail per node.
+// fixture's node annotations and ledger writes to the fixture's ledger (so
+// the next index sees them) and records every write in order. Writes can be
+// made to fail per node, for the PodGroup stamp and for the ledger.
 type memStore struct {
-	f         *fixture
-	log       []string
-	groups    []groupStamp
-	failNode  map[string]error
-	failStamp error
+	f          *fixture
+	log        []string
+	groups     []groupStamp
+	failNode   map[string]error
+	failStamp  error
+	failLedger error
 }
 
 func newMemStore(f *fixture) *memStore {
@@ -244,6 +247,45 @@ func (s *memStore) stampGroup(stamp groupStamp) error {
 	s.groups = append(s.groups, stamp)
 	s.log = append(s.log, "group:"+stamp.namespace+"/"+stamp.name)
 	return nil
+}
+
+func (s *memStore) readLedger() (capacityLedger, error) {
+	if s.failLedger != nil {
+		return capacityLedger{}, s.failLedger
+	}
+	return capacityLedger{records: append([]workloadRecord{}, s.f.ledger...), version: s.f.ledgerVersion}, nil
+}
+
+// writeLedger round-trips the records through JSON, as the ConfigMap does,
+// and enforces the version like the API server would.
+func (s *memStore) writeLedger(records []workloadRecord, version string) (string, error) {
+	if s.failLedger != nil {
+		return "", s.failLedger
+	}
+	if version != s.f.ledgerVersion {
+		return "", fmt.Errorf("ledger version %q, want %q", version, s.f.ledgerVersion)
+	}
+	body, err := json.Marshal(records)
+	if err != nil {
+		return "", err
+	}
+	decoded, err := decodeLedger(string(body))
+	if err != nil {
+		return "", err
+	}
+	s.f.ledger = decoded
+	s.f.ledgerVersion = strconv.Itoa(len(s.log) + 1)
+	s.log = append(s.log, "ledger")
+	return s.f.ledgerVersion, nil
+}
+
+// ledgerByIdentity is the fixture's ledger keyed by identity.
+func (f *fixture) ledgerByIdentity() map[string]workloadRecord {
+	out := map[string]workloadRecord{}
+	for _, record := range f.ledger {
+		out[identityKey(record.Identity)] = record
+	}
+	return out
 }
 
 // holdsOn decodes the holds annotation of a node.
@@ -866,23 +908,6 @@ func (f *fixture) onlyTask(t *testing.T, job string) *api.TaskInfo {
 	return nil
 }
 
-// ledgerOn decodes the ledger annotation of a node, keyed by identity.
-func (f *fixture) ledgerOn(t *testing.T, name string) map[string]workloadRecord {
-	out := map[string]workloadRecord{}
-	raw, ok := f.nodes[name].Node.Annotations[CapacityUpgradeLedgerAnnotation]
-	if !ok {
-		return out
-	}
-	records, err := decodeLedger(raw)
-	if err != nil {
-		t.Fatalf("ledger on %s: %v", name, err)
-	}
-	for _, record := range records {
-		out[identityKey(record.Identity)] = record
-	}
-	return out
-}
-
 // fullReserved is a spot mover that can only reach reserved by evicting a
 // lower-priority run: train (8 GPUs, -4) on spot-1, low (8 GPUs, -9) filling
 // reserved-1, and a priority-0 job filling reserved-2 that is never a victim.
@@ -905,7 +930,7 @@ func TestStartMoveRecordsMoverAndVictimsInTheLedger(t *testing.T) {
 	if len(plans) != 1 || len(victims) != 1 || victims[0].Name != "low" {
 		t.Fatalf("expected train to displace low, got %+v", plans)
 	}
-	ledger := f.ledgerOn(t, "reserved-1")
+	ledger := f.ledgerByIdentity()
 	stamp := testNow.Format(time.RFC3339)
 	mover, victim := ledger["exa-run-name=train-run,node-id=n0"], ledger["exa-run-name=low-run,node-id=n0"]
 	if mover.Last != stamp || mover.Moves != 1 {
@@ -914,8 +939,35 @@ func TestStartMoveRecordsMoverAndVictimsInTheLedger(t *testing.T) {
 	if victim.Last != stamp || victim.Moves != 0 {
 		t.Fatalf("expected the victim recorded without spending a move, got %+v", ledger)
 	}
-	if len(f.ledgerOn(t, "spot-1")) != 0 {
-		t.Fatalf("expected no ledger on the source node")
+	if len(store.log) < 2 || store.log[0] != "ledger" || store.log[1] != "node:reserved-1" {
+		t.Fatalf("expected the ledger written before the hold, got %v", store.log)
+	}
+}
+
+func TestStartMoveNeedsTheLedgerWrittenFirst(t *testing.T) {
+	f := fullReserved(t)
+	store := newMemStore(f)
+	store.failLedger = fmt.Errorf("configmaps is forbidden")
+	conf := liveConf()
+	idx := f.index()
+	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, testNow, nil)
+	if len(plans) != 1 {
+		t.Fatalf("expected one plan, got %+v", plans)
+	}
+	if err := startCapacityUpgradeMove(plans[0], idx, conf, store); err == nil {
+		t.Fatalf("expected the move to fail without a ledger write")
+	}
+	if len(store.log) != 0 || len(f.holdsOn(t, "reserved-1")) != 0 || len(idx.moves) != 0 {
+		t.Fatalf("expected nothing written or indexed after the ledger failed, got %v", store.log)
+	}
+}
+
+func TestUnreadableLedgerStopsPlanning(t *testing.T) {
+	f := fullReserved(t)
+	idx := f.index()
+	idx.ledgerErr = fmt.Errorf("configmaps is forbidden")
+	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil); len(plans) != 0 {
+		t.Fatalf("expected no plan without the ledger, got %+v", plans)
 	}
 }
 
@@ -987,7 +1039,7 @@ func TestMoveBudgetFollowsTheRunAcrossFreshPodGroups(t *testing.T) {
 	if err := startCapacityUpgradeMove(plans[0], idx, conf, store); err != nil {
 		t.Fatalf("startCapacityUpgradeMove: %v", err)
 	}
-	if record := f.ledgerOn(t, "reserved-2")["exa-run-name=train-run,node-id=n0"]; record.Moves != 2 {
+	if record := f.ledgerByIdentity()["exa-run-name=train-run,node-id=n0"]; record.Moves != 2 {
 		t.Fatalf("expected the ledger to carry two moves, got %+v", record)
 	}
 
@@ -1011,30 +1063,28 @@ func TestLedgerPrunesOnlyCooledRunsNobodyCarries(t *testing.T) {
 	conf := liveConf()
 	idx := f.index()
 	idx.prune(testNow.Add(10*time.Minute), conf.cooldown(), liveIdentities(f.nodes, conf.identityLabels()))
-	if len(idx.ledger["reserved-1"]) != 2 {
-		t.Fatalf("expected both records kept inside the cooldown, got %+v", idx.ledger)
+	if len(idx.ledgerRecords()) != 2 || idx.pruned {
+		t.Fatalf("expected both records kept inside the cooldown, got %+v", idx.ledgerRecords())
 	}
 	idx.prune(testNow.Add(time.Hour), conf.cooldown(), liveIdentities(f.nodes, conf.identityLabels()))
-	records := idx.ledger["reserved-1"]
-	if len(records) != 1 || records[0].Identity["exa-run-name"] != "low-run" {
+	records := idx.ledgerRecords()
+	if len(records) != 1 || records[0].Identity["exa-run-name"] != "low-run" || !idx.pruned {
 		t.Fatalf("expected only the run still on the cluster to be kept, got %+v", records)
 	}
 	if _, ok := idx.record(map[string]string{"exa-run-name": "train-run", "node-id": "n0"}); ok {
-		t.Fatalf("expected the pruned run to leave the merged view")
+		t.Fatalf("expected the pruned run to leave the ledger view")
 	}
-	if err := store.writeNode("reserved-1", idx.state("reserved-1")); err != nil {
-		t.Fatalf("writeNode: %v", err)
+	if err := idx.commitLedger(idx.ledgerRecords(), store); err != nil {
+		t.Fatalf("commitLedger: %v", err)
 	}
-	if ledger := f.ledgerOn(t, "reserved-1"); len(ledger) != 1 {
+	if ledger := f.ledgerByIdentity(); len(ledger) != 1 || idx.pruned {
 		t.Fatalf("expected the pruned ledger to be written, got %+v", ledger)
 	}
 }
 
 func TestMalformedLedgerRecordDelaysButNeverUnlocks(t *testing.T) {
 	f := fullReserved(t)
-	f.nodes["reserved-2"].Node.Annotations = map[string]string{
-		CapacityUpgradeLedgerAnnotation: `[{"identity":{"exa-run-name":"train-run","node-id":"n0"},"last":"soon","moves":0}]`,
-	}
+	f.ledger = []workloadRecord{{Identity: map[string]string{"exa-run-name": "train-run", "node-id": "n0"}, Last: "soon"}}
 	idx := f.index()
 	if idx.restartedWithin(map[string]string{"exa-run-name": "train-run", "node-id": "n0"}, testNow, time.Hour) != true {
 		t.Fatalf("expected an unparsable restart time to count as recent")
@@ -1043,32 +1093,60 @@ func TestMalformedLedgerRecordDelaysButNeverUnlocks(t *testing.T) {
 		t.Fatalf("expected the run with a bad record to wait, got %+v", plans)
 	}
 
-	f.nodes["reserved-2"].Node.Annotations[CapacityUpgradeLedgerAnnotation] = `[{"moves":1}]`
-	idx = f.index()
-	if _, malformed := idx.malformed["reserved-2"]; !malformed {
-		t.Fatalf("expected a record without identity to make the node malformed")
+	for _, raw := range []string{`[{"moves":1}]`, `[{"identity":{"a":"b"}}]`, `{not json`} {
+		if _, err := decodeLedger(raw); err == nil {
+			t.Fatalf("expected %s to be rejected", raw)
+		}
+	}
+	if records, err := decodeLedger(""); err != nil || len(records) != 0 {
+		t.Fatalf("expected an empty ledger to decode to nothing, got %+v, %v", records, err)
 	}
 }
 
-func TestMalformedHoldsKeepTheNodeLedger(t *testing.T) {
+func TestMalformedHoldsLeaveTheLedgerAlone(t *testing.T) {
 	f := fullReserved(t)
-	f.nodes["reserved-2"].Node.Annotations = map[string]string{
-		CapacityUpgradeHoldsAnnotation:  `{not json`,
-		CapacityUpgradeLedgerAnnotation: `[{"identity":{"exa-run-name":"low-run","node-id":"n0"},"last":"` + testNow.Format(time.RFC3339) + `","moves":0}]`,
-	}
+	f.nodes["reserved-2"].Node.Annotations = map[string]string{CapacityUpgradeHoldsAnnotation: `{not json`}
+	f.ledger = []workloadRecord{{Identity: map[string]string{"exa-run-name": "low-run", "node-id": "n0"}, Last: testNow.Format(time.RFC3339)}}
 	store := newMemStore(f)
 	steps, _ := f.advance(liveConf(), store, testNow.Add(time.Minute), nil)
 	if len(steps) != 1 || steps[0].outcome != "malformed" {
 		t.Fatalf("expected the node to be cleared as malformed, got %+v", steps)
 	}
-	if ledger := f.ledgerOn(t, "reserved-2"); len(ledger) != 1 {
-		t.Fatalf("expected the ledger to survive clearing the holds, got %+v", ledger)
-	}
 	if _, ok := f.nodes["reserved-2"].Node.Annotations[CapacityUpgradeHoldsAnnotation]; ok {
 		t.Fatalf("expected the malformed holds to be cleared")
 	}
+	if len(f.ledger) != 1 || len(store.log) != 1 {
+		t.Fatalf("expected maintenance to leave the ledger untouched, got %+v, %v", f.ledger, store.log)
+	}
 	if plans := f.planUpgrades(liveConf(), nil); len(plans) != 0 {
-		t.Fatalf("expected low to stay shielded by the surviving record, got %+v", plans)
+		t.Fatalf("expected low to stay shielded by the ledger, got %+v", plans)
+	}
+}
+
+func TestLedgerOutlivesTheNodesItWasWrittenFor(t *testing.T) {
+	f := fullReserved(t)
+	store := newMemStore(f)
+	_, victims := f.startOnly(t, liveConf(), store)
+	f.evict(t, victims[0])
+	f.remove(t, victims[0])
+	// Every node that took part in the move is gone; the victim comes back on
+	// a brand-new spot node with reserved room to move into.
+	f.remove(t, f.onlyTask(t, "default/pg-train"))
+	f.remove(t, f.onlyTask(t, "default/pg-top"))
+	for _, name := range []string{"spot-1", "reserved-1", "reserved-2"} {
+		delete(f.nodes, name)
+	}
+	f.addNode(tierNode("spot-3", "spot", "a"))
+	f.addNode(tierNode("reserved-3", "reserved", "a"))
+	f.placeGroup(t, 1, nil, runPod(tierPod("low-2", "spot-3", "pg-low-2", 8, -9, 0), "low-run"))
+
+	conf := liveConf()
+	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), testNow.Add(20*time.Minute), nil); len(plans) != 0 {
+		t.Fatalf("expected the displaced run to sit out its cooldown, got %+v", plans)
+	}
+	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), testNow.Add(31*time.Minute), nil)
+	if len(plans) != 1 || plans[0].members[0].Name != "low-2" || plans[0].nodeNames()[0] != "reserved-3" {
+		t.Fatalf("expected the displaced run to move once cooled, got %+v", plans)
 	}
 }
 
@@ -1102,8 +1180,8 @@ func TestStartMoveWritesHoldsOnEveryTargetBeforeStamping(t *testing.T) {
 	if len(plans) != 1 || len(victims) != 1 || victims[0].Name != "filler" {
 		t.Fatalf("expected a gang plan evicting filler, got %+v / %v", plans, names(victims))
 	}
-	if got := strings.Join(store.log, ","); got != "node:reserved-1,node:reserved-2,group:default/pg-gang" {
-		t.Fatalf("expected holds before the mover stamp, got %s", got)
+	if got := strings.Join(store.log, ","); got != "ledger,node:reserved-1,node:reserved-2,group:default/pg-gang" {
+		t.Fatalf("expected the ledger, then holds, then the mover stamp, got %s", got)
 	}
 	for _, node := range []string{"reserved-1", "reserved-2"} {
 		holds := f.holdsOn(t, node)
@@ -1157,6 +1235,13 @@ func TestStartMoveRollsBackOnWriteFailure(t *testing.T) {
 	}
 	if f.holdsOn(t, "reserved-1") != nil || len(store.groups) != 0 {
 		t.Fatalf("expected reserved-1 rolled back and no stamp, got %v / %+v", f.holdsOn(t, "reserved-1"), store.groups)
+	}
+	// The ledger record stays: it can only delay this gang's next move.
+	if record, ok := f.ledgerByIdentity()["exa.ai/owner-uid=owner-pg-gang"]; !ok || record.Moves != 1 {
+		t.Fatalf("expected the mover's record kept after rollback, got %+v", f.ledger)
+	}
+	if plans := f.planUpgrades(liveConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected the gang to wait out the cooldown after a failed start, got %+v", plans)
 	}
 
 	f, store = build()
