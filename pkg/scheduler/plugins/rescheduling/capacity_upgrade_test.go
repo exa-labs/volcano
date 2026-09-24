@@ -17,7 +17,7 @@ limitations under the License.
 package rescheduling
 
 // Tests for the capacityUpgrade strategy: the planner (which groups may
-// move where, in what order, with which victims) and the move transaction
+// move where, in what order, onto which idle GPUs) and the move transaction
 // (holds, drains, sequencing, claims, failure paths). The transaction tests
 // drive a move through the same steps the scheduler would across sessions,
 // re-reading the state from node annotations each time as a new session
@@ -280,18 +280,16 @@ func liveConf() *capacityUpgradeConf {
 }
 
 // startOnly plans one pass and makes every plan durable, returning the
-// plans and the victims the pass would evict.
-func (f *fixture) startOnly(t *testing.T, conf *capacityUpgradeConf, store *memStore) ([]capacityUpgradePlan, []*api.TaskInfo) {
+// plans.
+func (f *fixture) startOnly(t *testing.T, conf *capacityUpgradeConf, store *memStore) []capacityUpgradePlan {
 	idx := f.index()
 	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, testNow, nil)
-	victims := make([]*api.TaskInfo, 0)
 	for _, plan := range plans {
 		if err := startCapacityUpgradeMove(plan, idx, conf, store); err != nil {
 			t.Fatalf("startCapacityUpgradeMove: %v", err)
 		}
-		victims = append(victims, plan.victims...)
 	}
-	return plans, victims
+	return plans
 }
 
 // advance runs one session's maintenance at the given time and applies it,
@@ -347,7 +345,7 @@ func TestUpgradeSinglePodMovesToIdleReserved(t *testing.T) {
 		t.Fatalf("expected 1 plan, got %d", len(plans))
 	}
 	p := plans[0]
-	if p.gang || p.target != "reserved" || p.from != "spot" || len(p.victims) != 0 || p.moves != 1 {
+	if p.gang || p.target != "reserved" || p.from != "spot" || p.moves != 1 {
 		t.Fatalf("unexpected plan: %+v", p)
 	}
 	if len(p.nodes) != 1 || p.nodes["reserved-1"] != 1 || p.gpus != 1 {
@@ -358,78 +356,86 @@ func TestUpgradeSinglePodMovesToIdleReserved(t *testing.T) {
 	}
 }
 
-func TestUpgradeCountsLowerPriorityFillerAsRoom(t *testing.T) {
+// A mover only ever takes GPUs that are idle today. Lower-priority pods on
+// the target are not room: displacing them would send them back to the
+// expensive tier as fresh movers and chain moves indefinitely.
+func TestUpgradeNeverCountsLowerPriorityPodsAsRoom(t *testing.T) {
 	f := newFixture(t)
 	f.addNode(tierNode("spot-1", "spot", "a"))
 	f.addNode(tierNode("reserved-1", "reserved", "a"))
 	f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 4, -4, time.Hour))
-	for i := 0; i < 8; i++ {
+	fillers := make([]*api.TaskInfo, 0, 5)
+	for i := 0; i < 5; i++ {
 		name := fmt.Sprintf("filler-%d", i)
-		f.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
+		job := f.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
+		for _, task := range job.Tasks {
+			fillers = append(fillers, task)
+		}
 	}
 
-	plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
-	if len(plans) != 1 {
-		t.Fatalf("expected 1 plan, got %d", len(plans))
+	// 3 idle GPUs, 5 held by strictly lower-priority pods: no move.
+	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected no plan without idle room, got %+v", plans)
 	}
-	if len(plans[0].victims) != 4 || plans[0].nodes["reserved-1"] != 4 {
-		t.Fatalf("expected 4 victims on reserved-1, got %v on %v", names(plans[0].victims), plans[0].nodes)
+
+	// One filler finishing makes the room; the move is then planned,
+	// started and executed without touching the remaining fillers.
+	f.remove(t, fillers[4])
+	store := newMemStore(f)
+	plans := f.startOnly(t, liveConf(), store)
+	if len(plans) != 1 || plans[0].nodes["reserved-1"] != 4 {
+		t.Fatalf("expected train to take the 4 idle GPUs, got %+v", plans)
+	}
+	_, evicted := f.advance(liveConf(), store, testNow.Add(time.Second), nil)
+	if len(evicted) != 1 || evicted[0].Name != "train" {
+		t.Fatalf("expected only the mover to be evicted, got %v", names(evicted))
+	}
+	for _, filler := range fillers[:4] {
+		if f.running[filler.Pod.UID] != filler || filler.Status != api.Running {
+			t.Fatalf("filler %s was disturbed", filler.Name)
+		}
 	}
 }
 
-// Session.Evict flips the victim it is handed to Releasing (via
+// Session.Evict flips the task it is handed to Releasing (via
 // JobInfo.UpdateTaskStatus) before NodeInfo.UpdateTask reads the node's copy
-// back out of node.Tasks. A plan that carried the node-local clone would flip
+// back out of node.Tasks. A step that carried the node-local clone would flip
 // that copy itself, and RemoveTask would then subtract from an empty
-// ni.Releasing and panic. Victims must be the session-side tasks, and
-// replaying Session.Evict's bookkeeping on them must leave the target node
+// ni.Releasing and panic. Evicted movers must be the session-side tasks, and
+// replaying Session.Evict's bookkeeping on them must leave the source node
 // consistent.
-func TestUpgradeVictimsAreSessionTasksAndEvictionAccountingHolds(t *testing.T) {
-	f := newFixture(t)
-	f.addNode(tierNode("spot-1", "spot", "a"))
-	reserved := f.addNode(tierNode("reserved-1", "reserved", "a"))
-	f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 2, -4, time.Hour))
-	for i := 0; i < 8; i++ {
-		name := fmt.Sprintf("filler-%d", i)
-		f.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
+func TestEvictedMoversAreSessionTasksAndEvictionAccountingHolds(t *testing.T) {
+	f, mover := raceFixture(t)
+	spot := f.nodes["spot-1"]
+	store := newMemStore(f)
+	f.startOnly(t, liveConf(), store)
+	_, evictions := f.advance(liveConf(), store, testNow.Add(time.Minute), nil)
+	if len(evictions) != 1 || !sameTask(evictions[0], mover) {
+		t.Fatalf("expected the mover evicted, got %v", names(evictions))
+	}
+	evicted := evictions[0]
+	if evicted != f.running[evicted.Pod.UID] || evicted != f.jobs[evicted.Job].Tasks[evicted.UID] {
+		t.Fatalf("mover %s is not the session task", evicted.Name)
+	}
+	if evicted == spot.Tasks[api.PodKey(evicted.Pod)] {
+		t.Fatalf("mover %s aliases the node-local task copy", evicted.Name)
 	}
 
-	plans, victims := f.startOnly(t, liveConf(), newMemStore(f))
-	if len(plans) != 1 || len(victims) != 2 {
-		t.Fatalf("expected 1 plan with 2 victims, got %d plans, victims %v", len(plans), names(victims))
+	if err := f.jobs[evicted.Job].UpdateTaskStatus(evicted, api.Releasing); err != nil {
+		t.Fatalf("UpdateTaskStatus(%s): %v", evicted.Name, err)
 	}
-	for _, victim := range victims {
-		if victim != f.running[victim.Pod.UID] || victim != f.jobs[victim.Job].Tasks[victim.UID] {
-			t.Fatalf("victim %s is not the session task", victim.Name)
-		}
-		if victim == reserved.Tasks[api.PodKey(victim.Pod)] {
-			t.Fatalf("victim %s aliases the node-local task copy", victim.Name)
-		}
+	if err := spot.UpdateTask(evicted); err != nil {
+		t.Fatalf("UpdateTask(%s): %v", evicted.Name, err)
 	}
-
-	for _, victim := range victims {
-		if err := f.jobs[victim.Job].UpdateTaskStatus(victim, api.Releasing); err != nil {
-			t.Fatalf("UpdateTaskStatus(%s): %v", victim.Name, err)
-		}
-		if err := reserved.UpdateTask(victim); err != nil {
-			t.Fatalf("UpdateTask(%s): %v", victim.Name, err)
-		}
+	if got := spot.Releasing.Get(gpuRes); got != 8*gpuMilli {
+		t.Fatalf("expected 8 GPUs releasing on spot-1, got %v", got)
 	}
-	if got := reserved.Releasing.Get(gpuRes); got != 2000 {
-		t.Fatalf("expected 2 GPUs releasing on reserved-1, got %v", got)
-	}
-	if got := reserved.Used.Get(gpuRes); got != 8000 {
-		t.Fatalf("expected 8 GPUs still used on reserved-1, got %v", got)
-	}
-	if got := reserved.Idle.Get(gpuRes); got != 0 {
-		t.Fatalf("expected 0 GPUs idle on reserved-1, got %v", got)
-	}
-	if got := reserved.FutureIdle().Get(gpuRes); got != 2000 {
-		t.Fatalf("expected 2 GPUs future-idle on reserved-1, got %v", got)
+	if got, future := spot.Idle.Get(gpuRes), spot.FutureIdle().Get(gpuRes); got != 0 || future != 8*gpuMilli {
+		t.Fatalf("expected 0 idle / 8 future-idle GPUs on spot-1, got %v / %v", got, future)
 	}
 }
 
-func TestUpgradeDoesNotPreemptEqualOrHigherPriority(t *testing.T) {
+func TestUpgradeDoesNotDisplaceEqualOrHigherPriority(t *testing.T) {
 	f := newFixture(t)
 	f.addNode(tierNode("spot-1", "spot", "a"))
 	f.addNode(tierNode("reserved-1", "reserved", "a"))
@@ -553,40 +559,18 @@ func TestUpgradeSkipsCooldownYoungOptedOutProtectedAndExhausted(t *testing.T) {
 	}
 }
 
-func TestUpgradeVictimsMustBeControlledUnprotectedGpuPods(t *testing.T) {
-	f := newFixture(t)
-	f.addNode(tierNode("spot-1", "spot", "a"))
-	f.addNode(tierNode("reserved-1", "reserved", "a"))
-	f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 4, -4, time.Hour))
-	guarded := tierPod("guarded", "reserved-1", "pg-guarded", 4, -9, time.Hour)
-	guarded.Annotations[doNotDisruptAnnotation] = "true"
-	f.placeGroup(t, 1, nil, guarded)
-	orphan := tierPod("orphan", "reserved-1", "pg-orphan", 4, -9, time.Hour)
-	orphan.OwnerReferences = nil
-	f.placeGroup(t, 1, nil, orphan)
-
-	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
-		t.Fatalf("expected no plan without evictable victims, got %+v", plans)
-	}
-}
-
 func TestUpgradeLedgerPreventsDoubleBooking(t *testing.T) {
 	f := newFixture(t)
 	f.addNode(tierNode("spot-1", "spot", "a"))
 	f.addNode(tierNode("reserved-1", "reserved", "a"))
 	f.placeGroup(t, 1, nil, tierPod("a", "spot-1", "pg-a", 4, -4, time.Hour))
 	f.placeGroup(t, 1, nil, tierPod("b", "spot-1", "pg-b", 4, -4, time.Hour))
-	// Two 2-GPU fillers: only one mover's worth of preemptable room.
-	f.placeGroup(t, 1, nil, tierPod("f0", "reserved-1", "pg-f0", 2, -9, time.Hour))
-	f.placeGroup(t, 1, nil, tierPod("f1", "reserved-1", "pg-f1", 2, -9, time.Hour))
-	f.placeGroup(t, 1, nil, tierPod("stay", "reserved-1", "pg-stay", 4, -4, time.Hour))
+	// 4 idle GPUs: one mover's worth of room.
+	f.placeGroup(t, 1, nil, tierPod("stay", "reserved-1", "pg-stay", 4, -9, time.Hour))
 
 	plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
-	if len(plans) != 1 {
-		t.Fatalf("expected exactly 1 plan, got %d", len(plans))
-	}
-	if len(plans[0].victims) != 2 {
-		t.Fatalf("expected 2 victims, got %v", names(plans[0].victims))
+	if len(plans) != 1 || plans[0].nodes["reserved-1"] != 4 {
+		t.Fatalf("expected exactly 1 plan of 4 GPUs, got %+v", plans)
 	}
 }
 
@@ -597,48 +581,30 @@ func TestUpgradeLedgerNetsOutHoldsInFlight(t *testing.T) {
 	f.addNode(tierNode("reserved-1", "reserved", "a"))
 	f.placeGroup(t, 1, nil, tierPod("first", "spot-1", "pg-first", 4, -4, 2*time.Hour))
 	f.placeGroup(t, 1, nil, tierPod("second", "spot-2", "pg-second", 4, -4, time.Hour))
-	for i := 0; i < 4; i++ {
-		name := fmt.Sprintf("filler-%d", i)
-		f.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
-	}
+	f.placeGroup(t, 1, nil, tierPod("stay", "reserved-1", "pg-stay", 2, -9, time.Hour))
 	store := newMemStore(f)
 	conf := liveConf()
-	conf.MaxVictims = 1
+	conf.MaxPodMoves = 1
 
-	// Pass 1: "first" holds 4 GPUs on reserved-1 (4 idle) and stays put
-	// until the hold is honoured.
-	plans, victims := f.startOnly(t, conf, store)
-	if len(plans) != 1 || plans[0].members[0].Name != "first" || len(victims) != 0 {
+	// Pass 1: "first" holds 4 of the 6 idle GPUs on reserved-1 and stays
+	// put until the hold is honoured.
+	plans := f.startOnly(t, conf, store)
+	if len(plans) != 1 || plans[0].members[0].Name != "first" {
 		t.Fatalf("expected first to hold idle room, got %+v", plans)
 	}
-	// Pass 2, before "first" moved: reserved-1 has 4 idle GPUs, all held,
-	// and 4 fillers. "second" must evict all 4 fillers to fit, not count
-	// the held idle GPUs; "first" is in flight and not re-planned.
-	plans = f.planUpgrades(conf, nil)
-	if len(plans) != 1 || plans[0].members[0].Name != "second" {
-		t.Fatalf("expected only second to plan, got %+v", plans)
-	}
-	if len(plans[0].victims) != 4 {
-		t.Fatalf("expected second to need all 4 fillers, got %v", names(plans[0].victims))
+	// Pass 2, before "first" moved: reserved-1 still shows 6 idle GPUs, 4
+	// of them held. "second" does not fit the 2 left; "first" is in flight
+	// and not re-planned.
+	if plans := f.planUpgrades(conf, nil); len(plans) != 0 {
+		t.Fatalf("expected held GPUs not to be re-planned, got %+v", plans)
 	}
 
-	// A hold's own victims are spoken for: with the fillers promised to a
-	// hold, nothing is left for a third mover.
-	g := newFixture(t)
-	g.addNode(tierNode("spot-1", "spot", "a"))
-	g.addNode(tierNode("reserved-1", "reserved", "a"))
-	g.placeGroup(t, 1, nil, tierPod("first", "spot-1", "pg-first", 8, -4, 2*time.Hour))
-	g.placeGroup(t, 1, nil, tierPod("second", "spot-1", "pg-second", 4, -4, time.Hour))
-	for i := 0; i < 8; i++ {
-		name := fmt.Sprintf("filler-%d", i)
-		g.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
-	}
-	plans, victims = g.startOnly(t, conf, newMemStore(g))
-	if len(plans) != 1 || len(victims) != 8 {
-		t.Fatalf("expected first to take every filler, got %+v", plans)
-	}
-	if plans := g.planUpgrades(conf, nil); len(plans) != 0 {
-		t.Fatalf("expected no room left for second, got %+v", plans)
+	// The 2 unheld idle GPUs are room for a 2-GPU mover, though "second"
+	// is older and considered first.
+	f.placeGroup(t, 1, nil, tierPod("third", "spot-2", "pg-third", 2, -4, 30*time.Minute))
+	plans = f.planUpgrades(conf, nil)
+	if len(plans) != 1 || plans[0].members[0].Name != "third" {
+		t.Fatalf("expected only third to fit the unheld remainder, got %+v", plans)
 	}
 }
 
@@ -673,9 +639,9 @@ func TestUpgradeRespectsPerPassBudgets(t *testing.T) {
 		f.placeGroup(t, 1, nil, tierPod(name, "spot-1", "pg-"+name, 1, -4, time.Hour))
 	}
 	conf := newCapacityUpgradeConf()
-	conf.MaxVictims = 2
+	conf.MaxPodMoves = 2
 	if plans := f.planUpgrades(conf, nil); len(plans) != 2 {
-		t.Fatalf("expected victim budget of 2, got %d", len(plans))
+		t.Fatalf("expected pod move budget of 2, got %d", len(plans))
 	}
 
 	g := newFixture(t)
@@ -732,8 +698,17 @@ func TestUpgradeMixedGangCountsOwnReservedMembersAsRoom(t *testing.T) {
 		tierPod("w1", "spot-1", "pg-gang", 8, -4, time.Hour))
 
 	plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
-	if len(plans) != 1 || len(plans[0].victims) != 0 || len(plans[0].nodes) != 2 {
-		t.Fatalf("expected gang to fit both reserved nodes without victims, got %+v", plans)
+	if len(plans) != 1 || len(plans[0].nodes) != 2 {
+		t.Fatalf("expected gang to fit both reserved nodes, got %+v", plans)
+	}
+
+	// Those GPUs are not room for anyone else in the same pass: they only
+	// come free once w0 is evicted.
+	f.addNode(tierNode("spot-2", "spot", "a"))
+	f.placeGroup(t, 1, nil, tierPod("other", "spot-2", "pg-other", 8, -4, 2*time.Hour))
+	plans = f.planUpgrades(newCapacityUpgradeConf(), nil)
+	if len(plans) != 1 || plans[0].members[0].Name != "other" || plans[0].nodes["reserved-2"] != 8 {
+		t.Fatalf("expected only the older single pod to take the idle node, got %+v", plans)
 	}
 }
 
@@ -758,230 +733,6 @@ func TestUpgradeIdentityFromLabelsMustAgreeAcrossGang(t *testing.T) {
 	w1.Labels["execution-id"] = "exec-2"
 	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
 		t.Fatalf("expected gang with disagreeing identity to be skipped, got %+v", plans)
-	}
-}
-
-// ---- restarts read off the pods -------------------------------------------
-
-// flytePod names a pod the way Flyte does, <execution>-<node-id>-<attempt>,
-// and labels it with its node-id.
-func flytePod(execution, nodeID string, attempt int, nodeName, group string, gpus int64, priority int32, age time.Duration) *v1.Pod {
-	pod := tierPod(fmt.Sprintf("%s-%s-%d", execution, nodeID, attempt), nodeName, group, gpus, priority, age)
-	pod.Labels["execution-id"] = execution
-	pod.Labels["node-id"] = nodeID
-	return pod
-}
-
-// pytorchWorker names a pod the way the PyTorchJob Flyte creates for a gang
-// does: the job carries the attempt, the pod carries the replica.
-func pytorchWorker(execution, nodeID string, attempt, replica int, nodeName, group string, gpus int64, priority int32, age time.Duration) *v1.Pod {
-	job := fmt.Sprintf("%s-%s-%d", execution, nodeID, attempt)
-	pod := tierPod(fmt.Sprintf("%s-worker-%d", job, replica), nodeName, group, gpus, priority, age)
-	pod.Labels["execution-id"] = execution
-	pod.Labels["node-id"] = nodeID
-	pod.OwnerReferences[0].Kind = "PyTorchJob"
-	pod.OwnerReferences[0].Name = job
-	return pod
-}
-
-func TestWorkloadAttempt(t *testing.T) {
-	cases := []struct {
-		name       string
-		pod        *v1.Pod
-		attempt    int
-		direct, ok bool
-	}{
-		{"first attempt", flytePod("exec", "n0", 0, "spot-1", "pg", 1, -4, time.Hour), 0, true, true},
-		{"retried", flytePod("exec", "n0", 2, "spot-1", "pg", 1, -4, time.Hour), 2, true, true},
-		{"dynamic node", flytePod("exec-n1-0", "dn2", 13, "spot-1", "pg", 1, -4, time.Hour), 13, true, true},
-		{"gang worker reads the job's attempt", pytorchWorker("exec", "n0", 1, 3, "spot-1", "pg", 1, -4, time.Hour), 1, false, true},
-		{"no node-id label", tierPod("exec-n0-2", "spot-1", "pg", 1, -4, time.Hour), 0, false, false},
-		{"replica index is not an attempt", func() *v1.Pod {
-			pod := tierPod("exec-n0-1-worker-3", "spot-1", "pg", 1, -4, time.Hour)
-			pod.Labels["node-id"] = "n0"
-			return pod
-		}(), 0, false, false},
-		{"node-id mismatch", func() *v1.Pod {
-			pod := flytePod("exec", "n0", 1, "spot-1", "pg", 1, -4, time.Hour)
-			pod.Labels["node-id"] = "n1"
-			return pod
-		}(), 0, false, false},
-		{"no attempt suffix", func() *v1.Pod {
-			pod := tierPod("exec-n0", "spot-1", "pg", 1, -4, time.Hour)
-			pod.Labels["node-id"] = "n0"
-			return pod
-		}(), 0, false, false},
-	}
-	for _, c := range cases {
-		attempt, direct, ok := workloadAttempt(c.pod, "node-id")
-		if attempt != c.attempt || direct != c.direct || ok != c.ok {
-			t.Errorf("%s: got (%d, %v, %v), want (%d, %v, %v)", c.name, attempt, direct, ok, c.attempt, c.direct, c.ok)
-		}
-	}
-}
-
-// A pod that restarted within the cooldown is not evicted again, whoever
-// restarted it; only a pod its own name proves to be a first attempt is.
-func TestRecentRestartIsNotAVictim(t *testing.T) {
-	f := newFixture(t)
-	f.addNode(tierNode("spot-1", "spot", "a"))
-	f.addNode(tierNode("reserved-1", "reserved", "a"))
-	f.placeGroup(t, 1, nil, flytePod("mover", "n0", 0, "spot-1", "pg-mover", 8, -4, time.Hour))
-	f.placeGroup(t, 1, nil, flytePod("retried", "n0", 1, "reserved-1", "pg-retried", 1, -9, 5*time.Minute))
-	f.placeGroup(t, 1, nil, flytePod("fresh", "n0", 0, "reserved-1", "pg-fresh", 1, -9, 5*time.Minute))
-	f.placeGroup(t, 1, nil, flytePod("settled", "n0", 3, "reserved-1", "pg-settled", 1, -9, time.Hour))
-	f.placeGroup(t, 2, nil,
-		pytorchWorker("gang", "n0", 0, 0, "reserved-1", "pg-gang", 1, -9, 5*time.Minute),
-		pytorchWorker("gang", "n0", 0, 1, "reserved-1", "pg-gang", 1, -9, 5*time.Minute))
-	f.placeGroup(t, 1, nil, tierPod("nameless", "reserved-1", "pg-nameless", 1, -9, 5*time.Minute))
-
-	ledger := newUpgradeLedger(f.nodes, f.running, f.index(), newCapacityUpgradeConf(), gpuRes, testNow)
-	got := names(ledger.preemptable["reserved-1"])
-	want := []string{"fresh-n0-0", "settled-n0-3"}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("preemptable on reserved-1: got %v, want %v", got, want)
-	}
-
-	// The 8-GPU mover needs every GPU on reserved-1; the recent restarts
-	// there are not up for eviction, so it does not fit.
-	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
-		t.Fatalf("expected no plan while recent restarts occupy the target, got %+v", plans)
-	}
-}
-
-// A pod that restarted within the cooldown is not upgraded either, so a
-// victim landing back on spot cannot immediately become a mover; a first
-// attempt only has to be past minPodAge.
-func TestRecentRestartIsNotAMover(t *testing.T) {
-	conf := newCapacityUpgradeConf()
-	place := func(pod *v1.Pod, minMember int32, more ...*v1.Pod) *fixture {
-		f := newFixture(t)
-		f.addNode(tierNode("spot-1", "spot", "a"))
-		f.addNode(tierNode("reserved-1", "reserved", "a"))
-		f.placeGroup(t, minMember, nil, append([]*v1.Pod{pod}, more...)...)
-		return f
-	}
-	age := 20 * time.Minute
-	cases := []struct {
-		name  string
-		f     *fixture
-		moves bool
-	}{
-		{"first attempt past minPodAge", place(flytePod("a", "n0", 0, "spot-1", "pg-a", 1, -4, age), 1), true},
-		{"retried within cooldown", place(flytePod("b", "n0", 1, "spot-1", "pg-b", 1, -4, age), 1), false},
-		{"retried past cooldown", place(flytePod("c", "n0", 1, "spot-1", "pg-c", 1, -4, time.Hour), 1), true},
-		{"gang within cooldown", place(
-			pytorchWorker("g", "n0", 0, 0, "spot-1", "pg-g", 4, -4, age), 2,
-			pytorchWorker("g", "n0", 0, 1, "spot-1", "pg-g", 4, -4, age)), false},
-		{"gang past cooldown", place(
-			pytorchWorker("h", "n0", 0, 0, "spot-1", "pg-h", 4, -4, time.Hour), 2,
-			pytorchWorker("h", "n0", 0, 1, "spot-1", "pg-h", 4, -4, time.Hour)), true},
-		{"unknown attempt within cooldown", place(tierPod("nameless", "spot-1", "pg-n", 1, -4, age), 1), false},
-	}
-	for _, c := range cases {
-		plans := c.f.planUpgrades(conf, nil)
-		if (len(plans) == 1) != c.moves {
-			t.Errorf("%s: expected moves=%v, got %+v", c.name, c.moves, plans)
-		}
-	}
-}
-
-// The attempt index spends the move budget as the PodGroup count does, so a
-// workload restarted maxMovesPerGroup times is not upgraded even under a
-// fresh PodGroup.
-func TestAttemptSpendsTheMoveBudget(t *testing.T) {
-	f := newFixture(t)
-	f.addNode(tierNode("spot-1", "spot", "a"))
-	f.addNode(tierNode("reserved-1", "reserved", "a"))
-	f.placeGroup(t, 1, nil, flytePod("spent", "n0", 2, "spot-1", "pg-spent", 1, -4, time.Hour))
-	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
-		t.Fatalf("expected attempt 2 to exhaust the budget, got %+v", plans)
-	}
-
-	g := newFixture(t)
-	g.addNode(tierNode("spot-1", "spot", "a"))
-	g.addNode(tierNode("reserved-1", "reserved", "a"))
-	g.placeGroup(t, 1, nil, flytePod("once", "n0", 1, "spot-1", "pg-once", 1, -4, time.Hour))
-	plans := g.planUpgrades(newCapacityUpgradeConf(), nil)
-	if len(plans) != 1 || plans[0].moves != 2 {
-		t.Fatalf("expected attempt 1 to move as its 2nd move, got %+v", plans)
-	}
-
-	// The PodGroup count and the attempt do not add up; the higher one
-	// counts.
-	h := newFixture(t)
-	h.addNode(tierNode("spot-1", "spot", "a"))
-	h.addNode(tierNode("reserved-1", "reserved", "a"))
-	h.placeGroup(t, 1, map[string]string{CapacityUpgradeCountAnnotation: "1"},
-		flytePod("both", "n0", 1, "spot-1", "pg-both", 1, -4, time.Hour))
-	plans = h.planUpgrades(newCapacityUpgradeConf(), nil)
-	if len(plans) != 1 || plans[0].moves != 2 {
-		t.Fatalf("expected count 1 + attempt 1 to move as its 2nd move, got %+v", plans)
-	}
-}
-
-// The live churn: a victim's successor gets a fresh PodGroup, lands back on
-// spot and, with nothing remembered about it, was upgraded onto reserved 10
-// minutes later only to be evicted again. Its attempt now keeps it out of
-// both roles for the cooldown.
-func TestVictimSuccessorIsNeitherMoverNorVictimUntilCooled(t *testing.T) {
-	f := newFixture(t)
-	f.addNode(tierNode("spot-1", "spot", "a"))
-	f.addNode(tierNode("spot-2", "spot", "a"))
-	f.addNode(tierNode("reserved-1", "reserved", "a"))
-	f.addNode(tierNode("reserved-2", "reserved", "a"))
-	f.placeGroup(t, 1, nil, flytePod("mover", "n0", 0, "spot-1", "pg-mover", 8, -4, time.Hour))
-	victim := f.placeGroup(t, 1, nil, flytePod("low", "n0", 0, "reserved-1", "pg-low", 1, -9, time.Hour))
-	busy := f.placeGroup(t, 1, nil, flytePod("busy", "n0", 0, "reserved-2", "pg-busy", 8, 0, time.Hour))
-	store := newMemStore(f)
-	plans, victims := f.startOnly(t, liveConf(), store)
-	if len(plans) != 1 || len(victims) != 1 || victims[0].Name != "low-n0-0" {
-		t.Fatalf("expected the low pod to be evicted for the mover, got %+v / %v", plans, names(victims))
-	}
-	f.evict(t, victims[0])
-	f.remove(t, victims[0])
-	delete(f.jobs, victim.UID)
-	// reserved-2 frees up for whatever comes next.
-	for _, task := range busy.Tasks {
-		f.remove(t, task)
-	}
-	delete(f.jobs, busy.UID)
-
-	// Flyte retries the victim; it lands on spot under a fresh PodGroup.
-	successor := flytePod("low", "n0", 1, "spot-2", "pg-low-2", 1, -9, 0)
-	started := metav1.NewTime(testNow.Add(time.Minute))
-	successor.Status.StartTime = &started
-	successor.CreationTimestamp = started
-	f.placeGroup(t, 1, nil, successor)
-	// A higher-priority pod appears on spot with room for it on reserved-2.
-	f.placeGroup(t, 1, nil, flytePod("other", "n0", 0, "spot-2", "pg-other", 1, -4, time.Hour))
-
-	for _, later := range []time.Duration{15 * time.Minute, 30 * time.Minute} {
-		now := testNow.Add(later)
-		plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, newCapacityUpgradeConf(), f.index(), now, nil)
-		for _, plan := range plans {
-			if plan.members[0].Name == "low-n0-1" {
-				t.Fatalf("at +%v the successor was upgraded again: %+v", later, plan)
-			}
-			for _, v := range plan.victims {
-				if v.Name == "low-n0-1" {
-					t.Fatalf("at +%v the successor was evicted again: %+v", later, plan)
-				}
-			}
-		}
-	}
-
-	// Once cooled it is an ordinary spot pod again, with one move spent.
-	now := testNow.Add(32 * time.Minute)
-	plans = planCapacityUpgrades(f.nodes, f.jobs, f.running, newCapacityUpgradeConf(), f.index(), now, nil)
-	var upgraded *capacityUpgradePlan
-	for i := range plans {
-		if plans[i].members[0].Name == "low-n0-1" {
-			upgraded = &plans[i]
-		}
-	}
-	if upgraded == nil || upgraded.moves != 2 {
-		t.Fatalf("expected the cooled successor to move as its 2nd move, got %+v", plans)
 	}
 }
 
@@ -1040,7 +791,7 @@ func TestSuccessorUnderNewExecutionClaimsByRunName(t *testing.T) {
 	f.addNode(tierNode("reserved-2", "reserved", "a"))
 	store := newMemStore(f)
 	conf := liveConf()
-	plans, _ := f.startOnly(t, conf, store)
+	plans := f.startOnly(t, conf, store)
 	if len(plans) != 1 || plans[0].identity["exa-run-name"] != "sam-probe" || plans[0].identity["execution-id"] != "" {
 		t.Fatalf("expected a run-name identity, got %+v", plans)
 	}
@@ -1095,12 +846,11 @@ func TestStartMoveWritesHoldsOnEveryTargetBeforeStamping(t *testing.T) {
 	f.placeGroup(t, 2, nil,
 		tierPod("w0", "spot-1", "pg-gang", 8, -4, time.Hour),
 		tierPod("w1", "spot-2", "pg-gang", 8, -4, time.Hour))
-	f.placeGroup(t, 1, nil, tierPod("filler", "reserved-2", "pg-filler", 2, -9, time.Hour))
 	store := newMemStore(f)
 
-	plans, victims := f.startOnly(t, liveConf(), store)
-	if len(plans) != 1 || len(victims) != 1 || victims[0].Name != "filler" {
-		t.Fatalf("expected a gang plan evicting filler, got %+v / %v", plans, names(victims))
+	plans := f.startOnly(t, liveConf(), store)
+	if len(plans) != 1 || !plans[0].gang {
+		t.Fatalf("expected a gang plan, got %+v", plans)
 	}
 	if got := strings.Join(store.log, ","); got != "node:reserved-1,node:reserved-2,group:default/pg-gang" {
 		t.Fatalf("expected holds before the mover stamp, got %s", got)
@@ -1112,9 +862,6 @@ func TestStartMoveWritesHoldsOnEveryTargetBeforeStamping(t *testing.T) {
 		}
 		if holds[0].Group != "default/pg-gang" || holds[0].Target != "reserved" || holds[0].From != "spot" || holds[0].Moves != 1 {
 			t.Fatalf("unexpected hold metadata on %s: %+v", node, holds[0])
-		}
-		if node == "reserved-2" && (len(holds[0].Victims) != 1 || holds[0].Victims[0] != string(victims[0].Pod.UID)) {
-			t.Fatalf("expected the filler recorded as victim, got %v", holds[0].Victims)
 		}
 	}
 	if len(store.groups) != 1 || store.groups[0].name != "pg-gang" || store.groups[0].moves != 1 || store.groups[0].repack {
@@ -1169,69 +916,61 @@ func TestStartMoveRollsBackOnWriteFailure(t *testing.T) {
 	}
 }
 
-// raceFixture is the production incident's shape: an 8-GPU gang member on
-// spot whose only reserved room is occupied by lower-priority 1-GPU
-// fillers. Returns the mover and the fillers.
-func raceFixture(t *testing.T) (*fixture, *api.TaskInfo, []*api.TaskInfo) {
+// raceFixture is the production incident's shape: an 8-GPU pod on spot and
+// an idle 8-GPU reserved node. Returns the mover.
+func raceFixture(t *testing.T) (*fixture, *api.TaskInfo) {
 	f := newFixture(t)
 	f.addNode(tierNode("spot-1", "spot", "a"))
 	f.addNode(tierNode("reserved-1", "reserved", "a"))
 	f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 8, -4, time.Hour))
-	fillers := make([]*api.TaskInfo, 0, 8)
-	for i := 0; i < 8; i++ {
-		name := fmt.Sprintf("filler-%d", i)
-		job := f.placeGroup(t, 1, nil, tierPod(name, "reserved-1", "pg-"+name, 1, -9, time.Hour))
-		for _, task := range job.Tasks {
-			fillers = append(fillers, task)
-		}
-	}
 	var mover *api.TaskInfo
 	for _, task := range f.jobs["default/pg-train"].Tasks {
 		mover = task
 	}
-	return f, mover, fillers
+	return f, mover
 }
 
-func TestMoveEvictsVictimsWaitsForIdleThenDrainsAndEvictsMover(t *testing.T) {
-	f, mover, fillers := raceFixture(t)
+// Between planning and the hold write, allocate may bind a foreign pod onto
+// the GPUs the plan counted as idle. The move then waits, evicting nothing,
+// until the held share is idle again; only then is the source drained and
+// the mover evicted.
+func TestMoveWaitsForHeldGpusToBeIdleThenDrainsAndEvictsMover(t *testing.T) {
+	f, mover := raceFixture(t)
 	store := newMemStore(f)
 	conf := liveConf()
 
-	// Pass 1: hold reserved-1, evict the fillers; the mover stays.
-	plans, victims := f.startOnly(t, conf, store)
-	if len(plans) != 1 || len(victims) != 8 {
-		t.Fatalf("expected 1 plan evicting 8 fillers, got %d plans, %d victims", len(plans), len(victims))
-	}
-	for _, victim := range victims {
-		if victim.NodeName != "reserved-1" || victim.Priority != -9 {
-			t.Fatalf("unexpected victim %s on %s (priority %d)", victim.Name, victim.NodeName, victim.Priority)
-		}
+	// Pass 1: hold reserved-1; the mover stays.
+	plans := f.startOnly(t, conf, store)
+	if len(plans) != 1 || plans[0].nodes["reserved-1"] != 8 {
+		t.Fatalf("expected 1 plan holding reserved-1, got %+v", plans)
 	}
 	if mover.Status != api.Running {
 		t.Fatalf("mover must not be touched when the hold is written")
 	}
-	for _, filler := range fillers {
-		f.evict(t, filler)
+	var intruder *api.TaskInfo
+	for _, task := range f.placeGroup(t, 1, nil, tierPod("intruder", "reserved-1", "pg-intruder", 1, -9, time.Minute)).Tasks {
+		intruder = task
 	}
 
-	// Session 2: victims are still releasing; reserved-1 has no idle
-	// GPUs, so the mover is not evicted and no source is drained.
+	// Session 2: the held share is not idle, so the mover is not evicted,
+	// no source is drained and the intruder is left alone.
 	steps, evictions := f.advance(conf, store, testNow.Add(10*time.Second), nil)
 	if len(steps) != 0 || len(evictions) != 0 {
-		t.Fatalf("expected the move to wait for releasing victims, got %+v", steps)
+		t.Fatalf("expected the move to wait for idle GPUs, got %+v", steps)
 	}
 	if f.drainsOn(t, "spot-1") != nil {
-		t.Fatalf("source must not be drained before the target is clear")
+		t.Fatalf("source must not be drained before the target is idle")
+	}
+	if intruder.Status != api.Running {
+		t.Fatalf("nothing on the target may be evicted for a move")
 	}
 
-	// Session 3: victims are gone. Drain the source, mark the hold
+	// Session 3: the intruder finished. Drain the source, mark the hold
 	// evicted, then evict the mover.
-	for _, filler := range fillers {
-		f.remove(t, filler)
-	}
+	f.remove(t, intruder)
 	store.log = nil
 	steps, evictions = f.advance(conf, store, testNow.Add(time.Minute), nil)
-	if len(steps) != 1 || steps[0].outcome != "evicting" || steps[0].reason != "target capacity clear" {
+	if len(steps) != 1 || steps[0].outcome != "evicting" || steps[0].reason != "held capacity idle" {
 		t.Fatalf("expected the eviction step, got %+v", steps)
 	}
 	if len(evictions) != 1 || !sameTask(evictions[0], mover) {
@@ -1253,40 +992,13 @@ func TestMoveEvictsVictimsWaitsForIdleThenDrainsAndEvictsMover(t *testing.T) {
 	}
 }
 
-func TestMoveReEvictsVictimsThatDidNotGo(t *testing.T) {
-	f, mover, fillers := raceFixture(t)
-	store := newMemStore(f)
-	conf := liveConf()
-	f.startOnly(t, conf, store)
-	// Seven evictions took, one filler is still running.
-	for _, filler := range fillers[1:] {
-		f.evict(t, filler)
-		f.remove(t, filler)
-	}
-
-	steps, evictions := f.advance(conf, store, testNow.Add(time.Minute), nil)
-	if len(steps) != 1 || steps[0].outcome != "evicting" || steps[0].reason != "victims still running after eviction" {
-		t.Fatalf("expected a victim re-eviction step, got %+v", steps)
-	}
-	if len(evictions) != 1 || !sameTask(evictions[0], fillers[0]) {
-		t.Fatalf("expected only the stuck filler evicted, got %v", names(evictions))
-	}
-	if mover.Status != api.Running || f.drainsOn(t, "spot-1") != nil {
-		t.Fatalf("mover must stay until the target is clear")
-	}
-}
-
 func TestMoveDoesNotEvictMoverWhenStateWriteFails(t *testing.T) {
 	for _, failing := range []string{"spot-1", "reserved-1"} {
 		t.Run(failing, func(t *testing.T) {
-			f, mover, fillers := raceFixture(t)
+			f, mover := raceFixture(t)
 			store := newMemStore(f)
 			conf := liveConf()
 			f.startOnly(t, conf, store)
-			for _, filler := range fillers {
-				f.evict(t, filler)
-				f.remove(t, filler)
-			}
 
 			store.failNode[failing] = errors.New("conflict")
 			steps, evictions := f.advance(conf, store, testNow.Add(time.Minute), nil)
@@ -1295,7 +1007,7 @@ func TestMoveDoesNotEvictMoverWhenStateWriteFails(t *testing.T) {
 			}
 			// Whatever was written, the hold never says evicted while the
 			// source may be undrained: a later session finds the move still
-			// clearing and retries the whole step.
+			// held and retries the whole step.
 			if f.holdsOn(t, "reserved-1")[0].EvictedAt != "" {
 				t.Fatalf("the hold must not record an eviction that did not happen")
 			}
@@ -1316,14 +1028,10 @@ func TestMoveDoesNotEvictMoverWhenStateWriteFails(t *testing.T) {
 }
 
 func TestMoveWaitsWhileMoverNoLongerFitsTarget(t *testing.T) {
-	f, _, fillers := raceFixture(t)
+	f, _ := raceFixture(t)
 	store := newMemStore(f)
 	conf := liveConf()
 	f.startOnly(t, conf, store)
-	for _, filler := range fillers {
-		f.evict(t, filler)
-		f.remove(t, filler)
-	}
 	veto := func(task *api.TaskInfo, node *api.NodeInfo, gang bool) error { return errors.New("tainted") }
 	steps, evictions := f.advance(conf, store, testNow.Add(time.Minute), veto)
 	if len(steps) != 0 || len(evictions) != 0 {
@@ -1331,7 +1039,7 @@ func TestMoveWaitsWhileMoverNoLongerFitsTarget(t *testing.T) {
 	}
 	// It expires rather than evicting into nowhere.
 	steps, _ = f.advance(conf, store, testNow.Add(11*time.Minute), veto)
-	if len(steps) != 1 || steps[0].outcome != "expired" || steps[0].reason != "target capacity never cleared" {
+	if len(steps) != 1 || steps[0].outcome != "expired" || steps[0].reason != "held capacity never idle" {
 		t.Fatalf("expected expiry, got %+v", steps)
 	}
 	if f.holdsOn(t, "reserved-1") != nil {
@@ -1339,18 +1047,13 @@ func TestMoveWaitsWhileMoverNoLongerFitsTarget(t *testing.T) {
 	}
 }
 
-// evictedRace drives the race fixture to the placing phase: victims gone,
-// source drained, mover releasing. Returns the fixture, the store and the
-// move id.
+// evictedRace drives the race fixture to the placing phase: source drained,
+// mover releasing. Returns the fixture, the store and the move id.
 func evictedRace(t *testing.T) (*fixture, *memStore, string) {
-	f, mover, fillers := raceFixture(t)
+	f, mover := raceFixture(t)
 	store := newMemStore(f)
 	conf := liveConf()
 	f.startOnly(t, conf, store)
-	for _, filler := range fillers {
-		f.evict(t, filler)
-		f.remove(t, filler)
-	}
 	_, evictions := f.advance(conf, store, testNow.Add(time.Minute), nil)
 	if len(evictions) != 1 {
 		t.Fatalf("expected the mover evicted, got %v", names(evictions))
@@ -1554,7 +1257,7 @@ func TestGangClaimNeedsEveryFragment(t *testing.T) {
 }
 
 func TestMoverCannotClaimItsOwnHold(t *testing.T) {
-	_, mover, _ := raceFixture(t)
+	_, mover := raceFixture(t)
 	hold := capacityHold{Movers: []string{string(mover.Pod.UID)}, Identity: map[string]string{ownerIdentityKey: "owner-pg-train"}}
 	if holdMatches(hold, mover) {
 		t.Fatalf("the mover must not match its own hold")

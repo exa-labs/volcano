@@ -23,8 +23,8 @@ import (
 
 // Prometheus metrics for the capacityUpgrade strategy. "kind" is pod (one
 // pod restarted on its own) or gang (a whole PodGroup restarted together);
-// "mode" is dry_run (planned only), held (move started: holds written,
-// victims evicted) or moved (successor claimed the held capacity).
+// "mode" is dry_run (planned only), held (move started: holds written) or
+// moved (successor claimed the held capacity).
 var (
 	capacityUpgradePasses = promauto.NewCounter(
 		prometheus.CounterOpts{
@@ -70,16 +70,8 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: "volcano",
 			Name:      "capacity_upgrade_evictions_total",
-			Help:      "Pods evicted for capacity-upgrade moves, by move kind and role: victim (lower-priority pod on a target node) or mover (the pod being upgraded). Retried evictions count again.",
-		}, []string{"kind", "role"},
-	)
-
-	capacityUpgradeCooldownSkips = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Subsystem: "volcano",
-			Name:      "capacity_upgrade_cooldown_skips_total",
-			Help:      "Pods left alone because they are a recent restart (started within the cooldown, not the first attempt of their workload), by the role they were considered for: mover (not upgraded) or victim (not evicted). Counted once per pass per pod.",
-		}, []string{"role"},
+			Help:      "Movers evicted for capacity-upgrade moves, by move kind; a move evicts nothing else. Retried evictions count again.",
+		}, []string{"kind"},
 	)
 
 	capacityUpgradeHoldOutcomes = promauto.NewCounterVec(
