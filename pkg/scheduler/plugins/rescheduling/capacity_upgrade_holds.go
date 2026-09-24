@@ -19,11 +19,10 @@ package rescheduling
 // Capacity-upgrade moves are transactions that span many scheduler sessions,
 // so their state lives on the cluster, not in memory:
 //
-//   - A hold on a target node (CapacityUpgradeHoldsAnnotation) reserves a
-//     GPU quantity for one move. The hold predicate rejects every other GPU
-//     pod that would eat into that quantity, so lower-priority victims that
-//     are evicted to make room cannot be replaced by anything but the mover's
-//     successor.
+//   - A hold on a target node (CapacityUpgradeHoldsAnnotation) reserves an
+//     idle GPU quantity for one move. The hold predicate rejects every other
+//     GPU pod that would eat into that quantity, so the GPUs stay idle for
+//     the mover's successor across the sessions the move takes.
 //   - A drain on a source node (CapacityUpgradeDrainsAnnotation) marks a
 //     node whose GPUs are being vacated by a move. The drain predicate lets a
 //     GPU pod use only the node's real idle GPUs, never the ones still held by
@@ -31,12 +30,13 @@ package rescheduling
 //     capacity its predecessor is releasing.
 //
 // A move advances through phases derived from that state every session:
-// clearing (holds written, victims evicted, waiting for their GPUs to become
-// idle) -> placing (drains written, movers evicted, waiting for the successor
-// to bind onto the held GPUs) -> done (hold claimed by the successor and
-// released). A hold that does not progress within its TTL expires and is
-// released, and a hold whose fragments are inconsistent is abandoned; both
-// leave the cluster no worse than before the move started.
+// held (holds written, waiting for the held GPUs to be idle and the movers
+// to still fit) -> placing (drains written, movers evicted, waiting for the
+// successor to bind onto the held GPUs) -> done (hold claimed by the
+// successor and released). A hold that does not progress within its TTL
+// expires and is released, and a hold whose fragments are inconsistent is
+// abandoned; both leave the cluster no worse than before the move started.
+// Nothing but the movers is ever evicted.
 
 import (
 	"context"
@@ -87,9 +87,6 @@ type capacityHold struct {
 	Nodes []string `json:"nodes"`
 	// Movers are the UIDs of the pods the move evicts.
 	Movers []string `json:"movers"`
-	// Victims are the UIDs of the lower-priority pods evicted from the
-	// target nodes to make room; one still running is evicted again.
-	Victims []string `json:"victims,omitempty"`
 	// Identity is the label set a pod must carry to claim this hold.
 	Identity map[string]string `json:"identity"`
 	// Gpus is the GPU count reserved on this node.
@@ -156,9 +153,6 @@ type capacityUpgradeIndex struct {
 	groups map[string]bool
 	// movers marks pods a move in flight evicts.
 	movers map[types.UID]bool
-	// victims marks pods a move in flight evicts from its target nodes;
-	// their GPUs are already promised to that move's hold.
-	victims map[types.UID]bool
 	// malformed lists nodes whose annotations could not be decoded.
 	malformed map[string]string
 }
@@ -170,7 +164,6 @@ func newCapacityUpgradeIndex() *capacityUpgradeIndex {
 		moves:     map[string]*capacityUpgradeMove{},
 		groups:    map[string]bool{},
 		movers:    map[types.UID]bool{},
-		victims:   map[types.UID]bool{},
 		malformed: map[string]string{},
 	}
 }
@@ -245,9 +238,6 @@ func (idx *capacityUpgradeIndex) addHold(node string, hold capacityHold) {
 	for _, uid := range hold.Movers {
 		idx.movers[types.UID(uid)] = true
 	}
-	for _, uid := range hold.Victims {
-		idx.victims[types.UID(uid)] = true
-	}
 }
 
 // removeMove drops every fragment and drain of a move.
@@ -280,9 +270,6 @@ func (idx *capacityUpgradeIndex) removeMove(id string) (touched []string) {
 		delete(idx.groups, move.hold.Group)
 		for _, uid := range move.hold.Movers {
 			delete(idx.movers, types.UID(uid))
-		}
-		for _, uid := range move.hold.Victims {
-			delete(idx.victims, types.UID(uid))
 		}
 		delete(idx.moves, id)
 	}
@@ -516,10 +503,8 @@ type moveStep struct {
 	// without their sources drained.
 	first  []string
 	groups []groupStamp
-	// victims are evicted once the writes succeed; evicting says what they
-	// are to the move: "mover" or "victim" (a target victim evicted again).
-	victims  []*api.TaskInfo
-	evicting string
+	// movers are evicted once the writes succeed.
+	movers []*api.TaskInfo
 }
 
 // advanceCapacityUpgradeMoves derives this session's actions from the moves
@@ -576,7 +561,7 @@ func advanceCapacityUpgradeMoves(
 			if move.evicted() {
 				step.reason = "successor never claimed the hold"
 			} else {
-				step.reason = "target capacity never cleared"
+				step.reason = "held capacity never idle"
 			}
 		}
 		for _, node := range hold.Nodes {
@@ -600,7 +585,7 @@ func advanceCapacityUpgradeMoves(
 			// eviction did not take). Only pods created after the eviction
 			// count: a sibling of the mover that already ran on the target
 			// carries the same identity but is not the successor.
-			step.victims, step.evicting = append(step.victims, movers...), "mover"
+			step.movers = append(step.movers, movers...)
 			claimed := 0
 			successors := map[api.JobID]*api.JobInfo{}
 			for _, node := range hold.Nodes {
@@ -636,15 +621,17 @@ func advanceCapacityUpgradeMoves(
 				steps = append(steps, step)
 				continue
 			}
-			if len(step.victims) > 0 {
+			if len(step.movers) > 0 {
 				step.outcome, step.reason = "evicting", "movers still running after eviction"
 				steps = append(steps, step)
 			}
 			continue
 		}
 
-		// Clearing: wait until every target node can really take its
-		// share, then drain the sources and evict the movers.
+		// Held: once every target node really has its share idle (a pod
+		// bound between planning and the hold write may have taken some of
+		// it, and only finishing on its own gives it back), drain the
+		// sources and evict the movers.
 		if len(movers) == 0 {
 			// The movers are gone without this move evicting them (the
 			// job finished or was deleted); nothing can claim the hold.
@@ -655,12 +642,7 @@ func advanceCapacityUpgradeMoves(
 			steps = append(steps, step)
 			continue
 		}
-		if !targetsClear(idx, move, nodes, movers, gpu) {
-			if stuck := runningVictims(hold, nodes, jobs); len(stuck) > 0 {
-				step.victims, step.evicting = stuck, "victim"
-				step.outcome, step.reason = "evicting", "victims still running after eviction"
-				steps = append(steps, step)
-			}
+		if !targetsIdle(idx, move, nodes, movers, gpu) {
 			continue
 		}
 		if !moversFit(move, nodes, movers, predicate) {
@@ -716,8 +698,8 @@ func advanceCapacityUpgradeMoves(
 			step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
 		}
 		step.hold = hold
-		step.victims, step.evicting = movers, "mover"
-		step.outcome, step.reason = "evicting", "target capacity clear"
+		step.movers = movers
+		step.outcome, step.reason = "evicting", "held capacity idle"
 		steps = append(steps, step)
 	}
 
@@ -771,29 +753,6 @@ func runningMovers(hold capacityHold, jobs map[api.JobID]*api.JobInfo) []*api.Ta
 	return movers
 }
 
-// runningVictims returns the move's victims still running on its target
-// nodes (an eviction that did not take), as their jobs' tasks.
-func runningVictims(hold capacityHold, nodes map[string]*api.NodeInfo, jobs map[api.JobID]*api.JobInfo) []*api.TaskInfo {
-	wanted := map[types.UID]bool{}
-	for _, uid := range hold.Victims {
-		wanted[types.UID(uid)] = true
-	}
-	victims := make([]*api.TaskInfo, 0)
-	for _, name := range hold.Nodes {
-		for _, task := range nodes[name].Tasks {
-			if task.Pod == nil || !wanted[task.Pod.UID] || task.Status != api.Running {
-				continue
-			}
-			if job := jobs[task.Job]; job != nil && job.Tasks[task.UID] != nil {
-				task = job.Tasks[task.UID]
-			}
-			victims = append(victims, task)
-		}
-	}
-	sort.Slice(victims, func(i, j int) bool { return victims[i].Name < victims[j].Name })
-	return victims
-}
-
 // createdAfter reports whether the task's pod was created at or after the
 // given time.
 func createdAfter(task *api.TaskInfo, at time.Time) bool {
@@ -812,10 +771,10 @@ func placedStatus(status api.TaskStatus) bool {
 	return false
 }
 
-// targetsClear reports whether every target node's idle GPUs (plus the GPUs
+// targetsIdle reports whether every target node's idle GPUs (plus the GPUs
 // of this move's own movers running there, which the eviction frees) cover
 // everything held on it.
-func targetsClear(idx *capacityUpgradeIndex, move *capacityUpgradeMove, nodes map[string]*api.NodeInfo, movers []*api.TaskInfo, gpu v1.ResourceName) bool {
+func targetsIdle(idx *capacityUpgradeIndex, move *capacityUpgradeMove, nodes map[string]*api.NodeInfo, movers []*api.TaskInfo, gpu v1.ResourceName) bool {
 	for _, name := range move.hold.Nodes {
 		node := nodes[name]
 		available := node.Idle.Get(gpu)
@@ -864,7 +823,7 @@ type capacityUpgradeStore interface {
 // is logged and skipped; the cluster state it read from is unchanged, so the
 // next session retries it. Returns the movers whose steps fully applied.
 func applyMoveSteps(steps []moveStep, store capacityUpgradeStore) []*api.TaskInfo {
-	victims := make([]*api.TaskInfo, 0)
+	movers := make([]*api.TaskInfo, 0)
 	for _, step := range steps {
 		if err := writeNodeStates(step.nodes, step.first, store); err != nil {
 			klog.Errorf("capacityUpgrade: move %s %s: %v", step.id, step.outcome, err)
@@ -897,14 +856,14 @@ func applyMoveSteps(steps []moveStep, store capacityUpgradeStore) []*api.TaskInf
 		case "malformed":
 			capacityUpgradeHoldOutcomes.WithLabelValues(step.outcome, "node").Inc()
 		}
-		for _, victim := range step.victims {
-			klog.V(2).Infof("capacityUpgrade: evicting %s %s/%s from %s for move %s",
-				step.evicting, victim.Namespace, victim.Name, victim.NodeName, step.id)
-			capacityUpgradeEvictions.WithLabelValues(step.hold.kind(), step.evicting).Inc()
+		for _, mover := range step.movers {
+			klog.V(2).Infof("capacityUpgrade: evicting mover %s/%s from %s for move %s",
+				mover.Namespace, mover.Name, mover.NodeName, step.id)
+			capacityUpgradeEvictions.WithLabelValues(step.hold.kind()).Inc()
 		}
-		victims = append(victims, step.victims...)
+		movers = append(movers, step.movers...)
 	}
-	return victims
+	return movers
 }
 
 // writeNodeStates writes every node's state, the first nodes in the given
