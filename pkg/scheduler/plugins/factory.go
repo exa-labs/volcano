@@ -39,6 +39,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/plugins/pdb"
 	"volcano.sh/volcano/pkg/scheduler/plugins/predicates"
 	"volcano.sh/volcano/pkg/scheduler/plugins/priority"
+	"volcano.sh/volcano/pkg/scheduler/plugins/prioritypack"
 	"volcano.sh/volcano/pkg/scheduler/plugins/proportion"
 	"volcano.sh/volcano/pkg/scheduler/plugins/rescheduling"
 	resourcestrategyfit "volcano.sh/volcano/pkg/scheduler/plugins/resource-strategy-fit"
@@ -60,6 +61,7 @@ func init() {
 	framework.RegisterPluginBuilder(conformance.PluginName, conformance.New)
 	framework.RegisterPluginBuilder(binpack.PluginName, binpack.New)
 	framework.RegisterPluginBuilder(capacitycost.PluginName, capacitycost.New)
+	framework.RegisterPluginBuilder(prioritypack.PluginName, prioritypack.New)
 	framework.RegisterPluginBuilder(resourcestrategyfit.PluginName, resourcestrategyfit.New)
 	framework.RegisterPluginBuilder(tdm.PluginName, tdm.New)
 	framework.RegisterPluginBuilder(overcommit.PluginName, overcommit.New)
