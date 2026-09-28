@@ -58,6 +58,14 @@ var (
 		}, []string{"target", "kind", "mode"},
 	)
 
+	capacityUpgradeTargetsSkipped = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "volcano",
+			Name:      "capacity_upgrade_targets_skipped_total",
+			Help:      "Target nodes a candidate was not placed on, by reason: pending_demand (a pending task outranking the mover could reclaim the node through preempt). Counted once per candidate and node per pass.",
+		}, []string{"reason"},
+	)
+
 	capacityUpgradeStampFailures = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: "volcano",

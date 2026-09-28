@@ -73,6 +73,9 @@ type fixture struct {
 	nodes   map[string]*api.NodeInfo
 	jobs    map[api.JobID]*api.JobInfo
 	running map[types.UID]*api.TaskInfo
+	// demand is the pending-demand guard capacityUpgrade plans with (nil:
+	// no pending work is considered).
+	demand pendingDemand
 }
 
 func newFixture(t *testing.T) *fixture {
