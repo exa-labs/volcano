@@ -129,7 +129,8 @@ func (f *fixture) placeGroup(t *testing.T, minMember int32, annotations map[stri
 }
 
 // registerTask adds the task to its job, creating the job and PodGroup on
-// first sight.
+// first sight. As the cache does for PodGroups without a priority class,
+// the job's priority is its members' highest.
 func (f *fixture) registerTask(task *api.TaskInfo, minMember int32, annotations map[string]string) *api.JobInfo {
 	job, ok := f.jobs[task.Job]
 	if !ok {
@@ -143,11 +144,53 @@ func (f *fixture) registerTask(task *api.TaskInfo, minMember int32, annotations 
 			Spec: scheduling.PodGroupSpec{MinMember: minMember, Queue: "default"},
 		}}
 		job.SetPodGroup(pg)
+		job.Priority = task.Priority
 		f.jobs[task.Job] = job
 		return job
 	}
 	job.AddTaskInfo(task)
+	if task.Priority > job.Priority {
+		job.Priority = task.Priority
+	}
 	return job
+}
+
+// pendingGroup registers a job that is past the queue gate (PodGroup
+// Inqueue) in queue with count pending GPU tasks of gpus each at the given
+// priority: the shape preempt would try to place.
+func (f *fixture) pendingGroup(t *testing.T, group, queue string, priority int32, count int, gpus int64) *api.JobInfo {
+	var job *api.JobInfo
+	for i := 0; i < count; i++ {
+		pod := successorPod(fmt.Sprintf("%s-%d", group, i), group, gpus, priority, testNow)
+		task := api.NewTaskInfo(pod)
+		if task.Status != api.Pending {
+			t.Fatalf("pending pod %s has status %v", pod.Name, task.Status)
+		}
+		job = f.registerTask(task, int32(count), nil)
+	}
+	job.PodGroup.Spec.Queue = queue
+	job.Queue = api.QueueID(queue)
+	job.PodGroup.Status.Phase = scheduling.PodGroupInqueue
+	return job
+}
+
+// priorityVictims is the Preemptable chain of the priority and gang plugins
+// for whole-job victims: a preemptee may be evicted when its job ranks
+// below the preemptor's.
+func (f *fixture) priorityVictims(preemptor *api.TaskInfo, preemptees []*api.TaskInfo) []*api.TaskInfo {
+	victims := make([]*api.TaskInfo, 0, len(preemptees))
+	for _, preemptee := range preemptees {
+		if f.jobs[preemptee.Job].Priority < f.jobs[preemptor.Job].Priority {
+			victims = append(victims, preemptee)
+		}
+	}
+	return victims
+}
+
+// useDemand plans against the fixture's pending work with the given
+// preemptor predicate (nil: every node admits every preemptor).
+func (f *fixture) useDemand(predicate capacityUpgradePredicate) {
+	f.demand = newUpgradeDemand(f.jobs, gpuRes, nil, f.priorityVictims, predicate)
 }
 
 // evict marks a task Releasing exactly as Session.Evict does: the pod is
@@ -193,7 +236,7 @@ func (f *fixture) index() *capacityUpgradeIndex {
 }
 
 func (f *fixture) planUpgrades(conf *capacityUpgradeConf, predicate capacityUpgradePredicate) []capacityUpgradePlan {
-	return planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), testNow, predicate)
+	return planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), testNow, predicate, f.demand)
 }
 
 // memStore is a capacityUpgradeStore that applies node writes to the
@@ -283,7 +326,7 @@ func liveConf() *capacityUpgradeConf {
 // plans.
 func (f *fixture) startOnly(t *testing.T, conf *capacityUpgradeConf, store *memStore) []capacityUpgradePlan {
 	idx := f.index()
-	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, testNow, nil)
+	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, testNow, nil, f.demand)
 	for _, plan := range plans {
 		if err := startCapacityUpgradeMove(plan, idx, conf, store); err != nil {
 			t.Fatalf("startCapacityUpgradeMove: %v", err)
@@ -394,6 +437,154 @@ func TestUpgradeNeverCountsLowerPriorityPodsAsRoom(t *testing.T) {
 		if f.running[filler.Pod.UID] != filler || filler.Status != api.Running {
 			t.Fatalf("filler %s was disturbed", filler.Name)
 		}
+	}
+}
+
+// The live case behind the guard: a whole-node job is pending at a higher
+// priority than the mover, a target node has a gap and its other GPUs are
+// held by work that job may preempt. Moving into the gap only makes the
+// mover the first victim once preempt reclaims the node, so the gap is not a
+// target. Equal- or higher-priority residents make the node unreclaimable,
+// and then the gap is a target again.
+func TestUpgradeSkipsGapPendingWorkWouldReclaim(t *testing.T) {
+	build := func(t *testing.T, residentPriority int32) *fixture {
+		f := newFixture(t)
+		f.addNode(tierNode("spot-1", "spot", "a"))
+		f.addNode(tierNode("reserved-1", "reserved", "a"))
+		f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 1, -3, time.Hour))
+		f.placeGroup(t, 1, nil, tierPod("resident", "reserved-1", "pg-resident", 5, residentPriority, time.Hour))
+		f.pendingGroup(t, "gang", "default", -2, 4, 8)
+		return f
+	}
+
+	// Residents rank below the pending gang: preempt can clear the node.
+	f := build(t, -5)
+	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 1 {
+		t.Fatalf("without the guard the 3-GPU gap is a target, got %+v", plans)
+	}
+	f.useDemand(nil)
+	if plans := f.planUpgrades(newCapacityUpgradeConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected no plan into a gap pending work reclaims, got %+v", plans)
+	}
+
+	// Residents rank above the gang: 3 GPUs is all preempt could ever get
+	// there, the gap is the mover's to keep.
+	f = build(t, -1)
+	f.useDemand(nil)
+	plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
+	if len(plans) != 1 || plans[0].nodes["reserved-1"] != 1 {
+		t.Fatalf("expected the move into a gap nobody can reclaim, got %+v", plans)
+	}
+}
+
+// Pending work is only a claim on a node when preempt would act on it: the
+// task must be able to evict the mover (outrank it, share its queue), its
+// job must be past the queue gate, and the node must admit it at all.
+func TestUpgradeIgnoresPendingWorkThatCannotReclaimTheGap(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, f *fixture)
+	}{
+		{"equal priority cannot evict the mover", func(t *testing.T, f *fixture) {
+			f.pendingGroup(t, "gang", "default", -3, 1, 8)
+			f.useDemand(nil)
+		}},
+		{"lower priority cannot evict the mover", func(t *testing.T, f *fixture) {
+			f.pendingGroup(t, "gang", "default", -7, 1, 8)
+			f.useDemand(nil)
+		}},
+		{"another queue does not preempt here", func(t *testing.T, f *fixture) {
+			f.pendingGroup(t, "gang", "other", -2, 1, 8)
+			f.useDemand(nil)
+		}},
+		{"job still at the queue gate", func(t *testing.T, f *fixture) {
+			job := f.pendingGroup(t, "gang", "default", -2, 1, 8)
+			job.PodGroup.Status.Phase = scheduling.PodGroupPending
+			f.useDemand(nil)
+		}},
+		{"job not starving", func(t *testing.T, f *fixture) {
+			f.pendingGroup(t, "gang", "default", -2, 1, 8)
+			f.demand = newUpgradeDemand(f.jobs, gpuRes, func(*api.JobInfo) bool { return false }, f.priorityVictims, nil)
+		}},
+		{"node does not admit the pending task", func(t *testing.T, f *fixture) {
+			f.pendingGroup(t, "gang", "default", -2, 1, 8)
+			f.useDemand(func(task *api.TaskInfo, node *api.NodeInfo, gang bool) error {
+				if task.Job == f.jobs["default/gang"].UID {
+					return errors.New("wrong accelerator")
+				}
+				return nil
+			})
+		}},
+		{"request larger than the node", func(t *testing.T, f *fixture) {
+			f.pendingGroup(t, "gang", "default", -2, 1, 16)
+			f.useDemand(nil)
+		}},
+		{"pending task needs no GPU", func(t *testing.T, f *fixture) {
+			f.pendingGroup(t, "gang", "default", -2, 1, 0)
+			f.useDemand(nil)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.addNode(tierNode("spot-1", "spot", "a"))
+			f.addNode(tierNode("reserved-1", "reserved", "a"))
+			f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 1, -3, time.Hour))
+			f.placeGroup(t, 1, nil, tierPod("resident", "reserved-1", "pg-resident", 5, -5, time.Hour))
+			tc.setup(t, f)
+			plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
+			if len(plans) != 1 || plans[0].nodes["reserved-1"] != 1 {
+				t.Fatalf("expected the move, got %+v", plans)
+			}
+		})
+	}
+}
+
+// A gang steers around spoken-for nodes: an empty reserved node a pending
+// whole-node job would take is skipped in favour of gaps on nodes whose
+// residents outrank that job, even though the empty node has more idle GPUs.
+func TestUpgradeGangAvoidsSpokenForNodes(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("spot-2", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.addNode(tierNode("reserved-2", "reserved", "a"))
+	f.addNode(tierNode("reserved-3", "reserved", "a"))
+	f.placeGroup(t, 2, nil,
+		tierPod("w0", "spot-1", "pg-gang", 4, -3, time.Hour),
+		tierPod("w1", "spot-2", "pg-gang", 4, -3, time.Hour))
+	f.placeGroup(t, 1, nil, tierPod("r2", "reserved-2", "pg-r2", 4, -1, time.Hour))
+	f.placeGroup(t, 1, nil, tierPod("r3", "reserved-3", "pg-r3", 4, -1, time.Hour))
+	f.pendingGroup(t, "boss", "default", -2, 1, 8)
+
+	plans := f.planUpgrades(newCapacityUpgradeConf(), nil)
+	if len(plans) != 1 || plans[0].nodes["reserved-1"] != 8 {
+		t.Fatalf("without the guard the gang packs onto the empty node, got %+v", plans)
+	}
+
+	f.useDemand(nil)
+	plans = f.planUpgrades(newCapacityUpgradeConf(), nil)
+	if len(plans) != 1 || !plans[0].gang {
+		t.Fatalf("expected one gang plan, got %+v", plans)
+	}
+	if got := plans[0].nodes; got["reserved-1"] != 0 || got["reserved-2"] != 4 || got["reserved-3"] != 4 {
+		t.Fatalf("expected the gang split over the unreclaimable gaps, got %+v", got)
+	}
+}
+
+// One pending task per distinct request per job is enough to answer every
+// node; a job's identical members and non-GPU tasks add nothing.
+func TestUpgradeDemandKeepsOneProbePerRequest(t *testing.T) {
+	f := newFixture(t)
+	f.pendingGroup(t, "gang", "default", -2, 4, 8)
+	f.pendingGroup(t, "mixed", "default", -2, 2, 2)
+	launcher := successorPod("mixed-launcher", "mixed", 0, -2, testNow)
+	f.registerTask(api.NewTaskInfo(launcher), 3, nil)
+	f.pendingGroup(t, "gated", "default", -2, 1, 8).PodGroup.Status.Phase = scheduling.PodGroupPending
+
+	demand := newUpgradeDemand(f.jobs, gpuRes, nil, f.priorityVictims, nil)
+	if got := names(demand.preemptors); len(got) != 2 || got[0] != "gang-0" || got[1] != "mixed-0" {
+		t.Fatalf("expected one probe each for gang and mixed, got %v", got)
 	}
 }
 
@@ -886,7 +1077,7 @@ func TestStartMoveRollsBackOnWriteFailure(t *testing.T) {
 	}
 	start := func(f *fixture, store *memStore) error {
 		idx := f.index()
-		plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil)
+		plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil, f.demand)
 		if len(plans) != 1 {
 			t.Fatalf("expected 1 plan, got %d", len(plans))
 		}
@@ -1359,7 +1550,7 @@ func TestMalformedAnnotationIsClearedAndTrustsNothing(t *testing.T) {
 		t.Fatalf("expected reserved-2 malformed and contributing nothing, got %+v", idx)
 	}
 	// The malformed node is not a planning target either.
-	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil); len(plans) != 1 || plans[0].nodes["reserved-2"] == 0 {
+	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil, f.demand); len(plans) != 1 || plans[0].nodes["reserved-2"] == 0 {
 		// Planning still works; a malformed node just has no holds to net out.
 		t.Logf("plans: %+v", plans)
 	}

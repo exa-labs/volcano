@@ -44,7 +44,10 @@ import (
 // ledger of the target tier's idle capacity, net of capacity already held by
 // moves in flight. Nothing running on a target is ever evicted to make room:
 // a group moves only into GPUs that are idle already, so no move can
-// displace another workload and set off a chain of moves.
+// displace another workload and set off a chain of moves. Idle GPUs that
+// pending work outranking the mover could reclaim through preempt are not
+// a target either (see capacity_upgrade_demand.go): the mover would only
+// be evicted again once preempt takes the node.
 //
 // The strategy owns the whole move as a transaction (see
 // capacity_upgrade_holds.go): it writes a hold for the mover onto each
@@ -312,7 +315,8 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	}
 
 	idx := capacityUpgradeSessionIndex()
-	plans := planCapacityUpgrades(Session.Nodes, Session.Jobs, running, conf, idx, time.Now(), sessionPredicate())
+	predicate := sessionPredicate()
+	plans := planCapacityUpgrades(Session.Nodes, Session.Jobs, running, conf, idx, time.Now(), predicate, sessionDemand(v1.ResourceName(conf.GpuResource), predicate))
 
 	for _, plan := range plans {
 		pg := plan.job.PodGroup
@@ -407,7 +411,8 @@ func stampCapacityUpgradeMover(plan capacityUpgradePlan, store capacityUpgradeSt
 // tier that fits the whole group (within one zone, for gangs) wins. Fit is
 // simulated first-fit-decreasing over a ledger shared by every plan in the
 // pass and seeded with the holds in flight, so two plans cannot claim the
-// same capacity.
+// same capacity. Target nodes that pending demand would reclaim from the
+// group are passed over (demand may be nil).
 func planCapacityUpgrades(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -416,6 +421,7 @@ func planCapacityUpgrades(
 	idx *capacityUpgradeIndex,
 	now time.Time,
 	predicate capacityUpgradePredicate,
+	demand pendingDemand,
 ) []capacityUpgradePlan {
 	gpu := v1.ResourceName(conf.GpuResource)
 	ranker := conf.ranker()
@@ -468,18 +474,23 @@ func planCapacityUpgrades(
 		}
 		var placement *capacityUpgradePlacement
 		targetRank := 0
+		guard := newDemandGuard(demand, cand)
 		for rank := 0; rank < cand.maxRank; rank++ {
 			targets := byRank[rank]
 			if len(targets) == 0 {
 				continue
 			}
-			placement = simulateUpgrade(targets, cand, conf, gpu, ledger, predicate)
+			placement = simulateUpgrade(targets, cand, conf, gpu, ledger, predicate, guard)
 			if placement != nil {
 				targetRank = rank
 				break
 			}
 		}
 		if placement == nil {
+			if guard != nil && guard.skipped > 0 {
+				klog.V(3).Infof("capacityUpgrade: %s/%s not moved: %d target node(s) spoken for by pending work",
+					cand.job.Namespace, cand.job.Name, guard.skipped)
+			}
 			continue
 		}
 		ledger.commit(placement)
@@ -723,9 +734,10 @@ func (p *capacityUpgradePlacement) nodeNames() []string {
 // placing members largest-first onto the node with the most idle capacity
 // that passes predicates. Idle capacity on a node is its ledger idle plus the
 // resources of the group's own members already running there (they restart,
-// so their GPUs come free); no other running pod is counted. For gangs, the
-// target set is one zone at a time; the first zone that fits wins. Returns
-// nil unless every member places.
+// so their GPUs come free); no other running pod is counted. Nodes the
+// guard reports spoken for are skipped. For gangs, the target set is one
+// zone at a time; the first zone that fits wins. Returns nil unless every
+// member places.
 func simulateUpgrade(
 	targets []*api.NodeInfo,
 	cand capacityUpgradeCandidate,
@@ -733,6 +745,7 @@ func simulateUpgrade(
 	gpu v1.ResourceName,
 	ledger *upgradeLedger,
 	predicate capacityUpgradePredicate,
+	guard *demandGuard,
 ) *capacityUpgradePlacement {
 	zones := map[string][]*api.NodeInfo{}
 	zoneNames := make([]string, 0)
@@ -757,7 +770,7 @@ func simulateUpgrade(
 	})
 
 	for _, zone := range zoneNames {
-		placement := simulateUpgradeInZone(zones[zone], ordered, cand, gpu, ledger, predicate)
+		placement := simulateUpgradeInZone(zones[zone], ordered, cand, gpu, ledger, predicate, guard)
 		if placement != nil {
 			placement.zone = zone
 			return placement
@@ -797,12 +810,16 @@ func simulateUpgradeInZone(
 	gpu v1.ResourceName,
 	ledger *upgradeLedger,
 	predicate capacityUpgradePredicate,
+	guard *demandGuard,
 ) *capacityUpgradePlacement {
 	if len(nodes) == 0 {
 		return nil
 	}
 	targets := make([]*upgradeTarget, 0, len(nodes))
 	for _, node := range nodes {
+		if guard.spokenFor(node) {
+			continue
+		}
 		idle := ledger.idle[node.Name].Clone()
 		for _, member := range cand.members {
 			if member.NodeName == node.Name {
