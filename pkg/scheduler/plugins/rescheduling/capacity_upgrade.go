@@ -42,17 +42,24 @@ import (
 // priority ceiling, old enough, not opted out, its cooldown clock has expired
 // and its move budget is not spent. Fit is proven per pass against a shared
 // ledger of the target tier's idle capacity, net of capacity already held by
-// moves in flight. Nothing running on a target is ever evicted to make room:
-// a group moves only into GPUs that are idle already, so no move can
+// moves in flight. By default nothing running on a target is evicted to make
+// room: a group moves only into GPUs that are idle already, so no move can
 // displace another workload and set off a chain of moves. Idle GPUs that
 // pending work outranking the mover could reclaim through preempt are not
 // a target either (see capacity_upgrade_demand.go): the mover would only
 // be evicted again once preempt takes the node.
 //
+// maxDisplacedPriority opens one exception for filler workloads: running
+// pods on a target at or below that priority count as room next to the
+// idle GPUs, and a move evicts the ones its placement relies on. The same
+// pods are never movers, so a displaced pod that relands on costlier
+// capacity stays there and the chain ends with it.
+//
 // The strategy owns the whole move as a transaction (see
 // capacity_upgrade_holds.go): it writes a hold for the mover onto each
-// target node and stamps the mover's cooldown and budget. While the held
-// GPUs are idle it drains the mover's source nodes and evicts the mover; the
+// target node and stamps the mover's cooldown and budget, then evicts the
+// pods the hold displaces. Once the held GPUs are idle it drains the mover's
+// source nodes and evicts the mover; the
 // successor the controller creates is the only pod allowed onto the held
 // GPUs and cannot be pipelined back onto the capacity its predecessor is
 // still releasing. Gangs (PodGroups with minMember > 1) move as a whole; a
@@ -133,10 +140,33 @@ type capacityUpgradeConf struct {
 	// MaxMovesPerGroup caps how often a workload (a PodGroup and the
 	// PodGroups that succeed it) is restarted by this strategy.
 	MaxMovesPerGroup int `mapstructure:"maxMovesPerGroup"`
-	// MaxVictimPriority is the highest pod priority still movable (the
-	// mover is the only pod a move restarts); pods without an explicit
-	// priority count as 0.
+	// MaxVictimPriority is the highest pod priority still movable; pods
+	// without an explicit priority count as 0.
 	MaxVictimPriority int32 `mapstructure:"maxVictimPriority"`
+	// MaxDisplacedPriority, when set, lets a move make room for itself:
+	// running GPU pods on a target node at or below this priority count as
+	// claimable capacity next to the node's idle GPUs, and the move evicts
+	// the ones its placement relies on. Pods at or below it are never
+	// movers, so a displaced pod cannot become the next mover. Unset (the
+	// default), a move only ever takes idle GPUs and restarts nothing but
+	// the mover.
+	MaxDisplacedPriority *int32 `mapstructure:"maxDisplacedPriority"`
+}
+
+// displaces reports whether pods of the given priority are room to be made
+// on a target node rather than workloads to move.
+func (c *capacityUpgradeConf) displaces(priority int32) bool {
+	return c.MaxDisplacedPriority != nil && priority <= *c.MaxDisplacedPriority
+}
+
+// shielded reports whether the strategy must leave the pod where it is: it
+// opted out, has no controller to recreate it, or is disruption-protected
+// by anything other than its owner's lifecycle protection.
+func (c *capacityUpgradeConf) shielded(pod *v1.Pod) bool {
+	if pod.Labels[c.OptOutLabel] == "false" || metav1.GetControllerOf(pod) == nil {
+		return true
+	}
+	return pod.Annotations[doNotDisruptAnnotation] == "true" && pod.Labels[c.ProtectedLabel] != "true"
 }
 
 func newCapacityUpgradeConf() *capacityUpgradeConf {
@@ -185,12 +215,24 @@ type capacityUpgradePlan struct {
 	// nodes maps each target node to the GPU count placed on it.
 	nodes map[string]float64
 	// gpus is the group's total GPU count.
-	gpus     float64
-	priority int32
-	identity map[string]string
+	gpus float64
+	// displaced maps each target node to the pods running there that the
+	// placement relies on evicting.
+	displaced map[string][]*api.TaskInfo
+	priority  int32
+	identity  map[string]string
 	// moves is the mover's move count including this move.
 	moves int
 	at    time.Time
+}
+
+// displacedCount is the number of pods the move evicts to make room.
+func (p capacityUpgradePlan) displacedCount() int {
+	total := 0
+	for _, pods := range p.displaced {
+		total += len(pods)
+	}
+	return total
 }
 
 func (p capacityUpgradePlan) kind() string {
@@ -294,8 +336,9 @@ var victimsFnForCapacityUpgradeMoves = func(tasks []*api.TaskInfo) []*api.TaskIn
 
 // victimsFnForCapacityUpgrade plans and starts new moves; it runs on the
 // rescheduling interval. It evicts nothing itself: a started move is a hold
-// on idle target GPUs, and victimsFnForCapacityUpgradeMoves evicts the
-// mover once the hold and its source drains are durable.
+// on target GPUs, and victimsFnForCapacityUpgradeMoves evicts the pods the
+// hold displaces and then, once the hold and its source drains are durable,
+// the mover.
 var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	if Session == nil {
 		return nil
@@ -321,9 +364,9 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	for _, plan := range plans {
 		pg := plan.job.PodGroup
 		if conf.DryRun {
-			klog.V(2).Infof("capacityUpgrade[dry-run]: would move %s %s/%s (%d pods, %v GPUs) %s -> %s on %v",
+			klog.V(2).Infof("capacityUpgrade[dry-run]: would move %s %s/%s (%d pods, %v GPUs) %s -> %s on %v, displacing %d pods",
 				plan.kind(), pg.Namespace, pg.Name, len(plan.members), plan.gpus,
-				plan.from, plan.target, plan.nodeNames())
+				plan.from, plan.target, plan.nodeNames(), plan.displacedCount())
 			plan.observe("dry_run")
 			continue
 		}
@@ -331,17 +374,18 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 			klog.Errorf("capacityUpgrade: not moving %s %s/%s: %v", plan.kind(), pg.Namespace, pg.Name, err)
 			continue
 		}
-		klog.V(2).Infof("capacityUpgrade: holding %v for %s %s/%s (%d pods, %v GPUs) %s -> %s",
+		klog.V(2).Infof("capacityUpgrade: holding %v for %s %s/%s (%d pods, %v GPUs) %s -> %s, displacing %d pods",
 			plan.nodeNames(), plan.kind(), pg.Namespace, pg.Name, len(plan.members), plan.gpus,
-			plan.from, plan.target)
+			plan.from, plan.target, plan.displacedCount())
 		plan.observe("held")
 	}
 	return nil
 }
 
 // startCapacityUpgradeMove makes the move durable: it writes a hold
-// fragment onto every target node, then stamps the mover's cooldown and
-// budget. A write failure rolls back the fragments already written; a
+// fragment onto every target node, naming the pods the move displaces
+// there, then stamps the mover's cooldown and budget. A write failure rolls
+// back the fragments already written; a
 // fragment that cannot be rolled back is a durable hold like any other, so
 // maintenance carries it on (the hold itself records the move count the
 // successor inherits) or expires it. The index is updated so later plans in
@@ -358,8 +402,12 @@ func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeInde
 	names := plan.nodeNames()
 	until := plan.at.Add(time.Duration(conf.HoldTTLSeconds) * time.Second).UTC().Format(time.RFC3339)
 	fragment := func(name string) capacityHold {
+		var displaced []string
+		for _, pod := range plan.displaced[name] {
+			displaced = append(displaced, string(pod.Pod.UID))
+		}
 		return capacityHold{
-			Move: id, Group: group, Nodes: names, Movers: movers, Identity: plan.identity,
+			Move: id, Group: group, Nodes: names, Movers: movers, Displaced: displaced, Identity: plan.identity,
 			Gpus: plan.nodes[name], Priority: plan.priority, Moves: plan.moves,
 			Target: plan.target, From: plan.from, Until: until,
 		}
@@ -411,8 +459,9 @@ func stampCapacityUpgradeMover(plan capacityUpgradePlan, store capacityUpgradeSt
 // tier that fits the whole group (within one zone, for gangs) wins. Fit is
 // simulated first-fit-decreasing over a ledger shared by every plan in the
 // pass and seeded with the holds in flight, so two plans cannot claim the
-// same capacity. Target nodes that pending demand would reclaim from the
-// group are passed over (demand may be nil).
+// same capacity or count on displacing the same pod. Target nodes that
+// pending demand would reclaim from the group are passed over (demand may
+// be nil).
 func planCapacityUpgrades(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -462,7 +511,7 @@ func planCapacityUpgrades(
 		return candidates[i].job.UID < candidates[j].job.UID
 	})
 
-	ledger := newUpgradeLedger(nodes, idx, gpu)
+	ledger := newUpgradeLedger(nodes, running, conf, idx, gpu)
 	plans := make([]capacityUpgradePlan, 0)
 	pods, gangs := 0, 0
 	for _, cand := range candidates {
@@ -495,18 +544,19 @@ func planCapacityUpgrades(
 		}
 		ledger.commit(placement)
 		plan := capacityUpgradePlan{
-			job:      cand.job,
-			members:  cand.members,
-			gang:     cand.gang,
-			target:   nodes[placement.nodeNames()[0]].Node.Labels[conf.NodeLabelKey],
-			from:     cand.from,
-			zone:     placement.zone,
-			nodes:    placement.placed,
-			gpus:     cand.gpus / gpuMilli,
-			priority: cand.priority,
-			identity: cand.identity,
-			moves:    cand.moves + 1,
-			at:       now,
+			job:       cand.job,
+			members:   cand.members,
+			gang:      cand.gang,
+			target:    nodes[placement.nodeNames()[0]].Node.Labels[conf.NodeLabelKey],
+			from:      cand.from,
+			zone:      placement.zone,
+			nodes:     placement.placed,
+			gpus:      cand.gpus / gpuMilli,
+			displaced: placement.displaced,
+			priority:  cand.priority,
+			identity:  cand.identity,
+			moves:     cand.moves + 1,
+			at:        now,
 		}
 		klog.V(4).Infof("capacityUpgrade: %s/%s fits rank %d", cand.job.Namespace, cand.job.Name, targetRank)
 		plans = append(plans, plan)
@@ -543,9 +593,11 @@ type capacityUpgradeCandidate struct {
 
 // capacityUpgradeCandidateFor decides whether a job may move and gathers
 // what the planner needs. Every GPU member must be running, controlled,
-// old enough, at or below the priority ceiling, not opted out and not
-// disruption-protected (unless the protection is the owner's lifecycle
-// protection); at least one must run above the cheapest tier; the group's
+// old enough, at or below the priority ceiling and above the displaced
+// one (a pod moves have to make room over is never moved itself), not opted
+// out and not disruption-protected (unless the protection is the owner's
+// lifecycle protection); at least one must run above the cheapest tier; the
+// group's
 // cooldown must have expired, its budget must remain, no move for it may be
 // in flight and its members must share an identity. A gang (minMember > 1)
 // moves whole; a PodGroup of independent pods moves its single most
@@ -589,16 +641,10 @@ func capacityUpgradeCandidateFor(
 		if !isRunning || sessionTask.Status != api.Running || idx.movers[task.Pod.UID] {
 			return cand, false
 		}
-		if task.Pod.Labels[conf.OptOutLabel] == "false" {
+		if task.Priority > conf.MaxVictimPriority || conf.displaces(task.Priority) {
 			return cand, false
 		}
-		if task.Priority > conf.MaxVictimPriority {
-			return cand, false
-		}
-		if metav1.GetControllerOf(task.Pod) == nil {
-			return cand, false
-		}
-		if task.Pod.Annotations[doNotDisruptAnnotation] == "true" && task.Pod.Labels[conf.ProtectedLabel] != "true" {
+		if conf.shielded(task.Pod) {
 			return cand, false
 		}
 		started := podStartTime(task.Pod)
@@ -684,31 +730,91 @@ func podGroupCooled(pg *api.PodGroup, conf *capacityUpgradeConf, now time.Time) 
 
 // upgradeLedger tracks, per target node, the GPU capacity still claimable in
 // this pass: idle resources net of holds in flight and of what earlier plans
-// in the pass already took. Running pods on a target are never part of it;
-// a group fits a node only within what is idle there today.
+// in the pass already took, plus the displaceable pods no plan relies on
+// yet. No other running pod is part of it.
 type upgradeLedger struct {
 	idle map[string]*api.Resource
+	// displaceable lists each node's pods a plan may evict to make room,
+	// lowest priority then smallest first; empty unless the displaced
+	// priority ceiling is set.
+	displaceable map[string][]*api.TaskInfo
+	// taken marks the displaceable pods an earlier plan in the pass relies
+	// on evicting, so two plans cannot count on the same pod.
+	taken map[types.UID]bool
 }
 
 // newUpgradeLedger seeds the ledger from the session: each node's idle
-// resources net of the GPUs held by moves in flight.
-func newUpgradeLedger(nodes map[string]*api.NodeInfo, idx *capacityUpgradeIndex, gpu v1.ResourceName) *upgradeLedger {
-	ledger := &upgradeLedger{idle: make(map[string]*api.Resource, len(nodes))}
+// resources net of the GPUs held by moves in flight, and its displaceable
+// pods.
+func newUpgradeLedger(nodes map[string]*api.NodeInfo, running map[types.UID]*api.TaskInfo, conf *capacityUpgradeConf, idx *capacityUpgradeIndex, gpu v1.ResourceName) *upgradeLedger {
+	ledger := &upgradeLedger{
+		idle:         make(map[string]*api.Resource, len(nodes)),
+		displaceable: make(map[string][]*api.TaskInfo),
+		taken:        make(map[types.UID]bool),
+	}
 	for _, node := range nodes {
 		idle := node.Idle.Clone()
 		if outstanding := idx.outstanding(node.Name); outstanding > 0 {
 			idle.SetScalar(gpu, max(idle.Get(gpu)-outstanding, 0))
 		}
 		ledger.idle[node.Name] = idle
+		if pods := displaceablePods(node, running, conf, idx, gpu); len(pods) > 0 {
+			ledger.displaceable[node.Name] = pods
+		}
 	}
 	return ledger
 }
 
+// displaceablePods returns the pods on node a plan may evict to make room,
+// lowest priority first and smallest first within a priority: running GPU
+// pods at or below the displaced priority ceiling that the strategy is not
+// shielded from and that no move in flight counts on already (as a mover, as
+// a successor on its held GPUs, or as a pod being displaced, whose GPUs are
+// promised to that move's hold). The tasks returned are the session's (from
+// running), never the node-local clones: Session.Evict reconciles the task
+// it is handed against the node's copy, so handing it the copy itself
+// corrupts the node's accounting.
+func displaceablePods(node *api.NodeInfo, running map[types.UID]*api.TaskInfo, conf *capacityUpgradeConf, idx *capacityUpgradeIndex, gpu v1.ResourceName) []*api.TaskInfo {
+	if conf.MaxDisplacedPriority == nil {
+		return nil
+	}
+	pods := make([]*api.TaskInfo, 0)
+	for _, task := range node.Tasks {
+		if task.Pod == nil || !conf.displaces(task.Priority) || taskGpu(task, gpu) <= 0 || conf.shielded(task.Pod) {
+			continue
+		}
+		uid := task.Pod.UID
+		if idx.movers[uid] || idx.displaced[uid] || idx.claimant(node.Name, task) {
+			continue
+		}
+		sessionTask, isRunning := running[uid]
+		if !isRunning || sessionTask.Status != api.Running {
+			continue
+		}
+		pods = append(pods, sessionTask)
+	}
+	sort.Slice(pods, func(i, j int) bool {
+		if pods[i].Priority != pods[j].Priority {
+			return pods[i].Priority < pods[j].Priority
+		}
+		if gi, gj := taskGpu(pods[i], gpu), taskGpu(pods[j], gpu); gi != gj {
+			return gi < gj
+		}
+		return pods[i].Name < pods[j].Name
+	})
+	return pods
+}
+
 // commit records a plan: the target nodes lose the capacity the placement
-// consumed.
+// consumed and the pods it displaces are spoken for.
 func (l *upgradeLedger) commit(placement *capacityUpgradePlacement) {
 	for node, idle := range placement.idle {
 		l.idle[node] = idle
+	}
+	for _, pods := range placement.displaced {
+		for _, pod := range pods {
+			l.taken[pod.Pod.UID] = true
+		}
 	}
 }
 
@@ -719,6 +825,9 @@ type capacityUpgradePlacement struct {
 	zone   string
 	// idle is the ledger's idle map for the touched nodes after placement.
 	idle map[string]*api.Resource
+	// displaced maps each target node to the pods the placement relies on
+	// evicting there.
+	displaced map[string][]*api.TaskInfo
 }
 
 func (p *capacityUpgradePlacement) nodeNames() []string {
@@ -734,10 +843,11 @@ func (p *capacityUpgradePlacement) nodeNames() []string {
 // placing members largest-first onto the node with the most idle capacity
 // that passes predicates. Idle capacity on a node is its ledger idle plus the
 // resources of the group's own members already running there (they restart,
-// so their GPUs come free); no other running pod is counted. Nodes the
-// guard reports spoken for are skipped. For gangs, the target set is one
-// zone at a time; the first zone that fits wins. Returns nil unless every
-// member places.
+// so their GPUs come free). A member that fits no node's idle capacity is
+// placed where displacing the node's displaceable pods makes it fit; no
+// other running pod is counted. Nodes the guard reports spoken for are
+// skipped. For gangs, the target set is one zone at a time; the first zone
+// that fits wins. Returns nil unless every member places.
 func simulateUpgrade(
 	targets []*api.NodeInfo,
 	cand capacityUpgradeCandidate,
@@ -779,12 +889,19 @@ func simulateUpgrade(
 	return nil
 }
 
-// upgradeTarget is a target node's idle capacity during one simulation.
+// upgradeTarget is a target node's claimable capacity during one
+// simulation.
 type upgradeTarget struct {
 	node *api.NodeInfo
-	// idle is what this group may claim: the ledger's idle plus the GPUs
-	// of its own members running here.
+	// idle is what this group may claim without evicting anyone further:
+	// the ledger's idle plus the GPUs of its own members running here and
+	// of the pods it already displaces.
 	idle *api.Resource
+	// queue holds the node's displaceable pods nothing relies on yet, in
+	// the ledger's order.
+	queue []*api.TaskInfo
+	// displaced are the pods this group's placement relies on evicting.
+	displaced []*api.TaskInfo
 	// ledger is the ledger's idle for the node, which only this group's
 	// placements reduce; later plans in the pass never count on GPUs the
 	// mover has yet to release.
@@ -801,6 +918,36 @@ func subClamped(r, rr *api.Resource) {
 	for name, quantity := range rr.ScalarResources {
 		r.SetScalar(name, max(r.Get(name)-quantity, 0))
 	}
+}
+
+// makeRoom returns the queued pods to displace so that need fits the
+// target, and the queue left without them; ok is false when need does not
+// fit even with every queued pod gone. Pods go lowest priority first and,
+// within a priority, the smallest one that covers the GPU shortfall on its
+// own, else the largest, so as few pods and GPUs as possible are disturbed.
+func (t *upgradeTarget) makeRoom(need *api.Resource, gpu v1.ResourceName) (displaced, rest []*api.TaskInfo, ok bool) {
+	idle := t.idle.Clone()
+	rest = append(rest, t.queue...)
+	for !need.LessEqual(idle, api.Zero) {
+		if len(rest) == 0 {
+			return nil, nil, false
+		}
+		shortfall := need.Get(gpu) - idle.Get(gpu)
+		pick := 0
+		for i, pod := range rest {
+			if pod.Priority != rest[0].Priority {
+				break
+			}
+			pick = i
+			if taskGpu(pod, gpu) >= shortfall {
+				break
+			}
+		}
+		idle.Add(rest[pick].Resreq)
+		displaced = append(displaced, rest[pick])
+		rest = append(rest[:pick], rest[pick+1:]...)
+	}
+	return displaced, rest, true
 }
 
 func simulateUpgradeInZone(
@@ -826,7 +973,13 @@ func simulateUpgradeInZone(
 				idle.Add(member.Resreq)
 			}
 		}
-		targets = append(targets, &upgradeTarget{node: node, idle: idle, ledger: ledger.idle[node.Name].Clone()})
+		queue := make([]*api.TaskInfo, 0, len(ledger.displaceable[node.Name]))
+		for _, pod := range ledger.displaceable[node.Name] {
+			if !ledger.taken[pod.Pod.UID] {
+				queue = append(queue, pod)
+			}
+		}
+		targets = append(targets, &upgradeTarget{node: node, idle: idle, queue: queue, ledger: ledger.idle[node.Name].Clone()})
 	}
 
 	for _, member := range ordered {
@@ -840,34 +993,59 @@ func simulateUpgradeInZone(
 			}
 			return targets[i].node.Name < targets[j].node.Name
 		})
-		placed := false
-		for _, target := range targets {
-			if !need.LessEqual(target.idle, api.Zero) {
-				continue
-			}
-			if predicate != nil {
-				if err := predicate(member, target.node, cand.gang); err != nil {
+		// place puts the member on the first target that takes it: within
+		// idle capacity alone, or (displace) only where pods have to be
+		// displaced for it. Idle capacity anywhere is tried first, so
+		// nothing is displaced that did not have to be.
+		place := func(displace bool) bool {
+			for _, target := range targets {
+				fits := need.LessEqual(target.idle, api.Zero)
+				if fits == displace {
 					continue
 				}
+				displaced, rest := []*api.TaskInfo(nil), target.queue
+				if displace {
+					var ok bool
+					if displaced, rest, ok = target.makeRoom(need, gpu); !ok {
+						continue
+					}
+				}
+				if predicate != nil {
+					if err := predicate(member, target.node, cand.gang); err != nil {
+						continue
+					}
+				}
+				for _, pod := range displaced {
+					target.idle.Add(pod.Resreq)
+				}
+				target.queue = rest
+				target.displaced = append(target.displaced, displaced...)
+				target.idle.Sub(need)
+				subClamped(target.ledger, need)
+				target.placed += need.Get(gpu) / gpuMilli
+				return true
 			}
-			target.idle.Sub(need)
-			subClamped(target.ledger, need)
-			target.placed += need.Get(gpu) / gpuMilli
-			placed = true
-			break
+			return false
 		}
-		if !placed {
+		if !place(false) && !place(true) {
 			return nil
 		}
 	}
 
-	placement := &capacityUpgradePlacement{placed: map[string]float64{}, idle: make(map[string]*api.Resource)}
+	placement := &capacityUpgradePlacement{
+		placed:    map[string]float64{},
+		idle:      make(map[string]*api.Resource),
+		displaced: map[string][]*api.TaskInfo{},
+	}
 	for _, target := range targets {
 		if target.placed <= 0 {
 			continue
 		}
 		placement.placed[target.node.Name] = target.placed
 		placement.idle[target.node.Name] = target.ledger
+		if len(target.displaced) > 0 {
+			placement.displaced[target.node.Name] = target.displaced
+		}
 	}
 	return placement
 }

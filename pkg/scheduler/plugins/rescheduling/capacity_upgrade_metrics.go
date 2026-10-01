@@ -78,7 +78,15 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: "volcano",
 			Name:      "capacity_upgrade_evictions_total",
-			Help:      "Movers evicted for capacity-upgrade moves, by move kind; a move evicts nothing else. Retried evictions count again.",
+			Help:      "Movers evicted for capacity-upgrade moves, by move kind. Retried evictions count again.",
+		}, []string{"kind"},
+	)
+
+	capacityUpgradeDisplaced = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "volcano",
+			Name:      "capacity_upgrade_displaced_total",
+			Help:      "Pods at or below maxDisplacedPriority evicted from target nodes to make room for a capacity-upgrade move, by move kind. Retried evictions count again.",
 		}, []string{"kind"},
 	)
 
