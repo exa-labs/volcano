@@ -21,7 +21,8 @@ package rescheduling
 // (holds, drains, sequencing, claims, failure paths). The transaction tests
 // drive a move through the same steps the scheduler would across sessions,
 // re-reading the state from node annotations each time as a new session
-// does.
+// does. Making room over filler pods (maxDisplacedPriority) is covered in
+// capacity_upgrade_displaced_test.go.
 
 import (
 	"encoding/json"
@@ -399,9 +400,10 @@ func TestUpgradeSinglePodMovesToIdleReserved(t *testing.T) {
 	}
 }
 
-// A mover only ever takes GPUs that are idle today. Lower-priority pods on
-// the target are not room: displacing them would send them back to the
-// expensive tier as fresh movers and chain moves indefinitely.
+// Without a displaced-priority ceiling a mover only ever takes GPUs that are
+// idle today. Lower-priority pods on the target are not room: displacing
+// them would send them back to the expensive tier as fresh movers and chain
+// moves indefinitely.
 func TestUpgradeNeverCountsLowerPriorityPodsAsRoom(t *testing.T) {
 	f := newFixture(t)
 	f.addNode(tierNode("spot-1", "spot", "a"))

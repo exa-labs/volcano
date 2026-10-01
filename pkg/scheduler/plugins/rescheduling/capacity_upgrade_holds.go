@@ -19,10 +19,11 @@ package rescheduling
 // Capacity-upgrade moves are transactions that span many scheduler sessions,
 // so their state lives on the cluster, not in memory:
 //
-//   - A hold on a target node (CapacityUpgradeHoldsAnnotation) reserves an
-//     idle GPU quantity for one move. The hold predicate rejects every other
-//     GPU pod that would eat into that quantity, so the GPUs stay idle for
-//     the mover's successor across the sessions the move takes.
+//   - A hold on a target node (CapacityUpgradeHoldsAnnotation) reserves a
+//     GPU quantity for one move. The hold predicate rejects every other
+//     GPU pod that would eat into that quantity, so the GPUs stay free for
+//     the mover's successor across the sessions the move takes, and nothing
+//     but that successor can take the place of a pod the move displaces.
 //   - A drain on a source node (CapacityUpgradeDrainsAnnotation) marks a
 //     node whose GPUs are being vacated by a move. The drain predicate lets a
 //     GPU pod use only the node's real idle GPUs, never the ones still held by
@@ -30,13 +31,15 @@ package rescheduling
 //     capacity its predecessor is releasing.
 //
 // A move advances through phases derived from that state every session:
-// held (holds written, waiting for the held GPUs to be idle and the movers
-// to still fit) -> placing (drains written, movers evicted, waiting for the
+// held (holds written; the pods the hold displaces are evicted, then the
+// move waits for the held GPUs to be idle and the movers to still fit) ->
+// placing (drains written, movers evicted, waiting for the
 // successor to bind onto the held GPUs) -> done (hold claimed by the
 // successor and released). A hold that does not progress within its TTL
 // expires and is released, and a hold whose fragments are inconsistent is
 // abandoned; both leave the cluster no worse than before the move started.
-// Nothing but the movers is ever evicted.
+// Nothing but the movers and the pods their holds name as displaced is ever
+// evicted.
 
 import (
 	"context"
@@ -87,6 +90,9 @@ type capacityHold struct {
 	Nodes []string `json:"nodes"`
 	// Movers are the UIDs of the pods the move evicts.
 	Movers []string `json:"movers"`
+	// Displaced are the UIDs of the pods running on this node that the
+	// move evicts to make room for its reservation here.
+	Displaced []string `json:"displaced,omitempty"`
 	// Identity is the label set a pod must carry to claim this hold.
 	Identity map[string]string `json:"identity"`
 	// Gpus is the GPU count reserved on this node.
@@ -153,6 +159,9 @@ type capacityUpgradeIndex struct {
 	groups map[string]bool
 	// movers marks pods a move in flight evicts.
 	movers map[types.UID]bool
+	// displaced marks pods a move in flight evicts from its target nodes;
+	// their GPUs are promised to that move's hold.
+	displaced map[types.UID]bool
 	// malformed lists nodes whose annotations could not be decoded.
 	malformed map[string]string
 }
@@ -164,6 +173,7 @@ func newCapacityUpgradeIndex() *capacityUpgradeIndex {
 		moves:     map[string]*capacityUpgradeMove{},
 		groups:    map[string]bool{},
 		movers:    map[types.UID]bool{},
+		displaced: map[types.UID]bool{},
 		malformed: map[string]string{},
 	}
 }
@@ -238,6 +248,9 @@ func (idx *capacityUpgradeIndex) addHold(node string, hold capacityHold) {
 	for _, uid := range hold.Movers {
 		idx.movers[types.UID(uid)] = true
 	}
+	for _, uid := range hold.Displaced {
+		idx.displaced[types.UID(uid)] = true
+	}
 }
 
 // removeMove drops every fragment and drain of a move.
@@ -270,6 +283,11 @@ func (idx *capacityUpgradeIndex) removeMove(id string) (touched []string) {
 		delete(idx.groups, move.hold.Group)
 		for _, uid := range move.hold.Movers {
 			delete(idx.movers, types.UID(uid))
+		}
+		for _, fragment := range move.fragments {
+			for _, uid := range fragment.Displaced {
+				delete(idx.displaced, types.UID(uid))
+			}
 		}
 		delete(idx.moves, id)
 	}
@@ -505,6 +523,9 @@ type moveStep struct {
 	groups []groupStamp
 	// movers are evicted once the writes succeed.
 	movers []*api.TaskInfo
+	// displaced are the pods evicted from the move's target nodes to make
+	// room for it; a step evicts these or the movers, never both.
+	displaced []*api.TaskInfo
 }
 
 // advanceCapacityUpgradeMoves derives this session's actions from the moves
@@ -628,10 +649,12 @@ func advanceCapacityUpgradeMoves(
 			continue
 		}
 
-		// Held: once every target node really has its share idle (a pod
-		// bound between planning and the hold write may have taken some of
-		// it, and only finishing on its own gives it back), drain the
-		// sources and evict the movers.
+		// Held: once every target node really has its share idle, drain
+		// the sources and evict the movers. Until then the pods the hold
+		// displaces are evicted to make that share. A share short for any
+		// other reason (a pod bound between planning and the hold write
+		// took some of it) only comes back when that pod finishes on its
+		// own.
 		if len(movers) == 0 {
 			// The movers are gone without this move evicting them (the
 			// job finished or was deleted); nothing can claim the hold.
@@ -643,6 +666,11 @@ func advanceCapacityUpgradeMoves(
 			continue
 		}
 		if !targetsIdle(idx, move, nodes, movers, gpu) {
+			if displaced := displacedToEvict(idx, move, nodes, jobs, movers, gpu); len(displaced) > 0 && moversFit(move, nodes, movers, predicate) {
+				step.displaced = displaced
+				step.outcome, step.reason = "displacing", "making room on held capacity"
+				steps = append(steps, step)
+			}
 			continue
 		}
 		if !moversFit(move, nodes, movers, predicate) {
@@ -776,18 +804,70 @@ func placedStatus(status api.TaskStatus) bool {
 // everything held on it.
 func targetsIdle(idx *capacityUpgradeIndex, move *capacityUpgradeMove, nodes map[string]*api.NodeInfo, movers []*api.TaskInfo, gpu v1.ResourceName) bool {
 	for _, name := range move.hold.Nodes {
-		node := nodes[name]
-		available := node.Idle.Get(gpu)
-		for _, mover := range movers {
-			if mover.NodeName == name {
-				available += taskGpu(mover, gpu)
-			}
-		}
-		if available < idx.outstanding(name) {
+		if nodes[name].Idle.Get(gpu)+moversGpu(movers, name, gpu) < idx.outstanding(name) {
 			return false
 		}
 	}
 	return true
+}
+
+// moversGpu is the GPU quantity the movers occupy on the named node.
+func moversGpu(movers []*api.TaskInfo, node string, gpu v1.ResourceName) float64 {
+	total := 0.0
+	for _, mover := range movers {
+		if mover.NodeName == node {
+			total += taskGpu(mover, gpu)
+		}
+	}
+	return total
+}
+
+// displacedToEvict returns the pods the move still has to evict from its
+// target nodes. A node whose future-idle GPUs (idle or terminating, plus
+// the move's own movers there) already cover everything held on it needs
+// nothing more: its displaced pods are on their way out, or the room came
+// from elsewhere and they stay. On any other node the fragment's displaced
+// pods that are still running are evicted, by name, until the node is
+// covered. The tasks returned are the jobs' (the session's), not the
+// node-local clones.
+func displacedToEvict(
+	idx *capacityUpgradeIndex,
+	move *capacityUpgradeMove,
+	nodes map[string]*api.NodeInfo,
+	jobs map[api.JobID]*api.JobInfo,
+	movers []*api.TaskInfo,
+	gpu v1.ResourceName,
+) []*api.TaskInfo {
+	evict := make([]*api.TaskInfo, 0)
+	for _, name := range move.hold.Nodes {
+		node := nodes[name]
+		short := idx.outstanding(name) - node.FutureIdle().Get(gpu) - moversGpu(movers, name, gpu)
+		if short <= 0 {
+			continue
+		}
+		wanted := map[types.UID]bool{}
+		for _, uid := range move.fragments[name].Displaced {
+			wanted[types.UID(uid)] = true
+		}
+		running := make([]*api.TaskInfo, 0, len(wanted))
+		for _, task := range node.Tasks {
+			if task.Pod == nil || !wanted[task.Pod.UID] || task.Status != api.Running {
+				continue
+			}
+			if job := jobs[task.Job]; job != nil && job.Tasks[task.UID] != nil {
+				running = append(running, job.Tasks[task.UID])
+			}
+		}
+		sort.Slice(running, func(i, j int) bool { return running[i].Name < running[j].Name })
+		for _, task := range running {
+			if short <= 0 {
+				break
+			}
+			evict = append(evict, task)
+			short -= taskGpu(task, gpu)
+		}
+	}
+	return evict
 }
 
 // moversFit reports whether each mover still passes predicates on at least
@@ -819,11 +899,12 @@ type capacityUpgradeStore interface {
 }
 
 // applyMoveSteps executes steps in order: node state first, then PodGroup
-// stamps, then it reports the movers to evict. A step whose node write fails
+// stamps, then it reports the pods to evict. A step whose node write fails
 // is logged and skipped; the cluster state it read from is unchanged, so the
-// next session retries it. Returns the movers whose steps fully applied.
+// next session retries it. Returns the movers and displaced pods of the
+// steps that fully applied.
 func applyMoveSteps(steps []moveStep, store capacityUpgradeStore) []*api.TaskInfo {
-	movers := make([]*api.TaskInfo, 0)
+	evictions := make([]*api.TaskInfo, 0)
 	for _, step := range steps {
 		if err := writeNodeStates(step.nodes, step.first, store); err != nil {
 			klog.Errorf("capacityUpgrade: move %s %s: %v", step.id, step.outcome, err)
@@ -861,9 +942,14 @@ func applyMoveSteps(steps []moveStep, store capacityUpgradeStore) []*api.TaskInf
 				mover.Namespace, mover.Name, mover.NodeName, step.id)
 			capacityUpgradeEvictions.WithLabelValues(step.hold.kind()).Inc()
 		}
-		movers = append(movers, step.movers...)
+		for _, pod := range step.displaced {
+			klog.V(2).Infof("capacityUpgrade: displacing %s/%s (priority %d) from %s for move %s",
+				pod.Namespace, pod.Name, pod.Priority, pod.NodeName, step.id)
+			capacityUpgradeDisplaced.WithLabelValues(step.hold.kind()).Inc()
+		}
+		evictions = append(append(evictions, step.movers...), step.displaced...)
 	}
-	return movers
+	return evictions
 }
 
 // writeNodeStates writes every node's state, the first nodes in the given
