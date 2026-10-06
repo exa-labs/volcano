@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,7 +84,16 @@ const (
 	defaultMetricsInternal = 30 * time.Second
 
 	taskUpdaterWorker = 16
+
+	// unschedulableMessageRefreshInterval bounds how stale the node-count
+	// histogram in a pending pod's PodScheduled message may get before a
+	// count-only change is written back; see unschedulableConditionNeedsUpdate.
+	unschedulableMessageRefreshInterval = 5 * time.Minute
 )
+
+// nodeCountPattern matches the per-reason node counts in a FitErrors message
+// ("0/1073 nodes are unavailable: 226 Insufficient memory, ...").
+var nodeCountPattern = regexp.MustCompile(`\d+`)
 
 // defaultIgnoredProvisioners contains provisioners that will be ignored during pod pvc request computation and preemption.
 var defaultIgnoredProvisioners = []string{"rancher.io/local-path", "hostpath.csi.k8s.io"}
@@ -303,29 +313,39 @@ type defaultStatusUpdater struct {
 	vcclient   vcclient.Interface
 }
 
-// following the same logic as podutil.UpdatePodCondition
-func podConditionHaveUpdate(status *v1.PodStatus, condition *v1.PodCondition) bool {
-	lastTransitionTime := metav1.Now()
-	// Try to find this pod condition.
+// unschedulableConditionNeedsUpdate reports whether a pending pod's PodScheduled
+// condition has to be rewritten to `condition`, whose LastProbeTime is the
+// current session time.
+//
+// The FitErrors message embeds a per-reason node-count histogram, and on a
+// large cluster some count changes every session. Comparing messages
+// byte-for-byte therefore rewrote the full status of every pending pod every
+// session (~150 pod PUTs/s for a 1.5k-pod backlog on 10s sessions — the
+// single largest etcd writer). Only a change of status, reason, or of the set
+// of reasons is written immediately; a change in the counts alone is flushed
+// at most once per unschedulableMessageRefreshInterval, measured from the
+// LastProbeTime stamped on the last write.
+func unschedulableConditionNeedsUpdate(status *v1.PodStatus, condition *v1.PodCondition) bool {
 	_, oldCondition := podutil.GetPodCondition(status, condition.Type)
-
 	if oldCondition == nil {
-		// We are adding new pod condition.
 		return true
 	}
-	// We are updating an existing condition, so we need to check if it has changed.
-	if condition.Status == oldCondition.Status {
-		lastTransitionTime = oldCondition.LastTransitionTime
+	if condition.Status != oldCondition.Status || condition.Reason != oldCondition.Reason {
+		return true
 	}
+	if condition.Message == oldCondition.Message {
+		return false
+	}
+	if stripNodeCounts(condition.Message) != stripNodeCounts(oldCondition.Message) {
+		return true
+	}
+	return condition.LastProbeTime.Sub(oldCondition.LastProbeTime.Time) >= unschedulableMessageRefreshInterval
+}
 
-	isEqual := condition.Status == oldCondition.Status &&
-		condition.Reason == oldCondition.Reason &&
-		condition.Message == oldCondition.Message &&
-		condition.LastProbeTime.Equal(&oldCondition.LastProbeTime) &&
-		lastTransitionTime.Equal(&oldCondition.LastTransitionTime)
-
-	// Return true if one of the fields have changed.
-	return !isEqual
+// stripNodeCounts replaces every number in a FitErrors message so that two
+// messages differing only in node counts compare equal.
+func stripNodeCounts(message string) string {
+	return nodeCountPattern.ReplaceAllLiteralString(message, "#")
 }
 
 func podNominatedNodeNameNeedUpdate(status *v1.PodStatus, nodeName string) bool {
@@ -1028,13 +1048,14 @@ func (sc *SchedulerCache) taskUnschedulable(task *schedulingapi.TaskInfo, reason
 	pod := task.Pod
 
 	condition := &v1.PodCondition{
-		Type:    v1.PodScheduled,
-		Status:  v1.ConditionFalse,
-		Reason:  reason, // Add more reasons in order to distinguish more specific scenario of pending tasks
-		Message: message,
+		Type:          v1.PodScheduled,
+		Status:        v1.ConditionFalse,
+		Reason:        reason, // Add more reasons in order to distinguish more specific scenario of pending tasks
+		Message:       message,
+		LastProbeTime: metav1.Now(),
 	}
 
-	updateCond := podConditionHaveUpdate(&pod.Status, condition)
+	updateCond := unschedulableConditionNeedsUpdate(&pod.Status, condition)
 
 	// only update pod's nominatedNodeName when nominatedNodeName is not empty
 	// consider this situation:
