@@ -18,6 +18,7 @@ package rescheduling
 
 import (
 	"reflect"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -138,7 +139,8 @@ var victimsFnForLnu = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	}
 
 	// select victims from lowNodes
-	return evictPodsFromSourceNodes(highNodes, lowNodes, tasks, isContinueEvictPods, *utilizationConfig)
+	victims = evictPodsFromSourceNodes(highNodes, lowNodes, tasks, isContinueEvictPods, *utilizationConfig)
+	return admittedVictims(DefaultStrategy, victims, lowNodes, config, time.Now())
 }
 
 // lowThresholdFilter filter nodes which all resource dimensions are under the low utilization threshold

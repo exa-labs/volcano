@@ -45,6 +45,9 @@ import (
 // recently drained source steer them to the fuller nodes. A per-node cooldown
 // (a node drained or filled by a drain cannot be drained again until it
 // expires) and per-PodGroup eviction caps are the anti-thrash mechanism.
+// With moveAdmission, a pod governed by a spend cap is only repacked onto a
+// node that cap admits at the node's published price (see the capacitycost
+// package); a drain that would need any other destination is not planned.
 const GpuFragmentationStrategy = "gpuFragmentation"
 
 // DefaultGpuFragmentationConf holds the default (dry-run) configuration.
@@ -57,6 +60,10 @@ var DefaultGpuFragmentationConf = map[string]interface{}{
 	"cooldownSeconds":   1800,
 	"maxVictims":        8,
 	"maxVictimPriority": -1,
+
+	// Spend-cap move admission, off by default.
+	"moveAdmission":         false,
+	"priceStalenessSeconds": 900,
 }
 
 // KillSwitchEnv disables the strategy entirely when set to "true" on the
@@ -105,6 +112,14 @@ type gpuFragmentationConf struct {
 	// without an explicit priority count as 0, so the default (-1) restricts
 	// repacking to negative-priority (interruptible) workloads.
 	MaxVictimPriority int32 `mapstructure:"maxVictimPriority"`
+	// MoveAdmission refuses a destination to a victim governed by a spend
+	// cap unless the node's published verdict admits that cap at the node's
+	// current price; a node without a fresh verdict is refused. Off by
+	// default.
+	MoveAdmission bool `mapstructure:"moveAdmission"`
+	// PriceStalenessSeconds is how long a published price (and the
+	// admission verdict written with it) stays usable.
+	PriceStalenessSeconds int `mapstructure:"priceStalenessSeconds"`
 }
 
 func newGpuFragmentationConf() *gpuFragmentationConf {
@@ -285,7 +300,8 @@ func probeTask(task *api.TaskInfo) *api.TaskInfo {
 // ledger and never reuse a node already drained or filled by an earlier
 // drain, so the plans compose without double-booking. Equally-utilized nodes
 // tie-break toward the one running lower-priority victims, then fewer
-// victims, so the cheapest-to-disrupt workload moves.
+// victims, so the cheapest-to-disrupt workload moves. With moveAdmission, a
+// destination must also admit the spend cap of every victim placed on it.
 func planGpuFragmentationDrains(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -295,6 +311,9 @@ func planGpuFragmentationDrains(
 	predicate func(*api.TaskInfo, *api.NodeInfo) error,
 ) []gpuFragmentationDrain {
 	gpu := v1.ResourceName(conf.GpuResource)
+	if conf.MoveAdmission {
+		predicate = repackAdmission(predicate, conf, now)
+	}
 	pools := make(map[string][]*api.NodeInfo)
 	for _, node := range nodes {
 		if node.Node == nil || node.Allocatable.Get(gpu) <= 0 {

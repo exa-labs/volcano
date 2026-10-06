@@ -66,6 +66,14 @@ var (
 		}, []string{"kind"},
 	)
 
+	gpuRepackTargetsSkipped = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "volcano",
+			Name:      "gpu_repack_targets_skipped_total",
+			Help:      "Destination nodes a victim was not repacked onto, by reason: move_admission (the victim's spend cap does not admit the node). Counted once per victim pod and node per pass.",
+		}, []string{"reason"},
+	)
+
 	gpuRepackLastDrain = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: "volcano",
