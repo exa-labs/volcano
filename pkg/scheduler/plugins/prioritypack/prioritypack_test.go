@@ -229,9 +229,14 @@ var (
 )
 
 func gpuPod(name, node, pg string, prio *schedulingv1.PriorityClass, phase v1.PodPhase, preemptable bool) *v1.Pod {
+	return gpuPodOf(name, node, pg, prio, phase, preemptable, 1)
+}
+
+// gpuPodOf builds a pod holding gpus GPUs and as many cpus and gigabytes.
+func gpuPodOf(name, node, pg string, prio *schedulingv1.PriorityClass, phase v1.PodPhase, preemptable bool, gpus int) *v1.Pod {
 	labels := map[string]string{schedulingv1beta1.PodPreemptable: fmt.Sprint(preemptable)}
 	return util.BuildPodWithPriority("c1", name, node, phase,
-		api.BuildResourceList("1", "1G", api.ScalarResource{Name: string(gpu), Value: "1"}),
+		api.BuildResourceList(fmt.Sprint(gpus), fmt.Sprintf("%dG", gpus), api.ScalarResource{Name: string(gpu), Value: fmt.Sprint(gpus)}),
 		pg, labels, nil, &prio.Value)
 }
 
@@ -255,14 +260,19 @@ func lowPods(node string, n, preemptable int) ([]*v1.Pod, []*schedulingv1beta1.P
 }
 
 func runScenario(t *testing.T, test *uthelper.TestCommonStruct, withPriorityPack bool, actions ...framework.Action) {
+	runScenarioOn(t, test, withPriorityPack, 2, actions...)
+}
+
+// runScenarioOn runs the actions with preempt dry-running candidates nodes.
+func runScenarioOn(t *testing.T, test *uthelper.TestCommonStruct, withPriorityPack bool, candidates int, actions ...framework.Action) {
 	test.Plugins = schedulingPlugins
 	test.PriClass = []*schedulingv1.PriorityClass{highPrio, lowPrio}
 	test.RegisterSession(schedulingTiers(withPriorityPack), []conf.Configuration{{
 		Name: "preempt",
 		Arguments: map[string]interface{}{
 			preempt.EnableTopologyAwarePreemptionKey: true,
-			preempt.MinCandidateNodesAbsoluteKey:     2,
-			preempt.MaxCandidateNodesAbsoluteKey:     2,
+			preempt.MinCandidateNodesAbsoluteKey:     candidates,
+			preempt.MaxCandidateNodesAbsoluteKey:     candidates,
 		},
 	}})
 	defer test.Close()
@@ -340,4 +350,101 @@ func TestPreemptEvictsOnTheNodeWhoseCeilingIsAlreadyHigh(t *testing.T) {
 	test.ExpectEvicted = []string{"c1/n2-low-0"}
 	test.ExpectPipeLined = map[string][]string{"c1/pg-arrival": {"n2"}}
 	runScenario(t, test, true, preempt.New())
+}
+
+func TestSessionNodesScoresTheSessionRecordNotTheCopy(t *testing.T) {
+	live := gpuNode("n1", 8)
+	whole := gpuTask("whole", 8, -4, api.Running)
+	place(t, live, whole)
+	copied := live.Clone()
+	if err := copied.RemoveTask(whole); err != nil {
+		t.Fatalf("RemoveTask: %v", err)
+	}
+	stranger := gpuNode("n2", 8)
+
+	resolved := sessionNodes(map[string]*api.NodeInfo{"n1": live}, []*api.NodeInfo{copied, stranger})
+	if resolved[0] != live || resolved[1] != stranger {
+		t.Fatalf("sessionNodes = %v, want the session's n1 and the passed n2", resolved)
+	}
+	if got, want := occupancyOf(resolved[0], gpu).cost(0), float64(4*8*milli); got != want {
+		t.Fatalf("cost on the session's node = %v, want %v (the victim counts as held)", got, want)
+	}
+	if got := occupancyOf(copied, gpu).cost(0); got != 0 {
+		t.Fatalf("cost on the copy = %v, want 0", got)
+	}
+}
+
+// wholeNodeVictimScenario: both nodes full of low work. n1 is one 8-GPU
+// pod; n2 is eight 1-GPU pods, one preemptable so the victim is nameable.
+// A 1-GPU high arrival must evict that one pod rather than the 8-GPU pod,
+// although evicting the 8-GPU pod would leave n1 empty.
+func wholeNodeVictimScenario() *uthelper.TestCommonStruct {
+	n2Pods, n2Groups := lowPods("n2", 8, 1)
+	pods := append(n2Pods,
+		gpuPodOf("n1-whole", "n1", "pg-n1-whole", lowPrio, v1.PodRunning, true, 8),
+		gpuPod("arrival", "", "pg-arrival", highPrio, v1.PodPending, true),
+	)
+	groups := append(n2Groups,
+		util.BuildPodGroupWithPrio("pg-n1-whole", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning, "low"),
+		util.BuildPodGroupWithPrio("pg-arrival", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, "high"),
+	)
+	return &uthelper.TestCommonStruct{
+		Pods:      pods,
+		PodGroups: groups,
+		Nodes:     []*v1.Node{clusterNode("n1"), clusterNode("n2")},
+		Queues:    []*schedulingv1beta1.Queue{util.BuildQueue("q1", 1, nil)},
+	}
+}
+
+func TestPreemptKeepsTheWholeNodeJobOverOneSmallVictim(t *testing.T) {
+	test := wholeNodeVictimScenario()
+	test.ExpectEvictNum = 1
+	test.ExpectEvicted = []string{"c1/n2-low-0"}
+	test.ExpectPipeLined = map[string][]string{"c1/pg-arrival": {"n2"}}
+	runScenario(t, test, true, preempt.New())
+}
+
+func TestPreemptWithoutPriorityPackKeepsTheWholeNodeJob(t *testing.T) {
+	test := wholeNodeVictimScenario()
+	test.ExpectEvictNum = 1
+	test.ExpectEvicted = []string{"c1/n2-low-0"}
+	test.ExpectPipeLined = map[string][]string{"c1/pg-arrival": {"n2"}}
+	runScenario(t, test, false, preempt.New())
+}
+
+// burstScenario: three nodes full of low work but for one idle GPU on n1,
+// and four 1-GPU high arrivals. The first takes the idle GPU; the other
+// three must preempt on n1 too, whose ceiling the first arrival already
+// raised, instead of spreading over n2 and n3. Three of n1's pods are
+// preemptable so the victims are nameable; every pod on n2 and n3 is.
+func burstScenario() *uthelper.TestCommonStruct {
+	n1Pods, n1Groups := lowPods("n1", 7, 3)
+	n2Pods, n2Groups := lowPods("n2", 8, 8)
+	n3Pods, n3Groups := lowPods("n3", 8, 8)
+	pods := append(append(n1Pods, n2Pods...), n3Pods...)
+	groups := append(append(n1Groups, n2Groups...), n3Groups...)
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("arrival-%d", i)
+		pods = append(pods, gpuPod(name, "", "pg-"+name, highPrio, v1.PodPending, true))
+		groups = append(groups, util.BuildPodGroupWithPrio("pg-"+name, "c1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, "high"))
+	}
+	return &uthelper.TestCommonStruct{
+		Pods:      pods,
+		PodGroups: groups,
+		Nodes:     []*v1.Node{clusterNode("n1"), clusterNode("n2"), clusterNode("n3")},
+		Queues:    []*schedulingv1beta1.Queue{util.BuildQueue("q1", 1, nil)},
+	}
+}
+
+func TestPreemptBurstJoinsTheNodeAnEarlierArrivalRaised(t *testing.T) {
+	test := burstScenario()
+	test.ExpectEvictNum = 3
+	test.ExpectEvicted = []string{"c1/n1-low-0", "c1/n1-low-1", "c1/n1-low-2"}
+	test.ExpectPipeLined = map[string][]string{
+		"c1/pg-arrival-0": {"n1"},
+		"c1/pg-arrival-1": {"n1"},
+		"c1/pg-arrival-2": {"n1"},
+		"c1/pg-arrival-3": {"n1"},
+	}
+	runScenarioOn(t, test, true, 3, preempt.New())
 }

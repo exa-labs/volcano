@@ -30,9 +30,16 @@ limitations under the License.
 // candidates score weight × 100, the most expensive 0. Tasks not requesting
 // the configured resource are not scored.
 //
-// The same node-order function ranks candidate nodes for the preempt action
-// (which scores nodes after removing the candidate's victims), so a
-// preemptor also lands on the node where it raises the ceiling least.
+// The same node-order function ranks candidate nodes for the preempt action,
+// so a preemptor also lands on the node where it raises the ceiling least.
+// Preempt hands its candidates over as copies with their victims already
+// removed; the plugin scores the session's own node instead, so a
+// preemptor's victims count as held. Evicting lower-priority work then costs
+// what capping it would, and a candidate never wins because its eviction
+// empties the node: a whole-node job is not the cheapest victim for a
+// one-GPU preemptor just because removing it leaves nothing behind. Among
+// candidates that cost the same, binpack, which scores the copies, keeps
+// the most of the work in place.
 //
 // Scheduler configuration:
 //
@@ -197,6 +204,22 @@ func (p *priorityPackPlugin) scores(task *api.TaskInfo) bool {
 	return task.Resreq.Get(p.resource) > 0 || task.InitResreq.Get(p.resource) > 0
 }
 
+// sessionNodes maps each node to the session's record of it, which holds
+// every task the scheduler has not released: allocate and backfill pass
+// those records already, preempt passes copies without the candidate's
+// victims. A node the session does not hold is scored as passed.
+func sessionNodes(session map[string]*api.NodeInfo, nodes []*api.NodeInfo) []*api.NodeInfo {
+	resolved := make([]*api.NodeInfo, len(nodes))
+	for i, node := range nodes {
+		if live, found := session[node.Name]; found {
+			resolved[i] = live
+			continue
+		}
+		resolved[i] = node
+	}
+	return resolved
+}
+
 // batchScores ranks the candidate nodes for the task by placement cost.
 func (p *priorityPackPlugin) batchScores(task *api.TaskInfo, nodes []*api.NodeInfo) map[string]float64 {
 	costs := make(map[string]float64, len(nodes))
@@ -241,7 +264,7 @@ func (p *priorityPackPlugin) OnSessionOpen(ssn *framework.Session) {
 		if !p.scores(task) {
 			return nil, nil
 		}
-		scores := p.batchScores(task, nodes)
+		scores := p.batchScores(task, sessionNodes(ssn.Nodes, nodes))
 		klog.V(5).Infof("prioritypack: task %s/%s (priority %d) scores %v",
 			task.Namespace, task.Name, task.Priority, scores)
 		return scores, nil
