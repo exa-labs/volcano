@@ -39,8 +39,11 @@ package rescheduling
 //
 // moveAdmission. A member governed by a spend cap is never placed on a node
 // that cap does not admit, and a node without a fresh verdict admits no
-// capped member. The check runs when the move is planned and again before
-// the movers are evicted. It restricts moves only: the successor is a
+// capped member. A member the autoscaler has not classified (no spend-cap
+// annotation at all) is admitted nowhere, so its group is not moved; an
+// empty annotation marks an uncapped member, admitted anywhere. The check
+// runs when the move is planned and again before the movers are evicted.
+// It restricts moves only: the successor is a
 // pending pod like any other and binds wherever it fits best, which the
 // hold makes the target.
 //
@@ -344,8 +347,9 @@ func (p *upgradePricing) observeOverrun(nodes map[string]*api.NodeInfo) {
 }
 
 // admittedForMove puts move admission in front of a fit predicate: a task
-// governed by a spend cap fails on every node that cap does not admit. With
-// count set, each refused task and node is counted once.
+// governed by a spend cap fails on every node that cap does not admit, and
+// an unclassified task on every node. With count set, each refused task and
+// node is counted once.
 func admittedForMove(inner capacityUpgradePredicate, book *capacitycost.PriceBook, count bool) capacityUpgradePredicate {
 	refused := map[string]bool{}
 	return func(task *api.TaskInfo, node *api.NodeInfo, gang bool) error {

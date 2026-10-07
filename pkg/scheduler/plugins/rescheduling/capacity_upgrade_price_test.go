@@ -74,6 +74,13 @@ func capped(pod *v1.Pod, policy string) *v1.Pod {
 	return pod
 }
 
+// uncapped classifies the pod as governed by no spend cap: the annotation
+// is present and empty. A pod without it is unclassified, and move
+// admission refuses it every node.
+func uncapped(pod *v1.Pod) *v1.Pod {
+	return capped(pod, "")
+}
+
 // pricingConf is the default configuration with the given parameters set.
 func pricingConf(set func(*capacityUpgradeConf)) *capacityUpgradeConf {
 	conf := liveConf()
@@ -406,7 +413,7 @@ func TestPriceUpgradeNeverMovesAMemberOntoADearerNode(t *testing.T) {
 	}
 	f.placeGroup(t, 2, nil,
 		capped(tierPod("w0", "source-1", "pg-gang", 4, -4, time.Hour), "a"),
-		tierPod("w1", "source-2", "pg-gang", 4, -4, time.Hour))
+		uncapped(tierPod("w1", "source-2", "pg-gang", 4, -4, time.Hour)))
 	conf := pricingConf(func(c *capacityUpgradeConf) { c.PriceAware, c.MoveAdmission = true, true })
 	// 4x4 + 4x1 = 20 against 24 would save a sixth.
 	if plans := f.planUpgrades(conf, nil); len(plans) != 0 {
@@ -426,31 +433,35 @@ func TestPriceUpgradeNeverMovesAMemberOntoADearerNode(t *testing.T) {
 // The mover runs on spot and reserved capacity is idle: the rank says move.
 // Whether it may depends on the mover's spend cap and the target's verdict.
 func TestMoveAdmissionDecidesWhereACappedMoverMayGo(t *testing.T) {
+	under := func(policy string) func(*v1.Pod) *v1.Pod {
+		return func(pod *v1.Pod) *v1.Pod { return capped(pod, policy) }
+	}
+	unclassified := func(pod *v1.Pod) *v1.Pod { return pod }
 	cases := []struct {
-		name   string
-		policy string
-		target *api.NodeInfo
-		move   bool
+		name     string
+		classify func(*v1.Pod) *v1.Pod
+		target   *api.NodeInfo
+		move     bool
 	}{
-		{"cap applies and admits the target", "a", caps(pricedNode("target", "reserved", "a", "8"), "a,b", "a"), true},
-		{"cap applies and does not admit the target", "b", caps(pricedNode("target", "reserved", "a", "8"), "a,b", "a"), false},
-		{"cap does not apply to the target", "c", caps(pricedNode("target", "reserved", "a", "8"), "a,b", "a"), true},
-		{"target has no verdict", "a", tierNode("target", "reserved", "a"), false},
-		{"target verdict is stale", "a", caps(observedNode("target", "reserved", "a", "8", time.Hour), "a", "a"), false},
-		{"target price is malformed", "a", caps(pricedNode("target", "reserved", "a", "eight"), "a", "a"), false},
-		{"uncapped mover, target without a verdict", "", tierNode("target", "reserved", "a"), true},
-		{"uncapped mover, target admitting nobody", "", caps(pricedNode("target", "reserved", "a", "8"), "a", ""), true},
+		{"cap applies and admits the target", under("a"), caps(pricedNode("target", "reserved", "a", "8"), "a,b", "a"), true},
+		{"cap applies and does not admit the target", under("b"), caps(pricedNode("target", "reserved", "a", "8"), "a,b", "a"), false},
+		{"cap does not apply to the target", under("c"), caps(pricedNode("target", "reserved", "a", "8"), "a,b", "a"), true},
+		{"target has no verdict", under("a"), tierNode("target", "reserved", "a"), false},
+		{"target verdict is stale", under("a"), caps(observedNode("target", "reserved", "a", "8", time.Hour), "a", "a"), false},
+		{"target price is malformed", under("a"), caps(pricedNode("target", "reserved", "a", "eight"), "a", "a"), false},
+		{"uncapped mover, target without a verdict", uncapped, tierNode("target", "reserved", "a"), true},
+		{"uncapped mover, target admitting nobody", uncapped, caps(pricedNode("target", "reserved", "a", "8"), "a", ""), true},
+		{"uncapped mover with a blank policy", under(" "), tierNode("target", "reserved", "a"), true},
+		{"unclassified mover, target without a verdict", unclassified, tierNode("target", "reserved", "a"), false},
+		{"unclassified mover, target capping nobody", unclassified, pricedNode("target", "reserved", "a", "8"), false},
+		{"unclassified mover, target admitting its caps", unclassified, caps(pricedNode("target", "reserved", "a", "8"), "a", "a"), false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFixture(t)
 			f.addNode(tierNode("source", "spot", "a"))
 			f.addNode(c.target)
-			pod := tierPod("train", "source", "pg-train", 1, -4, time.Hour)
-			if c.policy != "" {
-				capped(pod, c.policy)
-			}
-			f.placeGroup(t, 1, nil, pod)
+			f.placeGroup(t, 1, nil, c.classify(tierPod("train", "source", "pg-train", 1, -4, time.Hour)))
 
 			// Without admission the move is planned whatever the cap says.
 			onlyPlanOnto(t, f.planUpgrades(liveConf(), nil), "target")
@@ -476,6 +487,23 @@ func TestMoveAdmissionDecidesWhereACappedMoverMayGo(t *testing.T) {
 	}
 }
 
+// Move admission is opt-in: without it an unclassified pod is planned like
+// any other, by rank and by price alike.
+func TestUnclassifiedPodsMoveWhenAdmissionIsOff(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(pricedNode("source", "spot", "a", "24"))
+	f.addNode(pricedNode("target", "reserved", "a", "8"))
+	pod := f.only(t, f.placeGroup(t, 1, nil, tierPod("train", "source", "pg-train", 1, -4, time.Hour)))
+	if capacitycost.Classified(pod.Pod) {
+		t.Fatalf("the pod must carry no spend-cap annotation")
+	}
+	onlyPlanOnto(t, f.planUpgrades(liveConf(), nil), "target")
+	onlyPlanOnto(t, f.planUpgrades(priceAwareConf(), nil), "target")
+	if plans := f.planUpgrades(admissionConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected admission to keep the unclassified pod in place, got %+v", plans)
+	}
+}
+
 // A refused node is passed over, not a veto on the move: the mover goes to
 // the next node that admits it.
 func TestMoveAdmissionPassesOverRefusedTargets(t *testing.T) {
@@ -489,25 +517,30 @@ func TestMoveAdmissionPassesOverRefusedTargets(t *testing.T) {
 }
 
 // Every member of a gang needs a node that admits it; one capped member
-// without one keeps the whole gang where it is.
+// without one, or one unclassified member, keeps the whole gang where it is.
 func TestMoveAdmissionAppliesToEveryGangMember(t *testing.T) {
-	build := func(admitted string) *fixture {
+	build := func(admitted string, classified bool) *fixture {
 		f := newFixture(t)
 		f.addNode(tierNode("spot-1", "spot", "a"))
 		f.addNode(tierNode("spot-2", "spot", "a"))
 		f.addNode(caps(pricedNode("reserved-1", "reserved", "a", "8"), "a", admitted))
 		f.addNode(caps(pricedNode("reserved-2", "reserved", "a", "8"), "a", admitted))
-		f.placeGroup(t, 2, nil,
-			tierPod("w0", "spot-1", "pg-gang", 8, -4, time.Hour),
-			capped(tierPod("w1", "spot-2", "pg-gang", 8, -4, time.Hour), "a"))
+		w0 := tierPod("w0", "spot-1", "pg-gang", 8, -4, time.Hour)
+		if classified {
+			uncapped(w0)
+		}
+		f.placeGroup(t, 2, nil, w0, capped(tierPod("w1", "spot-2", "pg-gang", 8, -4, time.Hour), "a"))
 		return f
 	}
-	if plans := build("").planUpgrades(admissionConf(), nil); len(plans) != 0 {
+	if plans := build("", true).planUpgrades(admissionConf(), nil); len(plans) != 0 {
 		t.Fatalf("expected the gang to stay, got %+v", plans)
 	}
-	plans := build("a").planUpgrades(admissionConf(), nil)
+	plans := build("a", true).planUpgrades(admissionConf(), nil)
 	if len(plans) != 1 || !plans[0].gang || len(plans[0].members) != 2 {
 		t.Fatalf("expected the gang to move, got %+v", plans)
+	}
+	if plans := build("a", false).planUpgrades(admissionConf(), nil); len(plans) != 0 {
+		t.Fatalf("expected the gang with an unclassified member to stay, got %+v", plans)
 	}
 }
 
@@ -758,7 +791,7 @@ func TestOverrunReliefMovesWholeGangsAndTheMemberInNeed(t *testing.T) {
 		f.addNode(caps(pricedNode("ok-b", "spot", "b", "160"), "a", "a"))
 		f.placeGroup(t, 2, nil,
 			capped(tierPod("w0", "over", "pg-gang", 8, -4, time.Hour), "a"),
-			tierPod("w1", "spot-1", "pg-gang", 8, -4, time.Hour))
+			uncapped(tierPod("w1", "spot-1", "pg-gang", 8, -4, time.Hour)))
 		// One admitting node per zone holds one member each: no zone
 		// fits the gang.
 		if plans := f.planUpgrades(reliefConf(), nil); len(plans) != 0 {

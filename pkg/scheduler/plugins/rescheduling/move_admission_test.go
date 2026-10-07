@@ -18,8 +18,9 @@ package rescheduling
 
 // Tests for move admission in the strategies that evict without holding a
 // target: gpuFragmentation (every simulated destination must admit the
-// victim's spend cap) and lowNodeUtilization (a capped victim needs at
-// least one admitting target node).
+// victim) and lowNodeUtilization (a victim needs at least one admitting
+// target node). A victim without the spend-cap annotation is unclassified
+// and admitted nowhere; policy("") classifies it as uncapped.
 
 import (
 	"testing"
@@ -78,8 +79,10 @@ func TestRepackAdmissionDecidesWhereACappedVictimMayGo(t *testing.T) {
 		{"cap does not apply to the destination", policy("c"), verdict(time.Minute, "a,b", "a"), true},
 		{"destination has no verdict", policy("a"), nil, false},
 		{"destination verdict is stale", policy("a"), verdict(time.Hour, "a", "a"), false},
-		{"uncapped victim, destination without a verdict", nil, nil, true},
-		{"uncapped victim, destination admitting nobody", nil, verdict(time.Minute, "a", ""), true},
+		{"uncapped victim, destination without a verdict", policy(""), nil, true},
+		{"uncapped victim, destination admitting nobody", policy(""), verdict(time.Minute, "a", ""), true},
+		{"unclassified victim, destination without a verdict", nil, nil, false},
+		{"unclassified victim, destination admitting its caps", nil, verdict(time.Minute, "a", "a"), false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -120,7 +123,7 @@ func TestRepackAdmissionPassesOverRefusedDestinations(t *testing.T) {
 	fullest := f.addNode(gpuNode("fullest", 8, verdict(time.Minute, "a", "")))
 	fuller := f.addNode(gpuNode("fuller", 8, verdict(time.Minute, "a", "a")))
 	f.placePod(t, source, gpuPod("victim", "source", 1, nil, policy("a"), true), 1, "")
-	f.placePod(t, source, gpuPod("bystander", "source", 1, nil, nil, true), 1, "")
+	f.placePod(t, source, gpuPod("bystander", "source", 1, nil, policy(""), true), 1, "")
 	f.placePod(t, fullest, gpuPod("resident-1", "fullest", 5, nil, nil, true), 1, "")
 	f.placePod(t, fuller, gpuPod("resident-2", "fuller", 4, nil, nil, true), 1, "")
 
@@ -169,7 +172,7 @@ func (*vetoError) Error() string { return "veto" }
 
 // lowNodeUtilization evicts toward the underutilized nodes without naming a
 // destination per pod, so a capped victim is kept only when one of those
-// nodes admits it.
+// nodes admits it, and an unclassified one not at all.
 func TestAdmittedVictimsNeedOneAdmittingTarget(t *testing.T) {
 	now := time.Now()
 	target := func(name string, annotations map[string]string) *NodeUtilization {
@@ -179,7 +182,8 @@ func TestAdmittedVictimsNeedOneAdmittingTarget(t *testing.T) {
 		return api.NewTaskInfo(gpuPod(name, "busy", 1, nil, annotations, true))
 	}
 	victims := []*api.TaskInfo{
-		victim("uncapped", nil),
+		victim("uncapped", policy("")),
+		victim("unclassified", nil),
 		victim("admitted", policy("a")),
 		victim("refused", policy("b")),
 		victim("not-applicable", policy("c")),
@@ -196,7 +200,7 @@ func TestAdmittedVictimsNeedOneAdmittingTarget(t *testing.T) {
 		want    []string
 	}{
 		{"admission off", map[string]interface{}{"thresholds": map[interface{}]interface{}{"cpu": 20}}, targets,
-			[]string{"uncapped", "admitted", "refused", "not-applicable"}},
+			[]string{"uncapped", "unclassified", "admitted", "refused", "not-applicable"}},
 		{"admission on", map[string]interface{}{"moveAdmission": true}, targets,
 			[]string{"uncapped", "admitted", "not-applicable"}},
 		{"admission on, only unpriced targets", map[string]interface{}{"moveAdmission": true}, targets[:1],

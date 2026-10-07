@@ -56,14 +56,17 @@ func priced(price string, age time.Duration, extra ...string) map[string]string 
 	return annotations
 }
 
-// cappedPod builds a pod governed by the given spend-cap policy ("" for
-// none).
+// cappedPod builds a pod the autoscaler has classified under the given
+// spend-cap policy ("" for uncapped: the annotation is present but empty).
 func cappedPod(policy string) *v1.Pod {
-	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}}
-	if policy != "" {
-		pod.Annotations = map[string]string{PodSpendCapPolicyAnnotation: policy}
-	}
+	pod := unclassifiedPod()
+	pod.Annotations = map[string]string{PodSpendCapPolicyAnnotation: policy}
 	return pod
+}
+
+// unclassifiedPod builds a pod without the spend-cap policy annotation.
+func unclassifiedPod() *v1.Pod {
+	return &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"}}
 }
 
 func TestPriceStateTreatsStaleAndMalformedAsUnpriced(t *testing.T) {
@@ -172,10 +175,11 @@ func TestAdmittedForMoveFailsClosedForCappedPods(t *testing.T) {
 		annotations map[string]string
 		want        bool
 	}{
-		// A pod without a policy is not capped: it may go anywhere, priced
-		// or not.
+		// A pod classified without a policy is not capped: it may go
+		// anywhere, priced or not.
 		{"uncapped pod, unpriced node", "", nil, true},
 		{"uncapped pod, node capping others", "", priced("4", time.Minute, SpendCapsAppliedAnnotation, "a,b", SpendCapsAdmittedAnnotation, ""), true},
+		{"uncapped pod with a blank policy", "  ", nil, true},
 		// No fresh verdict, no move.
 		{"capped pod, unpriced node", "a", map[string]string{SpendCapsAdmittedAnnotation: "a", SpendCapsAppliedAnnotation: "a"}, false},
 		{"capped pod, stale price", "a", priced("4", time.Hour, SpendCapsAppliedAnnotation, "a", SpendCapsAdmittedAnnotation, "a"), false},
@@ -203,9 +207,51 @@ func TestAdmittedForMoveFailsClosedForCappedPods(t *testing.T) {
 	if book.AdmittedForMove(cappedPod("a"), nil) {
 		t.Fatalf("a capped pod is not admitted on a node that is not there")
 	}
-	if !book.AdmittedForMove(nil, annotated(nil)) || SpendCapPolicy(nil) != "" {
-		t.Fatalf("a missing pod has no policy to refuse it")
+	if book.AdmittedForMove(nil, annotated(nil)) || SpendCapPolicy(nil) != "" || Classified(nil) {
+		t.Fatalf("a missing pod is unclassified and has no policy")
 	}
+}
+
+func TestAdmittedForMoveRefusesUnclassifiedPods(t *testing.T) {
+	book := NewPriceBook(bookNow, 15*time.Minute)
+	cases := []struct {
+		name        string
+		pod         *v1.Pod
+		annotations map[string]string
+		want        bool
+	}{
+		// Without the annotation the pod has not been classified: whether a
+		// cap governs it is unknown, so it is admitted nowhere.
+		{"unclassified pod, unpriced node", unclassifiedPod(), nil, false},
+		{"unclassified pod, priced node capping nobody", unclassifiedPod(), priced("4", time.Minute), false},
+		{"unclassified pod, priced node admitting everyone", unclassifiedPod(), priced("4", time.Minute, SpendCapsAppliedAnnotation, "a", SpendCapsAdmittedAnnotation, "a"), false},
+		{"pod with other annotations only", withAnnotation(unclassifiedPod(), "example.com/other", "x"), priced("4", time.Minute), false},
+		// The annotation present, even empty, is a classification.
+		{"empty annotation, unpriced node", cappedPod(""), nil, true},
+		{"empty annotation, priced node", cappedPod(""), priced("4", time.Minute), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := book.AdmittedForMove(c.pod, annotated(c.annotations)); got != c.want {
+				t.Fatalf("AdmittedForMove = %v, want %v", got, c.want)
+			}
+			if got := Classified(c.pod); got != c.want {
+				t.Fatalf("Classified = %v, want %v", got, c.want)
+			}
+			if SpendCapPolicy(c.pod) != "" {
+				t.Fatalf("SpendCapPolicy = %q, want none", SpendCapPolicy(c.pod))
+			}
+		})
+	}
+}
+
+// withAnnotation sets one annotation on the pod.
+func withAnnotation(pod *v1.Pod, key, value string) *v1.Pod {
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[key] = value
+	return pod
 }
 
 func TestReliefWindowOpenOnlyWhileTheAutoscalerWaits(t *testing.T) {

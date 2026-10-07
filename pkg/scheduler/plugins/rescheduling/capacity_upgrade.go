@@ -69,7 +69,8 @@ import (
 // spend caps into the strategy (see capacity_upgrade_price.go): priceAware
 // compares priced sources and targets by price instead of rank and asks for
 // a minimum saving, moveAdmission keeps a pod governed by a spend cap off
-// nodes its cap does not accept, and overrunRelief moves capped work off
+// nodes its cap does not accept (and does not move a pod the autoscaler has
+// not classified), and overrunRelief moves capped work off
 // nodes flagged as over their spend cap.
 const CapacityUpgradeStrategy = "capacityUpgrade"
 
@@ -176,7 +177,9 @@ type capacityUpgradeConf struct {
 	MinSavingPercent float64 `mapstructure:"minSavingPercent"`
 	// MoveAdmission refuses a target node to a mover governed by a spend
 	// cap unless the node's published verdict admits that cap at the node's
-	// current price; without a fresh verdict the node is refused.
+	// current price; without a fresh verdict the node is refused. A mover
+	// without the spend-cap annotation is unclassified and refused every
+	// node, so its group is not moved; an empty annotation means uncapped.
 	MoveAdmission bool `mapstructure:"moveAdmission"`
 	// OverrunRelief makes PodGroups with capped members on a node flagged
 	// as over its spend cap, while the autoscaler has not yet acted on it,

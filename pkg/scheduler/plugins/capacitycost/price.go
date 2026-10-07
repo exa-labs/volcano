@@ -29,13 +29,16 @@ package capacitycost
 //     those, the ones that admit it at its current price;
 //   - a node that every tenant's policy rejects is flagged as over its
 //     spend cap, with the time the autoscaler will act on it;
-//   - a pod governed by a spend-cap policy names that policy.
+//   - every pod the autoscaler has classified carries the spend-cap policy
+//     annotation: a policy name when a policy governs it, an empty value
+//     when none does. A pod without the annotation is unclassified.
 //
 // PriceBook reads those annotations as of one instant. It is shared by the
 // capacitycost scorer and the rescheduling strategies so that placement and
 // migration agree on what a node costs and on where a pod may be moved.
 // Binding a pending pod is never restricted by any of this; only voluntary
-// moves of running pods are (AdmittedForMove).
+// moves of running pods are (AdmittedForMove), and an unclassified pod is
+// not moved at all, since what it may cost is unknown.
 
 import (
 	"math"
@@ -70,7 +73,8 @@ const (
 	// moved off it.
 	SpendCapActionAfterAnnotation = "karpenter.sh/spend-cap-action-after"
 	// PodSpendCapPolicyAnnotation names the spend-cap policy governing a
-	// pod. Pods without it are not capped.
+	// pod. The autoscaler sets it on every pod it has classified, empty when
+	// no policy caps the pod; a pod without it is unclassified.
 	PodSpendCapPolicyAnnotation = "karpenter.sh/workload-overlay"
 
 	// DefaultPriceStaleness is how long a published price stays usable.
@@ -156,8 +160,8 @@ func (b *PriceBook) UnitPrice(node *api.NodeInfo, resource v1.ResourceName) (uni
 	return price / offered, true
 }
 
-// SpendCapPolicy is the spend-cap policy governing the pod, or "" when the
-// pod is not capped.
+// SpendCapPolicy is the spend-cap policy governing the pod, or "" when no
+// policy is named (the pod is uncapped or unclassified; see Classified).
 func SpendCapPolicy(pod *v1.Pod) string {
 	if pod == nil {
 		return ""
@@ -165,12 +169,27 @@ func SpendCapPolicy(pod *v1.Pod) string {
 	return strings.TrimSpace(pod.Annotations[PodSpendCapPolicyAnnotation])
 }
 
+// Classified reports whether the autoscaler has stamped the pod with its
+// spend-cap policy annotation, empty or not.
+func Classified(pod *v1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	_, ok := pod.Annotations[PodSpendCapPolicyAnnotation]
+	return ok
+}
+
 // AdmittedForMove reports whether a running pod may be moved onto the node
-// voluntarily. A pod without a spend-cap policy may go anywhere. A capped
+// voluntarily. An unclassified pod (no spend-cap policy annotation) is
+// never admitted: whether a cap governs it is unknown, so it stays put. A
+// pod whose annotation is empty is uncapped and may go anywhere. A capped
 // pod may only go where its policy accepts the node's current price: the
 // node needs a fresh price (no verdict, no move), and the policy must
 // either not apply to the node or be among those that admit it.
 func (b *PriceBook) AdmittedForMove(pod *v1.Pod, node *v1.Node) bool {
+	if !Classified(pod) {
+		return false
+	}
 	policy := SpendCapPolicy(pod)
 	if policy == "" {
 		return true

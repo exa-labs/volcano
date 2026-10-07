@@ -18,17 +18,21 @@ package rescheduling
 
 // Move admission for the strategies that evict a pod so that it restarts
 // somewhere else. A pod governed by a spend cap may only be moved to a node
-// that cap admits at the node's published price (capacitycost.PriceBook);
-// each strategy applies that to the destinations it plans with, behind its
-// own moveAdmission parameter:
+// that cap admits at the node's published price (capacitycost.PriceBook),
+// a pod the node autoscaler has not classified (no spend-cap annotation) is
+// not moved at all, and a pod classified as uncapped (empty annotation) may
+// go anywhere. Each strategy applies that to the destinations it plans with,
+// behind its own moveAdmission parameter:
 //
 //   - capacityUpgrade checks every target it places a mover on (see
 //     capacity_upgrade_price.go);
 //   - gpuFragmentation checks every destination of its simulated repack
 //     (repackAdmission);
-//   - lowNodeUtilization names no destination per pod, so a capped pod is
-//     only evicted when at least one of the underutilized nodes the
-//     strategy evicts toward admits it (admittedVictims).
+//   - lowNodeUtilization names no destination per pod, so a pod is only
+//     evicted when at least one of the underutilized nodes the strategy
+//     evicts toward admits it (admittedVictims).
+//
+// With moveAdmission off (the default), none of this applies.
 //
 // Binding is not restricted: the pod that replaces an evicted one is
 // scheduled like any pending pod.
@@ -45,8 +49,9 @@ import (
 )
 
 // repackAdmission puts move admission in front of gpuFragmentation's fit
-// predicate: a victim governed by a spend cap fails on every destination
-// that cap does not admit. Each refused victim and node is counted once.
+// predicate: a victim fails on every destination its spend cap does not
+// admit, and an unclassified victim on every destination. Each refused
+// victim and node is counted once.
 func repackAdmission(inner func(*api.TaskInfo, *api.NodeInfo) error, conf *gpuFragmentationConf, now time.Time) func(*api.TaskInfo, *api.NodeInfo) error {
 	book := capacitycost.NewPriceBook(now, time.Duration(conf.PriceStalenessSeconds)*time.Second)
 	refused := map[string]bool{}
@@ -76,9 +81,9 @@ type moveAdmissionParams struct {
 
 // admittedVictims applies move admission to a strategy that evicts toward a
 // set of target nodes without assigning each victim one: with moveAdmission
-// set in params, a victim governed by a spend cap is kept only when some
-// target admits it. Params that do not decode evict nothing, since whether
-// admission was asked for is then unknown.
+// set in params, a victim is kept only when some target admits it (never,
+// for an unclassified victim). Params that do not decode evict nothing,
+// since whether admission was asked for is then unknown.
 func admittedVictims(strategy string, victims []*api.TaskInfo, targets []*NodeUtilization, params map[string]interface{}, now time.Time) []*api.TaskInfo {
 	var conf moveAdmissionParams
 	if err := mapstructure.Decode(params, &conf); err != nil {
@@ -92,7 +97,8 @@ func admittedVictims(strategy string, victims []*api.TaskInfo, targets []*NodeUt
 	admitted := make([]*api.TaskInfo, 0, len(victims))
 	for _, victim := range victims {
 		if victim.Pod == nil || !admittedOnAny(book, victim, targets) {
-			klog.V(3).Infof("%s: not evicting %s/%s: no target node admits its spend cap", strategy, victim.Namespace, victim.Name)
+			klog.V(3).Infof("%s: not evicting %s/%s: no target node admits it (spend cap %q, classified %t)", strategy, victim.Namespace, victim.Name,
+				capacitycost.SpendCapPolicy(victim.Pod), capacitycost.Classified(victim.Pod))
 			continue
 		}
 		admitted = append(admitted, victim)

@@ -47,7 +47,9 @@ import (
 // expires) and per-PodGroup eviction caps are the anti-thrash mechanism.
 // With moveAdmission, a pod governed by a spend cap is only repacked onto a
 // node that cap admits at the node's published price (see the capacitycost
-// package); a drain that would need any other destination is not planned.
+// package) and a pod without the spend-cap annotation (unclassified) is not
+// repacked at all; a drain that would need any other destination is not
+// planned.
 const GpuFragmentationStrategy = "gpuFragmentation"
 
 // DefaultGpuFragmentationConf holds the default (dry-run) configuration.
@@ -114,8 +116,9 @@ type gpuFragmentationConf struct {
 	MaxVictimPriority int32 `mapstructure:"maxVictimPriority"`
 	// MoveAdmission refuses a destination to a victim governed by a spend
 	// cap unless the node's published verdict admits that cap at the node's
-	// current price; a node without a fresh verdict is refused. Off by
-	// default.
+	// current price; a node without a fresh verdict is refused. A victim
+	// without the spend-cap annotation is unclassified and refused every
+	// destination; an empty annotation means uncapped. Off by default.
 	MoveAdmission bool `mapstructure:"moveAdmission"`
 	// PriceStalenessSeconds is how long a published price (and the
 	// admission verdict written with it) stays usable.
