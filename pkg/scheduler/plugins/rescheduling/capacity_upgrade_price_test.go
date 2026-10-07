@@ -143,6 +143,29 @@ func TestPricingParamsDefaultOffAndParse(t *testing.T) {
 	}
 }
 
+// With an unlabeledRank below the cheapest tier, a PodGroup of independent
+// pods that all run on unlabeled nodes has no member on any tier of the
+// order: it is not a candidate, with the pricing parameters off or on.
+func TestUpgradeGroupRankedBelowEveryTierIsNotACandidate(t *testing.T) {
+	for name, conf := range map[string]*capacityUpgradeConf{
+		"defaults": liveConf(), "priceAware": priceAwareConf(), "overrunRelief": reliefConf(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.addNode(tierNode("owned-1", "", "a"))
+			f.addNode(tierNode("owned-2", "", "a"))
+			f.addNode(tierNode("reserved-1", "reserved", "a"))
+			f.placeGroup(t, 1, nil,
+				tierPod("p0", "owned-1", "pg-pods", 1, -4, time.Hour),
+				tierPod("p1", "owned-2", "pg-pods", 1, -4, 2*time.Hour))
+			conf.UnlabeledRank = -1
+			if plans := f.planUpgrades(conf, nil); len(plans) != 0 {
+				t.Fatalf("expected no plan, got %+v", plans)
+			}
+		})
+	}
+}
+
 // ---- priceAware ----------------------------------------------------------
 
 // Source and target are both spot, so the rank sees nothing to gain; only

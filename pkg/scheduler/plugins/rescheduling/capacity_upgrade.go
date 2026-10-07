@@ -789,6 +789,11 @@ func capacityUpgradeCandidateFor(
 				pick = member
 			}
 		}
+		if pick == nil {
+			// Every member ranks below the cheapest tier (a negative
+			// unlabeledRank): there is nothing cheaper to move to.
+			return cand, false
+		}
 		cand.members = []*api.TaskInfo{pick}
 		cand.priority = pick.Priority
 		cand.started = podStartTime(pick.Pod)
