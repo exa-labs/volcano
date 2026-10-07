@@ -155,12 +155,9 @@ var victimsFnForGpuFragmentation = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	}
 	gpuRepackPasses.Inc()
 
-	running := make(map[types.UID]*api.TaskInfo, len(tasks))
-	for _, task := range tasks {
-		if task.Pod != nil {
-			running[task.Pod.UID] = task
-		}
-	}
+	// Pods another strategy already plans to move this session are left
+	// out, so a node holding one is not drained (see planned_moves.go).
+	running := runningTasks(tasks, sessionPlannedMoves)
 
 	// Probe and PrePredicate once per victim, not per (victim, candidate,
 	// source): predicate cost otherwise scales O(sources x candidates x
@@ -218,6 +215,7 @@ var victimsFnForGpuFragmentation = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 			klog.V(2).Infof("gpuFragmentation: evicting %s/%s from %s (destination %s fits)",
 				move.victim.Namespace, move.victim.Name, drain.source, move.destination)
 			victims = append(victims, move.victim)
+			sessionPlannedMoves.record(move.victim)
 			evicted++
 		}
 		drain.observe("live", evicted)

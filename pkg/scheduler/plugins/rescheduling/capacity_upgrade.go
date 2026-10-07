@@ -375,7 +375,9 @@ var victimsFnForCapacityUpgradeMoves = func(tasks []*api.TaskInfo) []*api.TaskIn
 		return nil
 	}
 	steps := advanceCapacityUpgradeMoves(idx, Session.Nodes, Session.Jobs, conf, time.Now(), sessionPredicate())
-	return applyMoveSteps(steps, sessionStore{})
+	victims := applyMoveSteps(steps, sessionStore{})
+	sessionPlannedMoves.record(victims...)
+	return victims
 }
 
 // victimsFnForCapacityUpgrade plans and starts new moves; it runs on the
@@ -394,12 +396,10 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	conf := loadCapacityUpgradeConf()
 	capacityUpgradePasses.Inc()
 
-	running := make(map[types.UID]*api.TaskInfo, len(tasks))
-	for _, task := range tasks {
-		if task.Pod != nil {
-			running[task.Pod.UID] = task
-		}
-	}
+	// Pods another strategy already plans to move this session are left
+	// out, so their PodGroups are not candidates and no move counts on
+	// displacing them (see planned_moves.go).
+	running := runningTasks(tasks, sessionPlannedMoves)
 
 	idx := capacityUpgradeSessionIndex()
 	predicate := sessionPredicate()
@@ -417,6 +417,10 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 		if err := startCapacityUpgradeMove(plan, idx, conf, sessionStore{}); err != nil {
 			klog.Errorf("capacityUpgrade: not moving %s %s/%s: %v", plan.kind(), pg.Namespace, pg.Name, err)
 			continue
+		}
+		sessionPlannedMoves.record(plan.members...)
+		for _, pods := range plan.displaced {
+			sessionPlannedMoves.record(pods...)
 		}
 		klog.V(2).Infof("capacityUpgrade: holding %v for %s %s/%s (%d pods, %v GPUs) %s -> %s, displacing %d pods",
 			plan.nodeNames(), plan.kind(), pg.Namespace, pg.Name, len(plan.members), plan.gpus,
