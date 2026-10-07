@@ -64,6 +64,14 @@ import (
 // GPUs and cannot be pipelined back onto the capacity its predecessor is
 // still releasing. Gangs (PodGroups with minMember > 1) move as a whole; a
 // PodGroup of independent pods moves one pod per pass.
+//
+// Three opt-in parameters bring the node autoscaler's published prices and
+// spend caps into the strategy (see capacity_upgrade_price.go): priceAware
+// compares priced sources and targets by price instead of rank and asks for
+// a minimum saving, moveAdmission keeps a pod governed by a spend cap off
+// nodes its cap does not accept (and does not move a pod the autoscaler has
+// not classified), and overrunRelief moves capped work off
+// nodes flagged as over their spend cap.
 const CapacityUpgradeStrategy = "capacityUpgrade"
 
 // DefaultCapacityUpgradeConf holds the default (dry-run) configuration.
@@ -84,6 +92,13 @@ var DefaultCapacityUpgradeConf = map[string]interface{}{
 	"maxGangMoves":      2,
 	"maxMovesPerGroup":  2,
 	"maxVictimPriority": -1,
+
+	// Published prices and spend caps, all off by default.
+	"priceAware":            false,
+	"minSavingPercent":      10,
+	"moveAdmission":         false,
+	"overrunRelief":         false,
+	"priceStalenessSeconds": 900,
 }
 
 // CapacityUpgradeKillSwitchEnv disables the strategy entirely when set to
@@ -151,6 +166,30 @@ type capacityUpgradeConf struct {
 	// default), a move only ever takes idle GPUs and restarts nothing but
 	// the mover.
 	MaxDisplacedPriority *int32 `mapstructure:"maxDisplacedPriority"`
+	// PriceAware decides what is cheaper by the nodes' published prices
+	// wherever a group's source nodes and a target are all priced: the
+	// group moves only when the placement cuts its hourly cost by at least
+	// MinSavingPercent. Unpriced sources or targets keep the rank rule.
+	PriceAware bool `mapstructure:"priceAware"`
+	// MinSavingPercent is the smallest cost reduction, in percent of the
+	// group's current hourly cost, worth a price-based move. It is the
+	// hysteresis that keeps price noise from moving work back and forth.
+	MinSavingPercent float64 `mapstructure:"minSavingPercent"`
+	// MoveAdmission refuses a target node to a mover governed by a spend
+	// cap unless the node's published verdict admits that cap at the node's
+	// current price; without a fresh verdict the node is refused. A mover
+	// without the spend-cap annotation is unclassified and refused every
+	// node, so its group is not moved; an empty annotation means uncapped.
+	MoveAdmission bool `mapstructure:"moveAdmission"`
+	// OverrunRelief makes PodGroups with capped members on a node flagged
+	// as over its spend cap, while the autoscaler has not yet acted on it,
+	// the first candidates of a pass, and lets them move to any idle
+	// capacity that admits them, whatever its rank or price. Such a move
+	// never evicts anyone to make room. Implies MoveAdmission.
+	OverrunRelief bool `mapstructure:"overrunRelief"`
+	// PriceStalenessSeconds is how long a published price (and the
+	// admission verdict written with it) stays usable.
+	PriceStalenessSeconds int `mapstructure:"priceStalenessSeconds"`
 }
 
 // displaces reports whether pods of the given priority are room to be made
@@ -224,6 +263,8 @@ type capacityUpgradePlan struct {
 	// moves is the mover's move count including this move.
 	moves int
 	at    time.Time
+	// relief marks a move off a node that is over its spend cap.
+	relief bool
 }
 
 // displacedCount is the number of pods the move evicts to make room.
@@ -256,6 +297,9 @@ func (p capacityUpgradePlan) observe(mode string) {
 	capacityUpgradeMoves.WithLabelValues(p.target, p.kind(), mode).Inc()
 	capacityUpgradePods.WithLabelValues(p.target, p.kind(), mode).Add(float64(len(p.members)))
 	capacityUpgradeGpus.WithLabelValues(p.target, p.kind(), mode).Add(p.gpus)
+	if p.relief {
+		capacityUpgradeOverrunRelief.WithLabelValues(mode, p.kind()).Inc()
+	}
 }
 
 // capacityUpgradePredicate evaluates a member against a target node; gang
@@ -331,7 +375,9 @@ var victimsFnForCapacityUpgradeMoves = func(tasks []*api.TaskInfo) []*api.TaskIn
 		return nil
 	}
 	steps := advanceCapacityUpgradeMoves(idx, Session.Nodes, Session.Jobs, conf, time.Now(), sessionPredicate())
-	return applyMoveSteps(steps, sessionStore{})
+	victims := applyMoveSteps(steps, sessionStore{})
+	sessionPlannedMoves.record(victims...)
+	return victims
 }
 
 // victimsFnForCapacityUpgrade plans and starts new moves; it runs on the
@@ -350,12 +396,10 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	conf := loadCapacityUpgradeConf()
 	capacityUpgradePasses.Inc()
 
-	running := make(map[types.UID]*api.TaskInfo, len(tasks))
-	for _, task := range tasks {
-		if task.Pod != nil {
-			running[task.Pod.UID] = task
-		}
-	}
+	// Pods another strategy already plans to move this session are left
+	// out, so their PodGroups are not candidates and no move counts on
+	// displacing them (see planned_moves.go).
+	running := runningTasks(tasks, sessionPlannedMoves)
 
 	idx := capacityUpgradeSessionIndex()
 	predicate := sessionPredicate()
@@ -373,6 +417,10 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 		if err := startCapacityUpgradeMove(plan, idx, conf, sessionStore{}); err != nil {
 			klog.Errorf("capacityUpgrade: not moving %s %s/%s: %v", plan.kind(), pg.Namespace, pg.Name, err)
 			continue
+		}
+		sessionPlannedMoves.record(plan.members...)
+		for _, pods := range plan.displaced {
+			sessionPlannedMoves.record(pods...)
 		}
 		klog.V(2).Infof("capacityUpgrade: holding %v for %s %s/%s (%d pods, %v GPUs) %s -> %s, displacing %d pods",
 			plan.nodeNames(), plan.kind(), pg.Namespace, pg.Name, len(plan.members), plan.gpus,
@@ -409,7 +457,7 @@ func startCapacityUpgradeMove(plan capacityUpgradePlan, idx *capacityUpgradeInde
 		return capacityHold{
 			Move: id, Group: group, Nodes: names, Movers: movers, Displaced: displaced, Identity: plan.identity,
 			Gpus: plan.nodes[name], Priority: plan.priority, Moves: plan.moves,
-			Target: plan.target, From: plan.from, Until: until,
+			Target: plan.target, From: plan.from, Until: until, Reason: plan.reason(),
 		}
 	}
 	written := make([]string, 0, len(names))
@@ -462,6 +510,14 @@ func stampCapacityUpgradeMover(plan capacityUpgradePlan, store capacityUpgradeSt
 // same capacity or count on displacing the same pod. Target nodes that
 // pending demand would reclaim from the group are passed over (demand may
 // be nil).
+//
+// With overrunRelief, groups on nodes over their spend cap come first and
+// may take any idle capacity that admits them. With priceAware, a group
+// whose source nodes are all priced is first offered the priced nodes that
+// cost no more per GPU than its dearest source, cheapest first, and moves
+// when the placement saves enough; the rank tiers then only offer it nodes
+// without a price. With moveAdmission (or overrunRelief), no member is
+// placed on a node its spend cap does not admit.
 func planCapacityUpgrades(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -474,8 +530,12 @@ func planCapacityUpgrades(
 ) []capacityUpgradePlan {
 	gpu := v1.ResourceName(conf.GpuResource)
 	ranker := conf.ranker()
-	if ranker.MaxRank() <= 0 {
+	if ranker.MaxRank() <= 0 && !conf.PriceAware && !conf.OverrunRelief {
 		return nil
+	}
+	pricing := newUpgradePricing(nodes, conf, now, gpu)
+	if conf.admitsMoves() {
+		predicate = admittedForMove(predicate, pricing.book, true)
 	}
 
 	// Target nodes per rank, restricted to labelled GPU nodes.
@@ -496,12 +556,16 @@ func planCapacityUpgrades(
 
 	candidates := make([]capacityUpgradeCandidate, 0)
 	for _, job := range jobs {
-		cand, ok := capacityUpgradeCandidateFor(job, nodes, running, conf, ranker, gpu, idx, now)
+		cand, ok := capacityUpgradeCandidateFor(job, nodes, running, conf, ranker, gpu, idx, now, pricing)
 		if ok {
 			candidates = append(candidates, cand)
 		}
 	}
+	pricing.observeOverrun(nodes)
 	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].relief != candidates[j].relief {
+			return candidates[i].relief
+		}
 		if candidates[i].priority != candidates[j].priority {
 			return candidates[i].priority > candidates[j].priority
 		}
@@ -522,18 +586,32 @@ func planCapacityUpgrades(
 			continue
 		}
 		var placement *capacityUpgradePlacement
-		targetRank := 0
+		fits := ""
 		guard := newDemandGuard(demand, cand)
-		for rank := 0; rank < cand.maxRank; rank++ {
+		relief := false
+		if cand.relief {
+			placement = pricing.relieve(cand, ledger, predicate, guard)
+			relief, fits = placement != nil, "admitted idle capacity"
+			if !relief {
+				capacityUpgradeOverrunRelief.WithLabelValues("no_capacity", cand.kind()).Inc()
+				klog.V(3).Infof("capacityUpgrade: %s/%s is on a node over its spend cap, but no idle capacity admits it",
+					cand.job.Namespace, cand.job.Name)
+			}
+		}
+		if placement == nil && cand.priced {
+			placement, fits = pricing.cheaper(cand, ledger, predicate, guard), "cheaper priced nodes"
+		}
+		for rank := 0; placement == nil && rank < cand.maxRank; rank++ {
 			targets := byRank[rank]
+			if cand.priced {
+				// Priced targets were judged on price above.
+				targets = pricing.unpriced(targets)
+			}
 			if len(targets) == 0 {
 				continue
 			}
 			placement = simulateUpgrade(targets, cand, conf, gpu, ledger, predicate, guard)
-			if placement != nil {
-				targetRank = rank
-				break
-			}
+			fits = fmt.Sprintf("rank %d", rank)
 		}
 		if placement == nil {
 			if guard != nil && guard.skipped > 0 {
@@ -557,8 +635,9 @@ func planCapacityUpgrades(
 			identity:  cand.identity,
 			moves:     cand.moves + 1,
 			at:        now,
+			relief:    relief,
 		}
-		klog.V(4).Infof("capacityUpgrade: %s/%s fits rank %d", cand.job.Namespace, cand.job.Name, targetRank)
+		klog.V(4).Infof("capacityUpgrade: %s/%s fits %s", cand.job.Namespace, cand.job.Name, fits)
 		plans = append(plans, plan)
 		if cand.gang {
 			gangs++
@@ -589,6 +668,24 @@ type capacityUpgradeCandidate struct {
 	identity map[string]string
 	// moves is the group's move count so far.
 	moves int
+	// priced is true when prices decide what is cheaper for this group:
+	// priceAware is on and every member's node has a fresh price.
+	priced bool
+	// cost is the group's hourly cost on its current nodes and maxUnit the
+	// highest price per GPU among them; both are set when priced.
+	cost, maxUnit float64
+	// relief is true when a member governed by a spend cap runs on a node
+	// over that cap that the autoscaler has not acted on yet.
+	relief bool
+	// idleOnly keeps the placement to idle GPUs: nothing is displaced.
+	idleOnly bool
+}
+
+func (c capacityUpgradeCandidate) kind() string {
+	if c.gang {
+		return "gang"
+	}
+	return "pod"
 }
 
 // capacityUpgradeCandidateFor decides whether a job may move and gathers
@@ -596,12 +693,14 @@ type capacityUpgradeCandidate struct {
 // old enough, at or below the priority ceiling and above the displaced
 // one (a pod moves have to make room over is never moved itself), not opted
 // out and not disruption-protected (unless the protection is the owner's
-// lifecycle protection); at least one must run above the cheapest tier; the
+// lifecycle protection); at least one must run above the cheapest tier (or,
+// with priceAware, every member on a priced node; or, with overrunRelief,
+// a capped member on a node over its spend cap); the
 // group's
 // cooldown must have expired, its budget must remain, no move for it may be
 // in flight and its members must share an identity. A gang (minMember > 1)
 // moves whole; a PodGroup of independent pods moves its single most
-// expensive, oldest member.
+// expensive, oldest member (first one in need of relief, if any).
 func capacityUpgradeCandidateFor(
 	job *api.JobInfo,
 	nodes map[string]*api.NodeInfo,
@@ -611,6 +710,7 @@ func capacityUpgradeCandidateFor(
 	gpu v1.ResourceName,
 	idx *capacityUpgradeIndex,
 	now time.Time,
+	pricing *upgradePricing,
 ) (capacityUpgradeCandidate, bool) {
 	cand := capacityUpgradeCandidate{job: job}
 	if job.PodGroup == nil || len(job.Tasks) == 0 {
@@ -674,22 +774,32 @@ func capacityUpgradeCandidateFor(
 		}
 		cand.members = append(cand.members, sessionTask)
 	}
-	if len(cand.members) == 0 || cand.maxRank == 0 {
+	if len(cand.members) == 0 {
 		return cand, false
 	}
 	sort.Slice(cand.members, func(i, j int) bool { return cand.members[i].Name < cand.members[j].Name })
 	cand.gang = job.PodGroup.Spec.MinMember > 1
 	if !cand.gang && len(cand.members) > 1 {
 		// Independent pods sharing a PodGroup: move one at a time, the
-		// oldest of those on the most expensive tier.
-		var pick *api.TaskInfo
+		// oldest of those on the most expensive tier, unless relief or
+		// prices single out another.
+		pick, singled := pricing.single(cand.members)
+		if singled {
+			cand.maxRank = ranks[pick.Pod.UID]
+			cand.from = nodes[pick.NodeName].Node.Labels[conf.NodeLabelKey]
+		}
 		for _, member := range cand.members {
-			if ranks[member.Pod.UID] != cand.maxRank {
+			if singled || ranks[member.Pod.UID] != cand.maxRank {
 				continue
 			}
 			if pick == nil || podStartTime(member.Pod).Before(podStartTime(pick.Pod)) {
 				pick = member
 			}
+		}
+		if pick == nil {
+			// Every member ranks below the cheapest tier (a negative
+			// unlabeledRank): there is nothing cheaper to move to.
+			return cand, false
 		}
 		cand.members = []*api.TaskInfo{pick}
 		cand.priority = pick.Priority
@@ -697,6 +807,10 @@ func capacityUpgradeCandidateFor(
 	}
 	for _, member := range cand.members {
 		cand.gpus += taskGpu(member, gpu)
+	}
+	pricing.measure(&cand)
+	if cand.maxRank == 0 && !cand.priced && !cand.relief {
+		return cand, false
 	}
 	identity, ok := groupIdentity(cand.members, conf.identityLabels())
 	if !ok {
@@ -975,7 +1089,7 @@ func simulateUpgradeInZone(
 		}
 		queue := make([]*api.TaskInfo, 0, len(ledger.displaceable[node.Name]))
 		for _, pod := range ledger.displaceable[node.Name] {
-			if !ledger.taken[pod.Pod.UID] {
+			if !cand.idleOnly && !ledger.taken[pod.Pod.UID] {
 				queue = append(queue, pod)
 			}
 		}

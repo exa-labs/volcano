@@ -109,6 +109,9 @@ type capacityHold struct {
 	Until string `json:"until"`
 	// EvictedAt is set once the movers have been evicted (placing phase).
 	EvictedAt string `json:"evictedAt,omitempty"`
+	// Reason is set for moves that are not plain upgrades: overrun_relief
+	// for a move off a node over its spend cap.
+	Reason string `json:"reason,omitempty"`
 }
 
 // capacityDrain marks a node whose GPUs a move is vacating.
@@ -542,6 +545,12 @@ func advanceCapacityUpgradeMoves(
 	gpu := v1.ResourceName(conf.GpuResource)
 	ttl := time.Duration(conf.HoldTTLSeconds) * time.Second
 	steps := make([]moveStep, 0)
+	book := conf.priceBook(now)
+	if conf.admitsMoves() {
+		// Prices and verdicts may have changed since the move was planned:
+		// the movers are only evicted while their targets still admit them.
+		predicate = admittedForMove(predicate, book, false)
+	}
 
 	for node, reason := range idx.malformed {
 		step := moveStep{id: node, outcome: "malformed", reason: reason, nodes: map[string]nodeState{}}
@@ -659,6 +668,17 @@ func advanceCapacityUpgradeMoves(
 			// The movers are gone without this move evicting them (the
 			// job finished or was deleted); nothing can claim the hold.
 			step.outcome, step.reason = "abandoned", "movers gone before eviction"
+			for _, node := range idx.removeMove(id) {
+				step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
+			}
+			steps = append(steps, step)
+			continue
+		}
+		if hold.Reason == overrunReliefReason && !anyReliefDue(movers, nodes, book) {
+			// The overrun ended (the price fell, the tenants changed) or
+			// its window closed, after which the node is the autoscaler's
+			// to act on: either way the movers stay where they are.
+			step.outcome, step.reason = "abandoned", "source no longer awaiting overrun relief"
 			for _, node := range idx.removeMove(id) {
 				step.nodes[node] = nodeState{holds: idx.holds[node], drains: idx.drains[node]}
 			}
@@ -932,8 +952,14 @@ func applyMoveSteps(steps []moveStep, store capacityUpgradeStore) []*api.TaskInf
 			capacityUpgradePods.WithLabelValues(step.hold.Target, step.hold.kind(), "moved").Add(float64(len(step.hold.Movers)))
 			capacityUpgradeGpus.WithLabelValues(step.hold.Target, step.hold.kind(), "moved").Add(step.gpus)
 			capacityUpgradeMoves.WithLabelValues(step.hold.Target, step.hold.kind(), "moved").Inc()
+			if step.hold.Reason == overrunReliefReason {
+				capacityUpgradeOverrunRelief.WithLabelValues("moved", step.hold.kind()).Inc()
+			}
 		case "expired", "abandoned":
 			capacityUpgradeHoldOutcomes.WithLabelValues(step.outcome, step.hold.kind()).Inc()
+			if step.hold.Reason == overrunReliefReason {
+				capacityUpgradeOverrunRelief.WithLabelValues(step.outcome, step.hold.kind()).Inc()
+			}
 		case "malformed":
 			capacityUpgradeHoldOutcomes.WithLabelValues(step.outcome, "node").Inc()
 		}

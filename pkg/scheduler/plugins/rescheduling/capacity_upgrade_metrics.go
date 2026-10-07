@@ -62,7 +62,7 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: "volcano",
 			Name:      "capacity_upgrade_targets_skipped_total",
-			Help:      "Target nodes a candidate was not placed on, by reason: pending_demand (a pending task outranking the mover could reclaim the node through preempt). Counted once per candidate and node per pass.",
+			Help:      "Target nodes a candidate was not placed on, by reason: pending_demand (a pending task outranking the mover could reclaim the node through preempt, counted once per candidate and node per pass) or move_admission (the mover's spend cap does not admit the node, counted once per mover pod and node per pass).",
 		}, []string{"reason"},
 	)
 
@@ -96,5 +96,21 @@ var (
 			Name:      "capacity_upgrade_hold_outcomes_total",
 			Help:      "Finished capacity-upgrade moves by outcome (claimed, expired, abandoned) and kind; malformed counts node annotations that were cleared.",
 		}, []string{"outcome", "kind"},
+	)
+
+	capacityUpgradeOverrunRelief = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: "volcano",
+			Name:      "capacity_upgrade_overrun_relief_total",
+			Help:      "PodGroups on nodes over their spend cap considered for relief, by outcome and kind: dry_run (move planned only), held (move started), moved (successor bound onto admitted capacity), expired or abandoned (move released unfinished), no_capacity (no idle capacity admits the group; counted every pass).",
+		}, []string{"outcome", "kind"},
+	)
+
+	capacityUpgradeOverrunNodes = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: "volcano",
+			Name:      "capacity_upgrade_overrun_nodes",
+			Help:      "Nodes flagged as over their spend cap at the last pass, by relief window: open (the strategy may still move their tenants) or closed (left to the node autoscaler).",
+		}, []string{"window"},
 	)
 )

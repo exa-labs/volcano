@@ -168,6 +168,7 @@ func sumNodeOrderFns(fns []api.NodeOrderFn) api.NodeOrderFn {
 func (rp *reschedulingPlugin) OnSessionClose(ssn *framework.Session) {
 	Session = nil
 	sessionCapacityUpgrade = nil
+	sessionPlannedMoves = plannedMoves{}
 	for k := range RegisteredStrategyConfigs {
 		delete(RegisteredStrategyConfigs, k)
 	}
