@@ -89,8 +89,9 @@ type capDecision struct {
 // line renders the decision as one log line.
 func (d capDecision) line(mode string) string {
 	subject, target, outcome, victims := d.describe()
-	return fmt.Sprintf("evictionCost gate: strategy=%s mode=%s %s target=%s outcome=%s unit=%s gated=%.0f total=%.0f cap=%.0f jobs=%s",
-		d.strategy, mode, subject, target, outcome, d.unit, d.price.gated, d.price.total, d.limit, d.book.Describe(victims))
+	return fmt.Sprintf("evictionCost gate: strategy=%s mode=%s %s target=%s outcome=%s unit=%s gated=%s total=%s cap=%s jobs=%s",
+		d.strategy, mode, subject, target, outcome, d.unit, evictioncost.FormatGPUSeconds(d.price.gated), evictioncost.FormatGPUSeconds(d.price.total),
+		evictioncost.FormatGPUSeconds(d.limit), d.book.Describe(victims))
 }
 
 // log writes one decision the cap caught at V(2): once per over-cap drain

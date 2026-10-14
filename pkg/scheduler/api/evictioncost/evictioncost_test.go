@@ -265,4 +265,13 @@ func TestShadowListsVictims(t *testing.T) {
 	if line := book.ShadowLine("preempt", "topology_aware", preemptor, r); !strings.Contains(line, " baselineNode=n1 costAwareNode=n2 ") {
 		t.Fatalf("topology-aware line lacks the nodes: %q", line)
 	}
+	// Fractional costs print exactly, so a different decision never shows
+	// equal numbers.
+	r.CostAware.GPUSeconds = 7260.25
+	if line := book.ShadowLine("preempt", "normal", preemptor, r); !strings.Contains(line, " baseline=7260 costAware=7260.25 ") {
+		t.Fatalf("fractional cost rounded: %q", line)
+	}
+	if got := FormatPrice("ns/x", Price{GPUSeconds: 330.3}); got != "ns/x(330.3, default)" {
+		t.Fatalf("FormatPrice: %q", got)
+	}
 }

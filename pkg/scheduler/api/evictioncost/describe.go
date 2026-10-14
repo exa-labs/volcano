@@ -22,6 +22,7 @@ package evictioncost
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -79,7 +80,13 @@ func FormatPrice(name string, price Price) string {
 	if price.Announced {
 		source = "announced"
 	}
-	return fmt.Sprintf("%s(%.0f, %s)", name, price.GPUSeconds, source)
+	return fmt.Sprintf("%s(%s, %s)", name, FormatGPUSeconds(price.GPUSeconds), source)
+}
+
+// FormatGPUSeconds renders a cost or cap exactly, so two values the gate or
+// a shadow comparison tells apart never print alike: 7260, 330.3.
+func FormatGPUSeconds(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 // Describe lists each distinct job among the victims once, first seen
@@ -101,8 +108,8 @@ func (b *Book) Describe(victims []*api.TaskInfo) string {
 // ShadowLine is the log line of one shadow comparison.
 func (b *Book) ShadowLine(action, strategy string, preemptor *api.TaskInfo, r ShadowResult) string {
 	var line strings.Builder
-	fmt.Fprintf(&line, "evictionCost shadow: action=%s strategy=%s preemptor=%s outcome=%s baseline=%.0f costAware=%.0f",
-		action, strategy, b.JobName(preemptor), r.Outcome(), r.Baseline.GPUSeconds, r.CostAware.GPUSeconds)
+	fmt.Fprintf(&line, "evictionCost shadow: action=%s strategy=%s preemptor=%s outcome=%s baseline=%s costAware=%s",
+		action, strategy, b.JobName(preemptor), r.Outcome(), FormatGPUSeconds(r.Baseline.GPUSeconds), FormatGPUSeconds(r.CostAware.GPUSeconds))
 	if r.Baseline.Node != "" || r.CostAware.Node != "" {
 		fmt.Fprintf(&line, " baselineNode=%s costAwareNode=%s", r.Baseline.Node, r.CostAware.Node)
 	}
