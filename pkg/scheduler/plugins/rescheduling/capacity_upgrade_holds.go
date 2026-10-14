@@ -666,7 +666,7 @@ func advanceCapacityUpgradeMoves(
 			continue
 		}
 		if !targetsIdle(idx, move, nodes, movers, gpu) {
-			if displaced := displacedToEvict(idx, move, nodes, jobs, movers, gpu); len(displaced) > 0 && moversFit(move, nodes, movers, predicate) {
+			if displaced := displacedToEvict(idx, move, nodes, jobs, movers, gpu, displacedCost(conf, jobs, now)); len(displaced) > 0 && moversFit(move, nodes, movers, predicate) {
 				step.displaced = displaced
 				step.outcome, step.reason = "displacing", "making room on held capacity"
 				steps = append(steps, step)
@@ -829,7 +829,8 @@ func moversGpu(movers []*api.TaskInfo, node string, gpu v1.ResourceName) float64
 // from elsewhere and they stay. On any other node the fragment's displaced
 // pods that are still running are evicted, by name, until the node is
 // covered. The tasks returned are the jobs' (the session's), not the
-// node-local clones.
+// node-local clones. A non-nil cost evicts the cheapest first; otherwise
+// pods go by name.
 func displacedToEvict(
 	idx *capacityUpgradeIndex,
 	move *capacityUpgradeMove,
@@ -837,6 +838,7 @@ func displacedToEvict(
 	jobs map[api.JobID]*api.JobInfo,
 	movers []*api.TaskInfo,
 	gpu v1.ResourceName,
+	cost func(*api.TaskInfo) float64,
 ) []*api.TaskInfo {
 	evict := make([]*api.TaskInfo, 0)
 	for _, name := range move.hold.Nodes {
@@ -858,7 +860,14 @@ func displacedToEvict(
 				running = append(running, job.Tasks[task.UID])
 			}
 		}
-		sort.Slice(running, func(i, j int) bool { return running[i].Name < running[j].Name })
+		sort.Slice(running, func(i, j int) bool {
+			if cost != nil {
+				if ci, cj := cost(running[i]), cost(running[j]); ci != cj {
+					return ci < cj
+				}
+			}
+			return running[i].Name < running[j].Name
+		})
 		for _, task := range running {
 			if short <= 0 {
 				break

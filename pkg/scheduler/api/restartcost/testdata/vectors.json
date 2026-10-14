@@ -1,0 +1,309 @@
+{
+  "description": "Restart cost in GPU-seconds. Times are Unix seconds; null is unknown. Shared by every implementation of the cost function.",
+  "vectors": [
+    {
+      "name": "unannounced, still starting",
+      "now": 1791918592,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": null,
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": null,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 1040
+    },
+    {
+      "name": "unannounced, running an hour",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": null,
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": null,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 29040
+    },
+    {
+      "name": "clock before start",
+      "now": 1791918442,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": null,
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": null,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 240
+    },
+    {
+      "name": "productive now exactly",
+      "now": 1791919092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": null,
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": 1791919092,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 5040
+    },
+    {
+      "name": "checkpoint resume after productive",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": "checkpoint",
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": 1791919092,
+        "last_checkpoint": 1791921492
+      },
+      "expected_gpu_seconds": 9840
+    },
+    {
+      "name": "checkpoint inferred from last checkpoint",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": null,
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": 1791919092,
+        "last_checkpoint": 1791921492
+      },
+      "expected_gpu_seconds": 9840
+    },
+    {
+      "name": "checkpoint declared, none taken yet",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": "checkpoint",
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": 1791919092,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 29040
+    },
+    {
+      "name": "checkpoint older than productive",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": "checkpoint",
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": 1791919092,
+        "last_checkpoint": 1791918592
+      },
+      "expected_gpu_seconds": 29040
+    },
+    {
+      "name": "scratch declared ignores checkpoint",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": "scratch",
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": 1791919092,
+        "last_checkpoint": 1791921492
+      },
+      "expected_gpu_seconds": 29040
+    },
+    {
+      "name": "stateless declared",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": "stateless",
+        "startup_s": 120,
+        "termination_s": null,
+        "productive_at": null,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 1200
+    },
+    {
+      "name": "declared startup, not yet productive",
+      "now": 1791919092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": null,
+        "startup_s": 900,
+        "termination_s": null,
+        "productive_at": null,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 5040
+    },
+    {
+      "name": "measured startup beats declared",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": null,
+        "startup_s": 900,
+        "termination_s": null,
+        "productive_at": 1791918692,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 29040
+    },
+    {
+      "name": "termination capped by grace",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 120,
+        "resume": null,
+        "startup_s": null,
+        "termination_s": 600,
+        "productive_at": null,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 29760
+    },
+    {
+      "name": "termination below grace",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 8,
+        "started_at": 1791918492,
+        "grace_s": 120,
+        "resume": "stateless",
+        "startup_s": null,
+        "termination_s": 10,
+        "productive_at": null,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 2480
+    },
+    {
+      "name": "gang of 64 GPUs on a checkpoint",
+      "now": 1792004892,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 64,
+        "started_at": 1791918492,
+        "grace_s": 300,
+        "resume": "checkpoint",
+        "startup_s": 1200,
+        "termination_s": 120,
+        "productive_at": 1791919992,
+        "last_checkpoint": 1792004492
+      },
+      "expected_gpu_seconds": 129280
+    },
+    {
+      "name": "no GPUs",
+      "now": 1791922092,
+      "defaults": {
+        "startup_s": 300,
+        "termination_s": 30
+      },
+      "input": {
+        "gpus": 0,
+        "started_at": 1791918492,
+        "grace_s": 30,
+        "resume": null,
+        "startup_s": null,
+        "termination_s": null,
+        "productive_at": null,
+        "last_checkpoint": null
+      },
+      "expected_gpu_seconds": 0
+    }
+  ]
+}

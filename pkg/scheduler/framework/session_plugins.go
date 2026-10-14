@@ -1091,6 +1091,16 @@ func (ssn *Session) HyperNodeGradientForSubJobFn(subJob *api.SubJobInfo, hyperNo
 // if victims has same job id, sorted by !ssn.TaskOrderFn
 // if victims has different job id, sorted by !ssn.JobOrderFn
 func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor *api.TaskInfo) *util.PriorityQueue {
+	return ssn.BuildVictimsPriorityQueueByCost(victims, preemptor, nil)
+}
+
+// BuildVictimsPriorityQueueByCost orders victims like BuildVictimsPriorityQueue
+// except that, given a cost, victims of different jobs that are both in the
+// session go lower task priority first, then cheaper first, before the
+// queue and job order. Victims of one job share its cost and keep task order.
+// The cost only orders victims: JobOrderFn, which also orders allocation, is
+// untouched.
+func (ssn *Session) BuildVictimsPriorityQueueByCost(victims []*api.TaskInfo, preemptor *api.TaskInfo, cost func(*api.TaskInfo) float64) *util.PriorityQueue {
 	victimsQueue := util.NewPriorityQueue(func(l, r interface{}) bool {
 		lv := l.(*api.TaskInfo)
 		rv := r.(*api.TaskInfo)
@@ -1121,6 +1131,15 @@ func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor
 			return !lvJobFound
 		}
 
+		if cost != nil {
+			if lv.Priority != rv.Priority {
+				return lv.Priority < rv.Priority
+			}
+			if lc, rc := cost(lv), cost(rv); lc != rc {
+				return lc < rc
+			}
+		}
+
 		if !preemptorJobFound {
 			return !ssn.JobOrderFn(lvJob, rvJob)
 		}
@@ -1135,6 +1154,16 @@ func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor
 		victimsQueue.Push(victim)
 	}
 	return victimsQueue
+}
+
+// VictimsInOrder returns the victims in the order BuildVictimsPriorityQueueByCost pops them.
+func (ssn *Session) VictimsInOrder(victims []*api.TaskInfo, preemptor *api.TaskInfo, cost func(*api.TaskInfo) float64) []*api.TaskInfo {
+	queue := ssn.BuildVictimsPriorityQueueByCost(victims, preemptor, cost)
+	ordered := make([]*api.TaskInfo, 0, len(victims))
+	for !queue.Empty() {
+		ordered = append(ordered, queue.Pop().(*api.TaskInfo))
+	}
+	return ordered
 }
 
 // RegisterBinder registers the passed binder to the cache, the binder type can be such as pre-binder, post-binder

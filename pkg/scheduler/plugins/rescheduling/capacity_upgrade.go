@@ -151,6 +151,12 @@ type capacityUpgradeConf struct {
 	// default), a move only ever takes idle GPUs and restarts nothing but
 	// the mover.
 	MaxDisplacedPriority *int32 `mapstructure:"maxDisplacedPriority"`
+	// MaxRestartGpuSeconds, when set, skips a move whose restart cost (the
+	// mover's gang plus every job it displaces) exceeds it, and evicts the
+	// cheapest displaced pods first (see restartCostGate). Unset (0), moves
+	// are planned and carried out as without it.
+	MaxRestartGpuSeconds float64         `mapstructure:"maxRestartGpuSeconds"`
+	RestartCost          restartCostGate `mapstructure:",squash"`
 }
 
 // displaces reports whether pods of the given priority are room to be made
@@ -170,7 +176,7 @@ func (c *capacityUpgradeConf) shielded(pod *v1.Pod) bool {
 }
 
 func newCapacityUpgradeConf() *capacityUpgradeConf {
-	conf := &capacityUpgradeConf{}
+	conf := &capacityUpgradeConf{RestartCost: newRestartCostGate()}
 	_ = mapstructure.Decode(DefaultCapacityUpgradeConf, conf)
 	return conf
 }
@@ -331,7 +337,9 @@ var victimsFnForCapacityUpgradeMoves = func(tasks []*api.TaskInfo) []*api.TaskIn
 		return nil
 	}
 	steps := advanceCapacityUpgradeMoves(idx, Session.Nodes, Session.Jobs, conf, time.Now(), sessionPredicate())
-	return applyMoveSteps(steps, sessionStore{})
+	victims := applyMoveSteps(steps, sessionStore{})
+	recordShuffleEvictions(CapacityUpgradeStrategy, conf.RestartCost.book(Session.Jobs, v1.ResourceName(conf.GpuResource), time.Now()), victims)
+	return victims
 }
 
 // victimsFnForCapacityUpgrade plans and starts new moves; it runs on the
@@ -512,6 +520,7 @@ func planCapacityUpgrades(
 	})
 
 	ledger := newUpgradeLedger(nodes, running, conf, idx, gpu)
+	book := conf.RestartCost.book(jobs, gpu, now)
 	plans := make([]capacityUpgradePlan, 0)
 	pods, gangs := 0, 0
 	for _, cand := range candidates {
@@ -540,6 +549,10 @@ func planCapacityUpgrades(
 				klog.V(3).Infof("capacityUpgrade: %s/%s not moved: %d target node(s) spoken for by pending work",
 					cand.job.Namespace, cand.job.Name, guard.skipped)
 			}
+			continue
+		}
+		if cost, announced := movePrice(book, cand.members, placement.displaced); conf.RestartCost.skip(capacityUpgradeSkipped, conf.MaxRestartGpuSeconds, cost, announced) {
+			klog.V(3).Infof("capacityUpgrade: %s/%s not moved: restart cost %.0f GPU-seconds over the cap", cand.job.Namespace, cand.job.Name, cost)
 			continue
 		}
 		ledger.commit(placement)
