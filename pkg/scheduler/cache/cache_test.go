@@ -575,3 +575,58 @@ func (m *mockPreBinder) PreBind(ctx context.Context, bindCtx *BindContext) error
 func (m *mockPreBinder) PreBindRollBack(ctx context.Context, bindCtx *BindContext) {
 	// do nothing
 }
+
+func TestUnschedulableConditionNeedsUpdate(t *testing.T) {
+	now := metav1.NewTime(time.Date(2026, 9, 9, 18, 0, 0, 0, time.UTC))
+	const (
+		msgA = "0/1073 nodes are unavailable: 226 Insufficient memory, 400 Insufficient nvidia.com/gpu, 429 Insufficient cpu."
+		// msgA with every node count drifted and no reason added or removed.
+		msgADrift = "0/1075 nodes are unavailable: 227 Insufficient memory, 398 Insufficient nvidia.com/gpu, 431 Insufficient cpu."
+		// msgADrift with one more reason.
+		msgAExtraReason = "0/1075 nodes are unavailable: 227 Insufficient memory, 3 node(s) had untolerated taint {exa.ai/exa-cluster: true}, 398 Insufficient nvidia.com/gpu, 431 Insufficient cpu."
+		msgB            = "0/1073 nodes are unavailable: 1073 Insufficient nvidia.com/gpu."
+	)
+	existing := func(status v1.ConditionStatus, reason, message string, probed metav1.Time) *v1.PodStatus {
+		return &v1.PodStatus{Conditions: []v1.PodCondition{{
+			Type:          v1.PodScheduled,
+			Status:        status,
+			Reason:        reason,
+			Message:       message,
+			LastProbeTime: probed,
+		}}}
+	}
+	unschedulable := func(message string) *v1.PodCondition {
+		return &v1.PodCondition{
+			Type:          v1.PodScheduled,
+			Status:        v1.ConditionFalse,
+			Reason:        api.PodReasonUnschedulable,
+			Message:       message,
+			LastProbeTime: now,
+		}
+	}
+	ago := func(d time.Duration) metav1.Time { return metav1.NewTime(now.Add(-d)) }
+
+	tests := []struct {
+		name   string
+		status *v1.PodStatus
+		cond   *v1.PodCondition
+		want   bool
+	}{
+		{"no existing condition", &v1.PodStatus{}, unschedulable(msgA), true},
+		{"status changed", existing(v1.ConditionTrue, "", "", ago(time.Second)), unschedulable(msgA), true},
+		{"reason changed", existing(v1.ConditionFalse, api.PodReasonSchedulable, msgA, ago(time.Second)), unschedulable(msgA), true},
+		{"identical message", existing(v1.ConditionFalse, api.PodReasonUnschedulable, msgA, ago(time.Hour)), unschedulable(msgA), false},
+		{"reason set changed", existing(v1.ConditionFalse, api.PodReasonUnschedulable, msgA, ago(time.Second)), unschedulable(msgB), true},
+		{"reason added", existing(v1.ConditionFalse, api.PodReasonUnschedulable, msgA, ago(time.Second)), unschedulable(msgAExtraReason), true},
+		{"counts drifted, recently written", existing(v1.ConditionFalse, api.PodReasonUnschedulable, msgA, ago(10*time.Second)), unschedulable(msgADrift), false},
+		{"counts drifted, refresh due", existing(v1.ConditionFalse, api.PodReasonUnschedulable, msgA, ago(unschedulableMessageRefreshInterval)), unschedulable(msgADrift), true},
+		{"counts drifted, condition predates probe stamping", existing(v1.ConditionFalse, api.PodReasonUnschedulable, msgA, metav1.Time{}), unschedulable(msgADrift), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := unschedulableConditionNeedsUpdate(tt.status, tt.cond); got != tt.want {
+				t.Errorf("unschedulableConditionNeedsUpdate() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
