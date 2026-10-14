@@ -379,10 +379,20 @@ func planGpuFragmentationDrains(
 				continue
 			}
 			overCap := conf.EvictionCost.over(conf.MaxEvictionCostGpuSecondsPerGpu, cand.price.gated)
+			caught := func(moves []gpuFragmentationMove, outcome string) {
+				conf.EvictionCost.count(gpuRepackSkipped)
+				conf.EvictionCost.log(capDecision{
+					strategy: GpuFragmentationStrategy, unit: "gpu_seconds_per_gpu",
+					price: cand.price, limit: conf.MaxEvictionCostGpuSecondsPerGpu, book: book,
+					describe: func() (string, string, string, []*api.TaskInfo) {
+						return "source=" + source.Name, drainTargets(moves), outcome, victims
+					},
+				})
+			}
 			if overCap && !conf.EvictionCost.DryRun {
 				// Count the skip only if the drain could have happened.
-				if len(simulateDrain(members, source, victims, gpu, ledger.clone(), predicate)) > 0 {
-					conf.EvictionCost.count(gpuRepackSkipped)
+				if moves := simulateDrain(members, source, victims, gpu, ledger.clone(), predicate); len(moves) > 0 {
+					caught(moves, "skipped")
 				}
 				continue
 			}
@@ -391,7 +401,7 @@ func planGpuFragmentationDrains(
 				continue
 			}
 			if overCap {
-				conf.EvictionCost.count(gpuRepackSkipped)
+				caught(moves, "drained")
 			}
 			drains = append(drains, gpuFragmentationDrain{
 				pool:   pool,

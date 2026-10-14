@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -204,9 +205,9 @@ func TestShadowIgnoresEqualCostTies(t *testing.T) {
 	x.UID, y.UID = "x", "y"
 	book := NewBook(nil, gpu, DefaultDefaults(), t0.Add(time.Hour))
 	need := &api.Resource{ScalarResources: map[v1.ResourceName]float64{gpu: gpuMilli}}
-	differs, base, aware := book.Shadow([]*api.TaskInfo{x, y}, []*api.TaskInfo{y, x}, need, api.EmptyResource())
-	if differs || base != aware || base == 0 {
-		t.Fatalf("equal-cost covers: differs=%v baseline=%v aware=%v", differs, base, aware)
+	r := book.Shadow([]*api.TaskInfo{x, y}, []*api.TaskInfo{y, x}, need, api.EmptyResource())
+	if r.Differs() || r.Outcome() != "same" || r.Baseline.GPUSeconds == 0 {
+		t.Fatalf("equal-cost covers: %+v", r)
 	}
 }
 
@@ -223,5 +224,54 @@ func TestBookIgnoresMembersAlreadyReleasing(t *testing.T) {
 	kept.Status = api.Releasing
 	if got := book.Job(kept).GPUSeconds; got != 1*(30+3600) {
 		t.Fatalf("got %v, want only the member released by this action priced", got)
+	}
+}
+
+// Shadow returns the victims each ordering would evict, and its log line
+// names them per job with their price and source.
+func TestShadowListsVictims(t *testing.T) {
+	t0 := time.Date(2026, 10, 13, 19, 8, 12, 0, time.UTC)
+	scratch := map[string]string{AnnotationResume: ResumeScratch}
+	a0, a1 := task("a", 1, pod("a0", t0, scratch)), task("a", 1, pod("a1", t0, scratch))
+	b0 := task("b", 1, pod("b0", t0, nil))
+	preemptor := task("p", 1, pod("p0", t0, nil))
+	a0.UID, a1.UID, b0.UID, preemptor.UID = "a0", "a1", "b0", "p0"
+	jobs := map[api.JobID]*api.JobInfo{
+		"a": {UID: "a", Namespace: "ns", Name: "train", Tasks: api.TasksMap{"a0": a0, "a1": a1}},
+		"b": {UID: "b", Namespace: "ns", Name: "filler", Tasks: api.TasksMap{"b0": b0}},
+		"p": {UID: "p", Namespace: "ns", Name: "urgent", Tasks: api.TasksMap{"p0": preemptor}},
+	}
+	book := NewBook(jobs, gpu, DefaultDefaults(), t0.Add(time.Hour))
+	need := &api.Resource{ScalarResources: map[v1.ResourceName]float64{gpu: gpuMilli}}
+	r := book.Shadow([]*api.TaskInfo{a0, b0, a1}, []*api.TaskInfo{b0, a0, a1}, need, api.EmptyResource())
+	if len(r.Baseline.Victims) != 1 || r.Baseline.Victims[0] != a0 || len(r.CostAware.Victims) != 1 || r.CostAware.Victims[0] != b0 {
+		t.Fatalf("victims: baseline %v, cost-aware %v", r.Baseline.Victims, r.CostAware.Victims)
+	}
+	// a: 2 GPUs x (30 + 3600); b, unannounced, is priced the same per GPU.
+	if r.Baseline.GPUSeconds != 7260 || r.CostAware.GPUSeconds != 3630 || !r.Differs() {
+		t.Fatalf("costs: %+v", r)
+	}
+	var lines []string
+	saved := logLine
+	logLine = func(line func() string) { lines = append(lines, line()) }
+	defer func() { logLine = saved }()
+	book.LogShadow("preempt", "normal", preemptor, r)
+	want := "evictionCost shadow: action=preempt strategy=normal preemptor=ns/urgent outcome=different baseline=7260 costAware=3630" +
+		" baselineVictims=[ns/train(7260, announced)] costAwareVictims=[ns/filler(3630, default)]"
+	if len(lines) != 1 || lines[0] != want {
+		t.Fatalf("got %q, want %q", lines, want)
+	}
+	r.Baseline.Node, r.CostAware.Node = "n1", "n2"
+	if line := book.ShadowLine("preempt", "topology_aware", preemptor, r); !strings.Contains(line, " baselineNode=n1 costAwareNode=n2 ") {
+		t.Fatalf("topology-aware line lacks the nodes: %q", line)
+	}
+	// Fractional costs print exactly, so a different decision never shows
+	// equal numbers.
+	r.CostAware.GPUSeconds = 7260.25
+	if line := book.ShadowLine("preempt", "normal", preemptor, r); !strings.Contains(line, " baseline=7260 costAware=7260.25 ") {
+		t.Fatalf("fractional cost rounded: %q", line)
+	}
+	if got := FormatPrice("ns/x", Price{GPUSeconds: 330.3}); got != "ns/x(330.3, default)" {
+		t.Fatalf("FormatPrice: %q", got)
 	}
 }

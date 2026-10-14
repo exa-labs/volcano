@@ -282,11 +282,12 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 
 		if task.InitResreq.LessEqual(availableResources, api.Zero) {
 			if ra.evictionCost == evictioncost.ModeShadow {
-				differs, baseline, aware := ra.book.Shadow(
+				shadow := ra.book.Shadow(
 					ssn.VictimsInOrder(victims, task, nil),
 					ssn.VictimsInOrder(victims, task, ra.book.Cost),
 					resreq, idleBefore)
-				metrics.RegisterEvictionCostShadow(ra.Name(), differs, baseline, aware)
+				metrics.RegisterEvictionCostShadow(ra.Name(), shadow.Differs(), shadow.Baseline.GPUSeconds, shadow.CostAware.GPUSeconds)
+				ra.book.LogShadow(ra.Name(), "normal", task, shadow)
 			}
 			if err := stmt.Pipeline(task, n.Name, evictionOccurred); err != nil {
 				klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>",

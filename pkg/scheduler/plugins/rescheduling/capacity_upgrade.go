@@ -541,6 +541,10 @@ func planCapacityUpgrades(
 		// cap. Live, the next tier is tried, since another placement may
 		// displace less; dry run keeps the first placement.
 		overCap := false
+		// firstOver and firstOverCost are the first placement found over the
+		// cap, logged once the move is decided.
+		var firstOver *capacityUpgradePlacement
+		var firstOverCost price
 		for rank := 0; rank < cand.maxRank; rank++ {
 			targets := byRank[rank]
 			if len(targets) == 0 {
@@ -551,7 +555,9 @@ func planCapacityUpgrades(
 				continue
 			}
 			if cost := conf.EvictionCost.movePrice(book, cand.members, placement.displaced); conf.EvictionCost.over(conf.MaxEvictionCostGpuSeconds, cost.gated) {
-				klog.V(3).Infof("capacityUpgrade: %s/%s placement on rank %d costs %.0f GPU-seconds, over the cap", cand.job.Namespace, cand.job.Name, rank, cost.gated)
+				if firstOver == nil {
+					firstOver, firstOverCost = placement, cost
+				}
 				overCap = true
 				if !conf.EvictionCost.DryRun {
 					placement = nil
@@ -563,6 +569,26 @@ func planCapacityUpgrades(
 		}
 		if overCap && (placement == nil || conf.EvictionCost.DryRun) {
 			conf.EvictionCost.count(capacityUpgradeSkipped)
+		}
+		if firstOver != nil {
+			over, final, cand := firstOver, placement, cand
+			conf.EvictionCost.log(capDecision{
+				strategy: CapacityUpgradeStrategy, unit: "gpu_seconds",
+				price: firstOverCost, limit: conf.MaxEvictionCostGpuSeconds, book: book,
+				describe: func() (string, string, string, []*api.TaskInfo) {
+					target, displaced := moveTargets(over, nodes, conf.NodeLabelKey)
+					outcome := "skipped"
+					switch {
+					case final == nil:
+					case final == over:
+						outcome = "moved"
+					default:
+						movedTo, _ := moveTargets(final, nodes, conf.NodeLabelKey)
+						outcome = "moved_to=" + movedTo
+					}
+					return "mover=" + moverName(book, cand.job, cand.members), target, outcome, displaced
+				},
+			})
 		}
 		if placement == nil {
 			if guard != nil && guard.skipped > 0 {

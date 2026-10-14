@@ -19,6 +19,7 @@ package rescheduling
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -325,4 +326,102 @@ func TestGpuFragmentationGatesAnnouncedShare(t *testing.T) {
 	if got := f.plan(conf, nil); len(got) != 0 {
 		t.Fatalf("gateUnannounced: expected no drain, got %v", sources(got))
 	}
+}
+
+// captureGateLines records the gate's log lines for the rest of the test.
+func captureGateLines(t *testing.T) *[]string {
+	lines := &[]string{}
+	saved := logGate
+	logGate = func(line func() string) { *lines = append(*lines, line()) }
+	t.Cleanup(func() { logGate = saved })
+	return lines
+}
+
+// expectLines checks that each line holds its fragments, one line per entry.
+func expectLines(t *testing.T, what string, lines *[]string, want ...[]string) {
+	t.Helper()
+	defer func() { *lines = (*lines)[:0] }()
+	if len(*lines) != len(want) {
+		t.Fatalf("%s: expected %d line(s), got %q", what, len(want), *lines)
+	}
+	for i, fragments := range want {
+		t.Log((*lines)[i])
+		for _, fragment := range fragments {
+			if !strings.Contains((*lines)[i], fragment) {
+				t.Fatalf("%s: line %q lacks %q", what, (*lines)[i], fragment)
+			}
+		}
+	}
+}
+
+// Every decision a cap catches is logged once, in both modes, with the jobs
+// it evicts; nothing is logged without a cap or for an infeasible drain.
+func TestEvictionCostGateLogs(t *testing.T) {
+	lines := captureGateLines(t)
+	repack := func(params map[string]interface{}) *gpuFragmentationConf {
+		c := newGpuFragmentationConf()
+		params["maxVictims"] = 1
+		c.parse(params)
+		return c
+	}
+	repackFixture(t).plan(repack(map[string]interface{}{}), nil)
+	expectLines(t, "repack defaults", lines)
+
+	repackFixture(t).plan(repack(map[string]interface{}{"maxEvictionCostGpuSecondsPerGpu": 1000, "evictionCostDryRun": true}), nil)
+	expectLines(t, "repack dry run", lines, []string{
+		"evictionCost gate: strategy=gpuFragmentation mode=dry_run source=a-source target=dest outcome=drained unit=gpu_seconds_per_gpu",
+		"cap=1000 jobs=[", ", announced)]",
+	})
+
+	repackFixture(t).plan(repack(map[string]interface{}{"maxEvictionCostGpuSecondsPerGpu": 100}), nil)
+	expectLines(t, "repack live", lines,
+		[]string{"mode=live source=b-source target=dest outcome=skipped", "cap=100 "},
+		[]string{"mode=live source=a-source target=dest outcome=skipped", "cap=100 "})
+
+	f := newFixture(t)
+	source := f.addNode(gpuNode("source", 8, nil))
+	full := f.addNode(gpuNode("dest", 8, nil))
+	startedHourAgo(f.placePod(t, source, gpuPod("costly", "source", 1, eligible(), map[string]string{evictioncost.AnnotationResume: "scratch"}, true), 1, ""))
+	f.placePod(t, full, gpuPod("resident", "dest", 8, nil, nil, true), 1, "")
+	infeasible := newGpuFragmentationConf()
+	infeasible.MaxEvictionCostGpuSecondsPerGpu = 100
+	f.plan(infeasible, nil)
+	expectLines(t, "infeasible drain", lines)
+
+	move := func(conf *capacityUpgradeConf) {
+		f := newFixture(t)
+		f.addNode(tierNode("spot-1", "spot", "a"))
+		f.addNode(tierNode("reserved-1", "reserved", "a"))
+		mover := f.only(t, f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 4, -4, time.Hour)))
+		mover.Pod.Annotations[evictioncost.AnnotationResume] = evictioncost.ResumeScratch
+		f.startOnly(t, conf, newMemStore(f))
+	}
+	move(liveConf())
+	expectLines(t, "move defaults", lines)
+	capped := liveConf()
+	capped.MaxEvictionCostGpuSeconds = 10000
+	move(capped)
+	expectLines(t, "move live", lines, []string{
+		"evictionCost gate: strategy=capacityUpgrade mode=live mover=", ", announced) target=reserved:reserved-1 outcome=skipped unit=gpu_seconds",
+		"cap=10000 jobs=[]",
+	})
+	capped.EvictionCost.DryRun = true
+	move(capped)
+	expectLines(t, "move dry run", lines, []string{"mode=dry_run", "target=reserved:reserved-1 outcome=moved "})
+
+	// Over the cap on the cheapest tier, moved to the next one.
+	f = newFixture(t)
+	f.addNode(tierNode("ondemand-1", "on-demand", "a"))
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.only(t, f.placeGroup(t, 1, nil, tierPod("train", "ondemand-1", "pg-train", 4, -4, time.Hour)))
+	for _, filler := range f.fillers(t, "reserved-1", 8, 1, -9) {
+		filler.Pod.Annotations[evictioncost.AnnotationResume] = evictioncost.ResumeScratch
+	}
+	tiered := displacingConf(-9)
+	tiered.MaxEvictionCostGpuSeconds = 10000
+	f.startOnly(t, tiered, newMemStore(f))
+	expectLines(t, "next tier", lines, []string{
+		"target=reserved:reserved-1 outcome=moved_to=spot:spot-1", ", announced) ",
+	})
 }
