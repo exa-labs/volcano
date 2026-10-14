@@ -336,9 +336,8 @@ func planGpuFragmentationDrains(
 		type drainable struct {
 			source  *api.NodeInfo
 			victims []*api.TaskInfo
-			// costPerGpu is the victims' restart cost per GPU freed.
-			costPerGpu float64
-			announced  bool
+			// price is the victims' restart cost per GPU freed.
+			price price
 		}
 		sources := make([]drainable, 0, len(members))
 		for _, member := range members {
@@ -349,16 +348,15 @@ func planGpuFragmentationDrains(
 			if len(victims) == 0 {
 				continue
 			}
-			costPerGpu, announced := drainPrice(book, member, victims, gpu)
-			sources = append(sources, drainable{source: member, victims: victims, costPerGpu: costPerGpu, announced: announced})
+			sources = append(sources, drainable{source: member, victims: victims, price: conf.RestartCost.drainPrice(book, member, victims, gpu)})
 		}
 		sort.SliceStable(sources, func(i, j int) bool {
 			ui, uj := gpuFullness(sources[i].source, gpu), gpuFullness(sources[j].source, gpu)
 			if ui != uj {
 				return ui < uj
 			}
-			if byCost && sources[i].costPerGpu != sources[j].costPerGpu {
-				return sources[i].costPerGpu < sources[j].costPerGpu
+			if byCost && sources[i].price.total != sources[j].price.total {
+				return sources[i].price.total < sources[j].price.total
 			}
 			pi, pj := maxVictimPriority(sources[i].victims), maxVictimPriority(sources[j].victims)
 			if pi != pj {
@@ -380,7 +378,7 @@ func planGpuFragmentationDrains(
 			if ledger.touched(source.Name) {
 				continue
 			}
-			if conf.RestartCost.skip(gpuRepackSkipped, conf.MaxRestartGpuSecondsPerGpu, cand.costPerGpu, cand.announced) {
+			if conf.RestartCost.skip(gpuRepackSkipped, conf.MaxRestartGpuSecondsPerGpu, cand.price.gated) {
 				continue
 			}
 			moves := simulateDrain(members, source, victims, gpu, ledger, predicate)

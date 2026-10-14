@@ -92,11 +92,11 @@ func TestParsePod(t *testing.T) {
 		t.Fatalf("garbage must read as absent: %+v", f)
 	}
 
-	bare := pod("b", t0, map[string]string{AnnotationResume: "sometimes", "exa.ai/other": "1"})
+	bare := pod("b", t0, map[string]string{AnnotationResume: "sometimes", "exa.ai/other": "1", AnnotationProductiveAt: "2026-10-13T19:00:00Z"})
 	bare.Status.StartTime = nil
 	bare.Spec.TerminationGracePeriodSeconds = nil
 	f = ParsePod(bare)
-	if f.Announced || f.Resume != "" || f.GraceSeconds != 30 || f.StartedAt != float64(t0.Unix()-60) {
+	if f.Announced || f.Resume != "" || f.GraceSeconds != 30 || f.StartedAt != float64(t0.Unix()-60) || f.ProductiveAt != nil {
 		t.Fatalf("unannounced pod: unexpected facts %+v", f)
 	}
 }

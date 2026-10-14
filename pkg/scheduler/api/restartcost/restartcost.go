@@ -38,6 +38,7 @@ limitations under the License.
 package restartcost
 
 import (
+	"errors"
 	"math"
 	"strconv"
 	"sync"
@@ -177,8 +178,8 @@ func GPUSeconds(f Facts, now float64, d Defaults) float64 {
 
 // ParsePod reads a pod's restart facts; GPUs is left to the caller.
 // started_at is status.startTime, falling back to creation; the grace period
-// defaults to Kubernetes' 30 s. Unparseable annotations are logged at V(4)
-// and treated as absent.
+// defaults to Kubernetes' 30 s. Unparseable annotations, and a productive-at
+// before the start, are logged at V(4) and treated as absent.
 func ParsePod(pod *v1.Pod) Facts {
 	f := Facts{GraceSeconds: kubernetesDefaultGraceSecond}
 	if pod.Spec.TerminationGracePeriodSeconds != nil {
@@ -201,7 +202,15 @@ func ParsePod(pod *v1.Pod) Facts {
 	}
 	f.StartupSeconds = p.value(AnnotationStartupSeconds, parseSeconds)
 	f.TerminationSeconds = p.value(AnnotationTerminationSeconds, parseSeconds)
-	f.ProductiveAt = p.value(AnnotationProductiveAt, parseTime)
+	f.ProductiveAt = p.value(AnnotationProductiveAt, func(raw string) (float64, error) {
+		// Productive before it started would make the measured startup,
+		// and with it the price, negative.
+		at, err := parseTime(raw)
+		if err == nil && at < f.StartedAt {
+			err = errBeforeStart
+		}
+		return at, err
+	})
 	f.LastCheckpoint = p.value(AnnotationLastCheckpoint, parseTime)
 	p.value(AnnotationLastCheckpointStep, parseSeconds)
 	p.value(AnnotationCheckpointIntervalSeconds, parseSeconds)
@@ -242,6 +251,8 @@ func parseTime(raw string) (float64, error) {
 	t, err := time.Parse(time.RFC3339, raw)
 	return float64(t.Unix()), err
 }
+
+var errBeforeStart = errors.New("before the pod started")
 
 // Gang aggregates members into the facts of the whole: GPUs add up, the
 // earliest start and productive time and the latest checkpoint win, and

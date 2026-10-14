@@ -1096,10 +1096,10 @@ func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor
 
 // BuildVictimsPriorityQueueByCost orders victims like BuildVictimsPriorityQueue
 // except that, given a cost, victims of different jobs that are both in the
-// session go lower task priority first, then cheaper first, before the
-// queue and job order. Victims of one job share its cost and keep task order.
-// The cost only orders victims: JobOrderFn, which also orders allocation, is
-// untouched.
+// session go lower job priority first, then lower task priority, then
+// cheaper first, before the queue and job order. Victims of one job share
+// its cost and keep task order. The cost only orders victims: JobOrderFn,
+// which also orders allocation, is untouched.
 func (ssn *Session) BuildVictimsPriorityQueueByCost(victims []*api.TaskInfo, preemptor *api.TaskInfo, cost func(*api.TaskInfo) float64) *util.PriorityQueue {
 	victimsQueue := util.NewPriorityQueue(func(l, r interface{}) bool {
 		lv := l.(*api.TaskInfo)
@@ -1132,6 +1132,9 @@ func (ssn *Session) BuildVictimsPriorityQueueByCost(victims []*api.TaskInfo, pre
 		}
 
 		if cost != nil {
+			if lvJob.Priority != rvJob.Priority {
+				return lvJob.Priority < rvJob.Priority
+			}
 			if lv.Priority != rv.Priority {
 				return lv.Priority < rv.Priority
 			}
@@ -1154,6 +1157,17 @@ func (ssn *Session) BuildVictimsPriorityQueueByCost(victims []*api.TaskInfo, pre
 		victimsQueue.Push(victim)
 	}
 	return victimsQueue
+}
+
+// SameVictimPriority reports whether two victims rank equally before cost in
+// BuildVictimsPriorityQueueByCost: same job priority and same task priority.
+func (ssn *Session) SameVictimPriority(l, r *api.TaskInfo) bool {
+	if l.Priority != r.Priority {
+		return false
+	}
+	lJob, lFound := ssn.Jobs[l.Job]
+	rJob, rFound := ssn.Jobs[r.Job]
+	return lFound == rFound && (!lFound || lJob.Priority == rJob.Priority)
 }
 
 // VictimsInOrder returns the victims in the order BuildVictimsPriorityQueueByCost pops them.

@@ -533,26 +533,38 @@ func planCapacityUpgrades(
 		var placement *capacityUpgradePlacement
 		targetRank := 0
 		guard := newDemandGuard(demand, cand)
+		// overCap: a placement was found whose restart cost is over the
+		// cap. Live, the next tier is tried, since another placement may
+		// displace less; dry run keeps the first placement.
+		overCap := false
 		for rank := 0; rank < cand.maxRank; rank++ {
 			targets := byRank[rank]
 			if len(targets) == 0 {
 				continue
 			}
 			placement = simulateUpgrade(targets, cand, conf, gpu, ledger, predicate, guard)
-			if placement != nil {
-				targetRank = rank
-				break
+			if placement == nil {
+				continue
 			}
+			if cost := conf.RestartCost.movePrice(book, cand.members, placement.displaced); conf.RestartCost.over(conf.MaxRestartGpuSeconds, cost.gated) {
+				klog.V(3).Infof("capacityUpgrade: %s/%s placement on rank %d costs %.0f GPU-seconds, over the cap", cand.job.Namespace, cand.job.Name, rank, cost.gated)
+				overCap = true
+				if !conf.RestartCost.DryRun {
+					placement = nil
+					continue
+				}
+			}
+			targetRank = rank
+			break
+		}
+		if overCap && (placement == nil || conf.RestartCost.DryRun) {
+			conf.RestartCost.count(capacityUpgradeSkipped)
 		}
 		if placement == nil {
 			if guard != nil && guard.skipped > 0 {
 				klog.V(3).Infof("capacityUpgrade: %s/%s not moved: %d target node(s) spoken for by pending work",
 					cand.job.Namespace, cand.job.Name, guard.skipped)
 			}
-			continue
-		}
-		if cost, announced := movePrice(book, cand.members, placement.displaced); conf.RestartCost.skip(capacityUpgradeSkipped, conf.MaxRestartGpuSeconds, cost, announced) {
-			klog.V(3).Infof("capacityUpgrade: %s/%s not moved: restart cost %.0f GPU-seconds over the cap", cand.job.Namespace, cand.job.Name, cost)
 			continue
 		}
 		ledger.commit(placement)

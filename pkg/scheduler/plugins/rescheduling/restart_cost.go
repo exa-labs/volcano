@@ -31,8 +31,8 @@ import (
 // (see restartcost) and, once the strategy sets a cap, skips the decisions
 // that cost more than the cap and orders the rest cheapest first. Without a
 // cap, or in dry run, the strategy decides as it always has and the gate only
-// counts what it would skip. Jobs that announce no restart facts are never
-// gated unless GateUnannounced is set.
+// counts what it would skip. Only jobs that announce restart facts count
+// against the cap unless GateUnannounced is set.
 type restartCostGate struct {
 	DryRun               bool `mapstructure:"restartCostDryRun"`
 	GateUnannounced      bool `mapstructure:"gateUnannounced"`
@@ -48,12 +48,14 @@ func (g restartCostGate) orders(limit float64) bool {
 	return limit > 0 && !g.DryRun
 }
 
-// skip reports whether a decision costing cost must be skipped under limit,
-// and counts every decision the gate catches, skipped or (dry run) not.
-func (g restartCostGate) skip(skipped *prometheus.CounterVec, limit, cost float64, announced bool) bool {
-	if limit <= 0 || cost <= limit || (!announced && !g.GateUnannounced) {
-		return false
-	}
+// over reports whether a decision whose gated cost is gated exceeds limit.
+func (g restartCostGate) over(limit, gated float64) bool {
+	return limit > 0 && gated > limit
+}
+
+// count records a decision the gate caught and reports whether to skip it:
+// live skips, dry run only counts.
+func (g restartCostGate) count(skipped *prometheus.CounterVec) bool {
 	mode := "live"
 	if g.DryRun {
 		mode = "dry_run"
@@ -62,39 +64,64 @@ func (g restartCostGate) skip(skipped *prometheus.CounterVec, limit, cost float6
 	return !g.DryRun
 }
 
+// skip reports whether a decision must be skipped under limit, counting it
+// whenever the gate catches it.
+func (g restartCostGate) skip(skipped *prometheus.CounterVec, limit, gated float64) bool {
+	return g.over(limit, gated) && g.count(skipped)
+}
+
 // book prices jobs with the gate's defaults.
 func (g restartCostGate) book(jobs map[api.JobID]*api.JobInfo, gpu v1.ResourceName, now time.Time) *restartcost.Book {
 	return restartcost.NewBook(jobs, gpu, g.Defaults, now)
 }
 
-// victimsPrice is the restart cost of evicting the victims, each job once,
-// and whether any of their jobs announced restart facts.
-func victimsPrice(book *restartcost.Book, victims []*api.TaskInfo) (cost float64, announced bool) {
-	for _, victim := range victims {
-		announced = announced || book.Job(victim).Announced
+// price is a decision's restart cost. total orders decisions; gated is what
+// the cap is compared with: the share of jobs that announced restart facts,
+// or all of it under GateUnannounced.
+type price struct {
+	total, gated float64
+}
+
+func (p *price) add(job restartcost.Price, gateUnannounced bool) {
+	p.total += job.GPUSeconds
+	if job.Announced || gateUnannounced {
+		p.gated += job.GPUSeconds
 	}
-	return book.Selection(victims), announced
+}
+
+// victimsPrice prices evicting the victims, each job once.
+func (g restartCostGate) victimsPrice(book *restartcost.Book, victims []*api.TaskInfo) price {
+	var p price
+	seen := map[api.JobID]bool{}
+	for _, victim := range victims {
+		if victim.Job != "" && seen[victim.Job] {
+			continue
+		}
+		seen[victim.Job] = true
+		p.add(book.Job(victim), g.GateUnannounced)
+	}
+	return p
 }
 
 // drainPrice is a drain's restart cost per GPU it frees.
-func drainPrice(book *restartcost.Book, source *api.NodeInfo, victims []*api.TaskInfo, gpu v1.ResourceName) (perGpu float64, announced bool) {
-	cost, announced := victimsPrice(book, victims)
+func (g restartCostGate) drainPrice(book *restartcost.Book, source *api.NodeInfo, victims []*api.TaskInfo, gpu v1.ResourceName) price {
+	p := g.victimsPrice(book, victims)
 	if freed := source.Used.Get(gpu) / gpuMilli; freed > 0 {
-		return cost / freed, announced
+		p.total, p.gated = p.total/freed, p.gated/freed
 	}
-	return cost, announced
+	return p
 }
 
 // movePrice is a capacity move's restart cost: the mover's members as one
 // gang plus every job the placement displaces.
-func movePrice(book *restartcost.Book, members []*api.TaskInfo, displaced map[string][]*api.TaskInfo) (cost float64, announced bool) {
-	mover := book.Of(members)
+func (g restartCostGate) movePrice(book *restartcost.Book, members []*api.TaskInfo, displaced map[string][]*api.TaskInfo) price {
 	var pods []*api.TaskInfo
 	for _, onNode := range displaced {
 		pods = append(pods, onNode...)
 	}
-	cost, announced = victimsPrice(book, pods)
-	return mover.GPUSeconds + cost, mover.Announced || announced
+	p := g.victimsPrice(book, pods)
+	p.add(book.Of(members), g.GateUnannounced)
+	return p
 }
 
 // recordShuffleEvictions counts the strategy's evictions and their cost.

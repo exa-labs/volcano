@@ -203,3 +203,42 @@ func TestCapacityUpgradeRestartCostGate(t *testing.T) {
 		t.Fatalf("defaults: expected the move planned, got %d plans", got)
 	}
 }
+
+// The cheapest tier only fits by displacing announced fillers that put the
+// move over the cap; the next tier has idle room, so the move goes there.
+func TestCapacityUpgradeTriesNextTierOverCap(t *testing.T) {
+	f := newFixture(t)
+	f.addNode(tierNode("ondemand-1", "on-demand", "a"))
+	f.addNode(tierNode("spot-1", "spot", "a"))
+	f.addNode(tierNode("reserved-1", "reserved", "a"))
+	f.only(t, f.placeGroup(t, 1, nil, tierPod("train", "ondemand-1", "pg-train", 4, -4, time.Hour)))
+	for _, filler := range f.fillers(t, "reserved-1", 8, 1, -9) {
+		filler.Pod.Annotations[restartcost.AnnotationResume] = restartcost.ResumeScratch
+	}
+	conf := displacingConf(-9)
+	conf.MaxRestartGpuSeconds = 10000
+	plans := f.startOnly(t, conf, newMemStore(f))
+	if len(plans) != 1 || plans[0].target != "spot" || plans[0].displacedCount() != 0 {
+		t.Fatalf("expected one move to spot displacing nobody, got %+v", plans)
+	}
+}
+
+// A drain mixing an announced cheap job with an unannounced costly one is
+// gated on the announced share alone unless gateUnannounced.
+func TestGpuFragmentationGatesAnnouncedShare(t *testing.T) {
+	f := newFixture(t)
+	source := f.addNode(gpuNode("source", 8, nil))
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	startedHourAgo(f.placePod(t, source, gpuPod("cheap", "source", 1, eligible(), map[string]string{restartcost.AnnotationResume: "stateless"}, true), 1, ""))
+	startedHourAgo(f.placePod(t, source, gpuPod("quiet", "source", 1, eligible(), nil, true), 1, ""))
+	f.placePod(t, dest, gpuPod("resident", "dest", 5, nil, nil, true), 1, "")
+	conf := newGpuFragmentationConf()
+	conf.MaxRestartGpuSecondsPerGpu = 1000
+	if got := f.plan(conf, nil); len(got) != 2 {
+		t.Fatalf("expected both pods drained, got %v", sources(got))
+	}
+	conf.RestartCost.GateUnannounced = true
+	if got := f.plan(conf, nil); len(got) != 0 {
+		t.Fatalf("gateUnannounced: expected no drain, got %v", sources(got))
+	}
+}

@@ -1169,7 +1169,7 @@ func SelectVictimsOnNode(
 
 	// Now we try to reprieve non-violating victims.
 	if cost != nil {
-		reprieveCostliestFirst(potentialVictims, cost)
+		reprieveCostliestFirst(potentialVictims, cost, ssn.SameVictimPriority)
 	}
 	for _, p := range potentialVictims {
 		if _, err := reprievePod(p); err != nil {
@@ -1184,13 +1184,14 @@ func SelectVictimsOnNode(
 	}
 }
 
-// reprieveCostliestFirst reorders each run of equal-priority victims, as the
-// cost-ordered victim queue emits them, costliest first, so the reprieve
-// keeps the expensive ones and the cheap ones are evicted.
-func reprieveCostliestFirst(victims []*api.TaskInfo, cost func(*api.TaskInfo) float64) {
+// reprieveCostliestFirst reorders each run of victims that rank equally
+// before cost (same), as the cost-ordered victim queue emits them, costliest
+// first, so the reprieve keeps the expensive ones and the cheap ones are
+// evicted.
+func reprieveCostliestFirst(victims []*api.TaskInfo, cost func(*api.TaskInfo) float64, same func(l, r *api.TaskInfo) bool) {
 	for start := 0; start < len(victims); {
 		end := start + 1
-		for end < len(victims) && victims[end].Priority == victims[start].Priority {
+		for end < len(victims) && same(victims[end], victims[start]) {
 			end++
 		}
 		run := victims[start:end]

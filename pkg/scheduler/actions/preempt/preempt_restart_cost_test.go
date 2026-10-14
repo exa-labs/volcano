@@ -129,7 +129,8 @@ func TestReprieveCostliestFirst(t *testing.T) {
 		{Name: "mid-cheap", Priority: 5}, {Name: "mid-mid", Priority: 5}, {Name: "mid-dear", Priority: 5},
 	}
 	cost := map[string]float64{"low-cheap": 1, "low-dear": 9, "mid-cheap": 1, "mid-mid": 5, "mid-dear": 9}
-	reprieveCostliestFirst(victims, func(task *api.TaskInfo) float64 { return cost[task.Name] })
+	reprieveCostliestFirst(victims, func(task *api.TaskInfo) float64 { return cost[task.Name] },
+		func(l, r *api.TaskInfo) bool { return l.Priority == r.Priority })
 	want := []string{"low-dear", "low-cheap", "mid-dear", "mid-mid", "mid-cheap"}
 	for i, task := range victims {
 		if task.Name != want[i] {
