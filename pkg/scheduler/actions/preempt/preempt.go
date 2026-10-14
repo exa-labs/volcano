@@ -1175,8 +1175,12 @@ func SelectVictimsOnNode(
 				preemptor.InitResreq.LessEqual(nodeInfo.FutureIdle(), api.Zero) &&
 				ssn.SimulatePredicateFn(ctx, state, preemptor, nodeInfo) == nil
 		}
+		whole := func(task *api.TaskInfo) bool {
+			job, ok := ssn.Jobs[task.Job]
+			return ok && job.MinAvailable > 1
+		}
 		var err error
-		if victims, err = reprieveGangs(potentialVictims, allVictims, cost, ssn.SameVictimPriority, addTask, removeTask, fits); err != nil {
+		if victims, err = reprieveGangs(potentialVictims, allVictims, cost, ssn.SameVictimPriority, whole, addTask, removeTask, fits); err != nil {
 			return nil, api.AsStatus(err)
 		}
 	} else {
@@ -1194,14 +1198,17 @@ func SelectVictimsOnNode(
 	}
 }
 
-// reprieveGangs reprieves whole jobs, costliest first: a job keeps all its
-// removed members or none. An evicted job is charged anyway, so its other
-// eligible members on the node go too, at no extra cost, and the room they
-// free may reprieve cheaper jobs.
+// reprieveGangs reprieves jobs, costliest first: a job keeps all its removed
+// members or is charged. A charged job pays the same whatever it loses, so
+// its other eligible members on the node are removed too, and the room they
+// free may reprieve cheaper jobs. Members of a gang (whole) go with it;
+// members of a charged job that can run alone are then reprieved one by one
+// with the room left over, since keeping them costs nothing more.
 func reprieveGangs(
 	potential, eligible []*api.TaskInfo,
 	cost func(*api.TaskInfo) float64,
 	same func(l, r *api.TaskInfo) bool,
+	whole func(*api.TaskInfo) bool,
 	add, remove func(*api.TaskInfo) error,
 	fits func() bool,
 ) ([]*api.TaskInfo, error) {
@@ -1216,7 +1223,7 @@ func reprieveGangs(
 	for _, task := range potential {
 		removed[task.UID] = true
 	}
-	var victims []*api.TaskInfo
+	var victims, alone []*api.TaskInfo
 	decided := map[string]bool{}
 	for _, first := range potential {
 		key := gang(first)
@@ -1243,16 +1250,37 @@ func reprieveGangs(
 				return nil, err
 			}
 		}
-		victims = append(victims, members...)
+		var extras []*api.TaskInfo
 		for _, task := range eligible {
 			if gang(task) == key && !removed[task.UID] {
 				if err := remove(task); err != nil {
 					return nil, err
 				}
 				removed[task.UID] = true
-				victims = append(victims, task)
+				extras = append(extras, task)
 			}
 		}
+		if whole(first) {
+			victims = append(victims, members...)
+			victims = append(victims, extras...)
+		} else {
+			// Members the victim order did not pick come back first, so the
+			// ones it picked are the ones left out.
+			alone = append(alone, extras...)
+			alone = append(alone, members...)
+		}
+	}
+	for _, task := range alone {
+		if err := add(task); err != nil {
+			return nil, err
+		}
+		if fits() {
+			continue
+		}
+		if err := remove(task); err != nil {
+			return nil, err
+		}
+		victims = append(victims, task)
 	}
 	return victims, nil
 }

@@ -273,6 +273,40 @@ func TestMakeRoomDisplacesCheapestFillers(t *testing.T) {
 	}
 }
 
+// Room for a 4-GPU move is made per GPU, not per pod: one 4-GPU stateless
+// filler (4 x (30 + 300) = 1320 GPU-seconds) beats four 1-GPU fillers with
+// a 1000 s startup (1030 each, 4120 together), so the gated plan displaces
+// what the ungated one does.
+func TestMakeRoomComparesCostPerGpu(t *testing.T) {
+	plan := func(conf *capacityUpgradeConf) []string {
+		f := newFixture(t)
+		f.addNode(tierNode("spot-1", "spot", "a"))
+		f.addNode(tierNode("reserved-1", "reserved", "a"))
+		f.only(t, f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 4, -4, time.Hour)))
+		for _, filler := range f.fillers(t, "reserved-1", 1, 4, -9) {
+			filler.Pod.Annotations[evictioncost.AnnotationResume] = evictioncost.ResumeStateless
+		}
+		for _, filler := range f.fillers(t, "reserved-1", 4, 1, -9) {
+			filler.Pod.Annotations[evictioncost.AnnotationResume] = evictioncost.ResumeStateless
+			filler.Pod.Annotations[evictioncost.AnnotationStartupSeconds] = "1000"
+		}
+		plans := f.startOnly(t, conf, newMemStore(f))
+		if len(plans) != 1 {
+			t.Fatalf("expected one plan, got %+v", plans)
+		}
+		return displacedNames(plans[0])
+	}
+	want := []string{"filler-reserved-1-4gpu-pri-9-0"}
+	if got := plan(displacingConf(-9)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("default: got %v, want %v", got, want)
+	}
+	gated := displacingConf(-9)
+	gated.MaxEvictionCostGpuSeconds = 1e9
+	if got := plan(gated); !reflect.DeepEqual(got, want) {
+		t.Fatalf("gated: got %v, want %v", got, want)
+	}
+}
+
 // A drain mixing an announced cheap job with an unannounced costly one is
 // gated on the announced share alone unless gateUnannounced.
 func TestGpuFragmentationGatesAnnouncedShare(t *testing.T) {

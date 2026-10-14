@@ -17,6 +17,7 @@ limitations under the License.
 package preempt
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -188,6 +189,59 @@ func TestReprieveChargesGangOnce(t *testing.T) {
 	test.Run([]framework.Action{New()})
 	if err := test.CheckAll(0); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A job whose members can run alone (minMember 1) fills a 4-GPU node. A
+// 1-GPU preemptor needs one member gone, with eviction cost on as off: the
+// job is charged either way, and its other members cost nothing to keep.
+func TestReprieveKeepsMembersThatRunAlone(t *testing.T) {
+	now := time.Now()
+	trueValue := true
+	tiers := []conf.Tier{{Plugins: []conf.PluginOption{
+		{Name: conformance.PluginName, EnabledPreemptable: &trueValue},
+		{Name: gang.PluginName, EnabledJobReady: &trueValue, EnabledJobPipelined: &trueValue, EnabledJobStarving: &trueValue},
+		{Name: priority.PluginName, EnabledTaskOrder: &trueValue, EnabledJobOrder: &trueValue, EnabledPreemptable: &trueValue,
+			EnabledJobPipelined: &trueValue, EnabledJobStarving: &trueValue},
+		{Name: proportion.PluginName, EnabledOverused: &trueValue, EnabledQueueOrder: &trueValue},
+		{Name: predicates.PluginName, EnabledPreemptable: &trueValue, EnabledPredicate: &trueValue},
+	}}}
+	for _, mode := range []string{"off", "on"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			pods := []*v1.Pod{gpuPod("preemptor", "", "pg-new", v1.PodPending, time.Time{}, nil)}
+			for i := 0; i < 4; i++ {
+				pods = append(pods, gpuPod(fmt.Sprintf("m%d", i), "n1", "pg-a", v1.PodRunning, now.Add(-time.Duration(4-i)*time.Hour), nil))
+			}
+			test := uthelper.TestCommonStruct{
+				Plugins: map[string]framework.PluginBuilder{
+					conformance.PluginName: conformance.New, gang.PluginName: gang.New, priority.PluginName: priority.New,
+					proportion.PluginName: proportion.New, predicates.PluginName: predicates.New,
+				},
+				PriClass: []*schedulingv1.PriorityClass{util.BuildPriorityClass("high-priority", 100000), util.BuildPriorityClass("low-priority", 10)},
+				PodGroups: []*schedulingv1beta1.PodGroup{
+					util.BuildPodGroupWithPrio("pg-a", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning, "low-priority"),
+					util.BuildPodGroupWithPrio("pg-new", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+				},
+				Pods: pods,
+				Nodes: []*v1.Node{util.BuildNode("n1", api.BuildResourceList("8", "8G",
+					api.ScalarResource{Name: "pods", Value: "10"}, api.ScalarResource{Name: "nvidia.com/gpu", Value: "4"}), nil)},
+				Queues:         []*schedulingv1beta1.Queue{util.BuildQueue("q1", 1, nil)},
+				ExpectEvicted:  []string{"c1/m3"},
+				ExpectEvictNum: 1,
+			}
+			test.RegisterSession(tiers, []conf.Configuration{{Name: "preempt", Arguments: map[string]interface{}{
+				EnableTopologyAwarePreemptionKey:    true,
+				EnableNodeOrderScoreInPreemptionKey: false,
+				MinCandidateNodesAbsoluteKey:        1,
+				MaxCandidateNodesAbsoluteKey:        1,
+				evictioncost.ModeKey:                mode,
+			}}})
+			defer test.Close()
+			test.Run([]framework.Action{New()})
+			if err := test.CheckAll(0); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

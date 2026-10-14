@@ -18,6 +18,7 @@ package rescheduling
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"time"
@@ -958,7 +959,8 @@ func subClamped(r, rr *api.Resource) {
 // fit even with every queued pod gone. Pods go lowest priority first and,
 // within a priority, the smallest one that covers the GPU shortfall on its
 // own, else the largest, so as few pods and GPUs as possible are disturbed.
-// With an eviction cost, only the cheapest pods of the priority are candidates.
+// With an eviction cost, only the pods of the priority that are cheapest per
+// GPU of the shortfall they cover are candidates.
 func (t *upgradeTarget) makeRoom(need *api.Resource, gpu v1.ResourceName) (displaced, rest []*api.TaskInfo, ok bool) {
 	idle := t.idle.Clone()
 	rest = append(rest, t.queue...)
@@ -967,18 +969,16 @@ func (t *upgradeTarget) makeRoom(need *api.Resource, gpu v1.ResourceName) (displ
 			return nil, nil, false
 		}
 		shortfall := need.Get(gpu) - idle.Get(gpu)
-		cheapest := 0.0
+		cheapest := math.Inf(1)
 		for i := 0; t.cost != nil && i < len(rest) && rest[i].Priority == rest[0].Priority; i++ {
-			if c := t.cost(rest[i]); i == 0 || c < cheapest {
-				cheapest = c
-			}
+			cheapest = math.Min(cheapest, t.costPerGpu(rest[i], shortfall, gpu))
 		}
-		pick := 0
+		pick := -1
 		for i, pod := range rest {
 			if pod.Priority != rest[0].Priority {
 				break
 			}
-			if t.cost != nil && t.cost(pod) > cheapest {
+			if t.cost != nil && t.costPerGpu(pod, shortfall, gpu) > cheapest {
 				continue
 			}
 			pick = i
@@ -986,11 +986,28 @@ func (t *upgradeTarget) makeRoom(need *api.Resource, gpu v1.ResourceName) (displ
 				break
 			}
 		}
+		if pick < 0 {
+			pick = 0
+		}
 		idle.Add(rest[pick].Resreq)
 		displaced = append(displaced, rest[pick])
 		rest = append(rest[:pick], rest[pick+1:]...)
 	}
 	return displaced, rest, true
+}
+
+// costPerGpu is the pod's eviction cost per GPU of the shortfall it covers:
+// GPUs beyond the shortfall buy nothing. A pod freeing no GPU while GPUs
+// are short costs +Inf; with no GPU shortfall it costs its full price.
+func (t *upgradeTarget) costPerGpu(pod *api.TaskInfo, shortfall float64, gpu v1.ResourceName) float64 {
+	if shortfall <= 0 {
+		return t.cost(pod)
+	}
+	covered := math.Min(taskGpu(pod, gpu), shortfall)
+	if covered <= 0 {
+		return math.Inf(1)
+	}
+	return t.cost(pod) / covered
 }
 
 func simulateUpgradeInZone(
