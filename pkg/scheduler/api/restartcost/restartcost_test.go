@@ -81,7 +81,7 @@ func TestParsePod(t *testing.T) {
 		AnnotationTerminationSeconds: "-5",
 		AnnotationProductiveAt:       "2026-10-13T19:20:12Z",
 		AnnotationLastCheckpoint:     "yesterday",
-	}))
+	}), float64(t0.Unix()+3600))
 	if !f.Announced || f.Resume != ResumeCheckpoint || f.GraceSeconds != 120 || f.StartedAt != float64(t0.Unix()) {
 		t.Fatalf("unexpected facts %+v", f)
 	}
@@ -95,9 +95,21 @@ func TestParsePod(t *testing.T) {
 	bare := pod("b", t0, map[string]string{AnnotationResume: "sometimes", "exa.ai/other": "1", AnnotationProductiveAt: "2026-10-13T19:00:00Z"})
 	bare.Status.StartTime = nil
 	bare.Spec.TerminationGracePeriodSeconds = nil
-	f = ParsePod(bare)
+	f = ParsePod(bare, 0)
 	if f.Announced || f.Resume != "" || f.GraceSeconds != 30 || f.StartedAt != float64(t0.Unix()-60) || f.ProductiveAt != nil {
 		t.Fatalf("unannounced pod: unexpected facts %+v", f)
+	}
+
+	// No start and no creation time: priced as just started, not as
+	// running since the epoch.
+	bare.CreationTimestamp = metav1.Time{}
+	now := float64(t0.Unix())
+	if f = ParsePod(bare, now); f.StartedAt != now {
+		t.Fatalf("unknown start: got started_at %v, want %v", f.StartedAt, now)
+	}
+	f.GPUs = 1
+	if got := GPUSeconds(f, now, DefaultDefaults()); got != 30 {
+		t.Fatalf("unknown start: got %v GPU-seconds, want the 30 s drain", got)
 	}
 }
 
@@ -112,7 +124,7 @@ func TestGangAggregation(t *testing.T) {
 			AnnotationProductiveAt: "2026-10-13T19:13:12Z", AnnotationLastCheckpoint: "2026-10-13T20:30:00Z"})),
 		task("j", 0, pod("launcher", t0.Add(-time.Minute), nil)),
 	}
-	f, ok := Gang(members, gpu)
+	f, ok := Gang(members, gpu, 0)
 	if !ok || !f.Announced || f.GPUs != 8 || f.StartedAt != float64(t0.Unix()-60) {
 		t.Fatalf("unexpected gang facts %+v", f)
 	}
@@ -122,7 +134,7 @@ func TestGangAggregation(t *testing.T) {
 	if *f.ProductiveAt != float64(t0.Unix()+300) || *f.LastCheckpoint != float64(t0.Add(82*time.Minute-12*time.Second).Unix()) {
 		t.Fatalf("productive-at must be earliest and last-checkpoint latest: %+v", f)
 	}
-	if _, ok := Gang(nil, gpu); ok {
+	if _, ok := Gang(nil, gpu, 0); ok {
 		t.Fatal("empty gang must not be ok")
 	}
 }
@@ -169,5 +181,47 @@ func TestParseMode(t *testing.T) {
 		if got := ParseMode(raw); got != want {
 			t.Errorf("ParseMode(%q) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+// An unquoted on/off reaches the action as a YAML bool.
+func TestModeOf(t *testing.T) {
+	for _, c := range []struct {
+		raw  interface{}
+		want Mode
+	}{{nil, ModeOff}, {true, ModeOn}, {false, ModeOff}, {"shadow", ModeShadow}, {"on", ModeOn}, {3, ModeOff}} {
+		if got := ModeOf(c.raw); got != c.want {
+			t.Errorf("ModeOf(%v) = %q, want %q", c.raw, got, c.want)
+		}
+	}
+}
+
+// Two orderings that evict different pods at the same cost are a tie, not
+// a different decision.
+func TestShadowIgnoresEqualCostTies(t *testing.T) {
+	t0 := time.Date(2026, 10, 13, 19, 8, 12, 0, time.UTC)
+	x, y := task("x", 1, pod("x", t0, nil)), task("y", 1, pod("y", t0, nil))
+	x.UID, y.UID = "x", "y"
+	book := NewBook(nil, gpu, DefaultDefaults(), t0.Add(time.Hour))
+	need := &api.Resource{ScalarResources: map[v1.ResourceName]float64{gpu: gpuMilli}}
+	differs, base, aware := book.Shadow([]*api.TaskInfo{x, y}, []*api.TaskInfo{y, x}, need, api.EmptyResource())
+	if differs || base != aware || base == 0 {
+		t.Fatalf("equal-cost covers: differs=%v baseline=%v aware=%v", differs, base, aware)
+	}
+}
+
+// Members already Releasing when the book opens add nothing; members the
+// action marks Releasing afterwards still count.
+func TestBookIgnoresMembersAlreadyReleasing(t *testing.T) {
+	t0 := time.Date(2026, 10, 13, 19, 8, 12, 0, time.UTC)
+	gone, kept := task("a", 1, pod("a0", t0, nil)), task("a", 1, pod("a1", t0, nil))
+	gone.UID, kept.UID = "a0", "a1"
+	gone.Status = api.Releasing
+	jobs := map[api.JobID]*api.JobInfo{"a": {UID: "a", Tasks: api.TasksMap{"a0": gone, "a1": kept},
+		TaskStatusIndex: map[api.TaskStatus]api.TasksMap{api.Releasing: {"a0": gone}, api.Running: {"a1": kept}}}}
+	book := NewBook(jobs, gpu, DefaultDefaults(), t0.Add(time.Hour))
+	kept.Status = api.Releasing
+	if got := book.Job(kept).GPUSeconds; got != 1*(30+3600) {
+		t.Fatalf("got %v, want only the member released by this action priced", got)
 	}
 }

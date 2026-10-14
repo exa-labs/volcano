@@ -521,6 +521,9 @@ func planCapacityUpgrades(
 
 	ledger := newUpgradeLedger(nodes, running, conf, idx, gpu)
 	book := conf.RestartCost.book(jobs, gpu, now)
+	if conf.RestartCost.orders(conf.MaxRestartGpuSeconds) {
+		ledger.cost = book.Cost
+	}
 	plans := make([]capacityUpgradePlan, 0)
 	pods, gangs := 0, 0
 	for _, cand := range candidates {
@@ -766,6 +769,9 @@ type upgradeLedger struct {
 	// taken marks the displaceable pods an earlier plan in the pass relies
 	// on evicting, so two plans cannot count on the same pod.
 	taken map[types.UID]bool
+	// cost, once the restart-cost gate is in force, makes room with the
+	// cheapest displaceable pods of a priority.
+	cost func(*api.TaskInfo) float64
 }
 
 // newUpgradeLedger seeds the ledger from the session: each node's idle
@@ -932,6 +938,8 @@ type upgradeTarget struct {
 	// mover has yet to release.
 	ledger *api.Resource
 	placed float64
+	// cost is the ledger's; see upgradeLedger.
+	cost func(*api.TaskInfo) float64
 }
 
 // subClamped subtracts rr from r dimension by dimension, flooring at zero:
@@ -950,6 +958,7 @@ func subClamped(r, rr *api.Resource) {
 // fit even with every queued pod gone. Pods go lowest priority first and,
 // within a priority, the smallest one that covers the GPU shortfall on its
 // own, else the largest, so as few pods and GPUs as possible are disturbed.
+// With a restart cost, only the cheapest pods of the priority are candidates.
 func (t *upgradeTarget) makeRoom(need *api.Resource, gpu v1.ResourceName) (displaced, rest []*api.TaskInfo, ok bool) {
 	idle := t.idle.Clone()
 	rest = append(rest, t.queue...)
@@ -958,10 +967,19 @@ func (t *upgradeTarget) makeRoom(need *api.Resource, gpu v1.ResourceName) (displ
 			return nil, nil, false
 		}
 		shortfall := need.Get(gpu) - idle.Get(gpu)
+		cheapest := 0.0
+		for i := 0; t.cost != nil && i < len(rest) && rest[i].Priority == rest[0].Priority; i++ {
+			if c := t.cost(rest[i]); i == 0 || c < cheapest {
+				cheapest = c
+			}
+		}
 		pick := 0
 		for i, pod := range rest {
 			if pod.Priority != rest[0].Priority {
 				break
+			}
+			if t.cost != nil && t.cost(pod) > cheapest {
+				continue
 			}
 			pick = i
 			if taskGpu(pod, gpu) >= shortfall {
@@ -1004,7 +1022,7 @@ func simulateUpgradeInZone(
 				queue = append(queue, pod)
 			}
 		}
-		targets = append(targets, &upgradeTarget{node: node, idle: idle, queue: queue, ledger: ledger.idle[node.Name].Clone()})
+		targets = append(targets, &upgradeTarget{node: node, idle: idle, queue: queue, ledger: ledger.idle[node.Name].Clone(), cost: ledger.cost})
 	}
 
 	for _, member := range ordered {

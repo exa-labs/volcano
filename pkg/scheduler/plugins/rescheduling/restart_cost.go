@@ -64,10 +64,19 @@ func (g restartCostGate) count(skipped *prometheus.CounterVec) bool {
 	return !g.DryRun
 }
 
-// skip reports whether a decision must be skipped under limit, counting it
-// whenever the gate catches it.
-func (g restartCostGate) skip(skipped *prometheus.CounterVec, limit, gated float64) bool {
-	return g.over(limit, gated) && g.count(skipped)
+// clone copies the ledger, so a drain can be simulated without committing it.
+func (l *drainLedger) clone() *drainLedger {
+	out := &drainLedger{idle: make(map[string]*api.Resource, len(l.idle)), drained: map[string]bool{}, filled: map[string]bool{}}
+	for name, idle := range l.idle {
+		out.idle[name] = idle.Clone()
+	}
+	for name := range l.drained {
+		out.drained[name] = true
+	}
+	for name := range l.filled {
+		out.filled[name] = true
+	}
+	return out
 }
 
 // book prices jobs with the gate's defaults.

@@ -61,13 +61,13 @@ func (ra *Action) Initialize() {}
 func (ra *Action) parseArguments(ssn *framework.Session) {
 	arguments := framework.GetArgOfActionFromConf(ssn.Configurations, ra.Name())
 	arguments.GetBool(&ra.enablePredicateErrorCache, conf.EnablePredicateErrCacheKey)
-	mode := string(restartcost.ModeOff)
-	arguments.GetString(&mode, restartcost.ModeKey)
-	ra.restartCost = restartcost.ParseMode(mode)
+	ra.restartCost = restartcost.ModeOf(arguments[restartcost.ModeKey])
+	gpu := string(restartcost.GPUResource)
+	arguments.GetString(&gpu, restartcost.GPUResourceKey)
 	defaults := restartcost.DefaultDefaults()
 	arguments.GetFloat64(&defaults.StartupSeconds, restartcost.StartupSecondsKey)
 	arguments.GetFloat64(&defaults.TerminationSeconds, restartcost.TerminationSecondsKey)
-	ra.book = restartcost.NewBook(ssn.Jobs, restartcost.GPUResource, defaults, time.Now())
+	ra.book = restartcost.NewBook(ssn.Jobs, v1.ResourceName(gpu), defaults, time.Now())
 }
 
 func (ra *Action) Execute(ssn *framework.Session) {

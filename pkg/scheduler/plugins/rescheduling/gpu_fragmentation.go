@@ -378,12 +378,20 @@ func planGpuFragmentationDrains(
 			if ledger.touched(source.Name) {
 				continue
 			}
-			if conf.RestartCost.skip(gpuRepackSkipped, conf.MaxRestartGpuSecondsPerGpu, cand.price.gated) {
+			overCap := conf.RestartCost.over(conf.MaxRestartGpuSecondsPerGpu, cand.price.gated)
+			if overCap && !conf.RestartCost.DryRun {
+				// Count the skip only if the drain could have happened.
+				if len(simulateDrain(members, source, victims, gpu, ledger.clone(), predicate)) > 0 {
+					conf.RestartCost.count(gpuRepackSkipped)
+				}
 				continue
 			}
 			moves := simulateDrain(members, source, victims, gpu, ledger, predicate)
 			if len(moves) == 0 {
 				continue
+			}
+			if overCap {
+				conf.RestartCost.count(gpuRepackSkipped)
 			}
 			drains = append(drains, gpuFragmentationDrain{
 				pool:   pool,

@@ -121,6 +121,76 @@ func TestTopologyAwarePreemptRestartCost(t *testing.T) {
 	}
 }
 
+// Reprieve charges gangs: one 6-GPU node holds job A (two 2-GPU members
+// with an hour of work it cannot resume) and stateless 1-GPU pods b and c.
+// A 3-GPU preemptor needs room that b and c alone cannot free, so A is
+// charged anyway and both its members go, while b and c stay. The GPU
+// resource is configured, so the costs are only right if the key is read.
+func TestReprieveChargesGangOnce(t *testing.T) {
+	const gpuName = "example.com/gpu"
+	now := time.Now()
+	pod := func(name, node, group string, phase v1.PodPhase, gpus string, annotations map[string]string) *v1.Pod {
+		p := util.BuildPod("c1", name, node, phase, api.BuildResourceList("1", "1G", api.ScalarResource{Name: gpuName, Value: gpus}),
+			group, map[string]string{schedulingv1beta1.PodPreemptable: "true"}, nil)
+		for k, v := range annotations {
+			p.Annotations[k] = v
+		}
+		if phase == v1.PodRunning {
+			p.Status.StartTime = &metav1.Time{Time: now.Add(-time.Hour)}
+		}
+		return p
+	}
+	scratch := map[string]string{restartcost.AnnotationResume: restartcost.ResumeScratch}
+	stateless := map[string]string{restartcost.AnnotationResume: restartcost.ResumeStateless}
+	trueValue := true
+	tiers := []conf.Tier{{Plugins: []conf.PluginOption{
+		{Name: conformance.PluginName, EnabledPreemptable: &trueValue},
+		{Name: gang.PluginName, EnabledJobReady: &trueValue, EnabledJobPipelined: &trueValue, EnabledJobStarving: &trueValue},
+		{Name: priority.PluginName, EnabledTaskOrder: &trueValue, EnabledJobOrder: &trueValue, EnabledPreemptable: &trueValue,
+			EnabledJobPipelined: &trueValue, EnabledJobStarving: &trueValue},
+		{Name: proportion.PluginName, EnabledOverused: &trueValue, EnabledQueueOrder: &trueValue},
+		{Name: predicates.PluginName, EnabledPreemptable: &trueValue, EnabledPredicate: &trueValue},
+	}}}
+	test := uthelper.TestCommonStruct{
+		Plugins: map[string]framework.PluginBuilder{
+			conformance.PluginName: conformance.New, gang.PluginName: gang.New, priority.PluginName: priority.New,
+			proportion.PluginName: proportion.New, predicates.PluginName: predicates.New,
+		},
+		PriClass: []*schedulingv1.PriorityClass{util.BuildPriorityClass("high-priority", 100000), util.BuildPriorityClass("low-priority", 10)},
+		PodGroups: []*schedulingv1beta1.PodGroup{
+			util.BuildPodGroupWithPrio("pg-a", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning, "low-priority"),
+			util.BuildPodGroupWithPrio("pg-b", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning, "low-priority"),
+			util.BuildPodGroupWithPrio("pg-c", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning, "low-priority"),
+			util.BuildPodGroupWithPrio("pg-new", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+		},
+		Pods: []*v1.Pod{
+			pod("a1", "n1", "pg-a", v1.PodRunning, "2", scratch),
+			pod("a2", "n1", "pg-a", v1.PodRunning, "2", scratch),
+			pod("b", "n1", "pg-b", v1.PodRunning, "1", stateless),
+			pod("c", "n1", "pg-c", v1.PodRunning, "1", stateless),
+			pod("preemptor", "", "pg-new", v1.PodPending, "3", nil),
+		},
+		Nodes: []*v1.Node{util.BuildNode("n1", api.BuildResourceList("8", "8G",
+			api.ScalarResource{Name: "pods", Value: "10"}, api.ScalarResource{Name: gpuName, Value: "6"}), nil)},
+		Queues:         []*schedulingv1beta1.Queue{util.BuildQueue("q1", 1, nil)},
+		ExpectEvicted:  []string{"c1/a1", "c1/a2"},
+		ExpectEvictNum: 2,
+	}
+	test.RegisterSession(tiers, []conf.Configuration{{Name: "preempt", Arguments: map[string]interface{}{
+		EnableTopologyAwarePreemptionKey:    true,
+		EnableNodeOrderScoreInPreemptionKey: false,
+		MinCandidateNodesAbsoluteKey:        1,
+		MaxCandidateNodesAbsoluteKey:        1,
+		restartcost.ModeKey:                 true,
+		restartcost.GPUResourceKey:          gpuName,
+	}}})
+	defer test.Close()
+	test.Run([]framework.Action{New()})
+	if err := test.CheckAll(0); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Victims of equal priority on one node: the cheapest is evicted first and
 // reprieved last.
 func TestReprieveCostliestFirst(t *testing.T) {

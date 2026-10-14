@@ -17,6 +17,8 @@ limitations under the License.
 package rescheduling
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -220,6 +222,54 @@ func TestCapacityUpgradeTriesNextTierOverCap(t *testing.T) {
 	plans := f.startOnly(t, conf, newMemStore(f))
 	if len(plans) != 1 || plans[0].target != "spot" || plans[0].displacedCount() != 0 {
 		t.Fatalf("expected one move to spot displacing nobody, got %+v", plans)
+	}
+}
+
+// A drain over the cap counts as skipped only if it could have happened.
+func TestGpuFragmentationSkipsCountOnlyFeasibleDrains(t *testing.T) {
+	skipped := func() float64 { return testutil.ToFloat64(gpuRepackSkipped.WithLabelValues("restart_cost", "live")) }
+	f := newFixture(t)
+	source := f.addNode(gpuNode("source", 8, nil))
+	dest := f.addNode(gpuNode("dest", 8, nil))
+	startedHourAgo(f.placePod(t, source, gpuPod("costly", "source", 1, eligible(), map[string]string{restartcost.AnnotationResume: "scratch"}, true), 1, ""))
+	f.placePod(t, dest, gpuPod("resident", "dest", 8, nil, nil, true), 1, "")
+	conf := newGpuFragmentationConf()
+	conf.MaxRestartGpuSecondsPerGpu = 100
+	before := skipped()
+	if got := f.plan(conf, nil); len(got) != 0 || skipped() != before {
+		t.Fatalf("infeasible drain: expected no drain and no skip, got %v and %v skips", sources(got), skipped()-before)
+	}
+}
+
+// With the move gate in force, room is made from the cheapest fillers of a
+// priority: the four stateless ones, not the scratch ones.
+func TestMakeRoomDisplacesCheapestFillers(t *testing.T) {
+	plan := func(conf *capacityUpgradeConf) []string {
+		f := newFixture(t)
+		f.addNode(tierNode("spot-1", "spot", "a"))
+		f.addNode(tierNode("reserved-1", "reserved", "a"))
+		f.only(t, f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 4, -4, time.Hour)))
+		for i, filler := range f.fillers(t, "reserved-1", 8, 1, -9) {
+			resume := restartcost.ResumeScratch
+			if i >= 4 {
+				resume = restartcost.ResumeStateless
+			}
+			filler.Pod.Annotations[restartcost.AnnotationResume] = resume
+		}
+		plans := f.startOnly(t, conf, newMemStore(f))
+		if len(plans) != 1 {
+			t.Fatalf("expected one plan, got %+v", plans)
+		}
+		return displacedNames(plans[0])
+	}
+	filler := func(i int) string { return fmt.Sprintf("filler-reserved-1-1gpu-pri-9-%d", i) }
+	gated := displacingConf(-9)
+	gated.MaxRestartGpuSeconds = 1e9
+	if got, want := plan(gated), []string{filler(4), filler(5), filler(6), filler(7)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("gated: got %v, want %v", got, want)
+	}
+	if got := plan(displacingConf(-9)); len(got) != 4 {
+		t.Fatalf("default: expected four fillers displaced, got %v", got)
 	}
 }
 

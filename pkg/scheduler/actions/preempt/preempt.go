@@ -146,13 +146,13 @@ func (pmpt *Action) parseArguments(ssn *framework.Session) {
 		time.Duration(pmpt.preemptionBackoffSeconds)*time.Second,
 		time.Duration(pmpt.preemptionMaxBackoffSeconds)*time.Second,
 	)
-	mode := string(restartcost.ModeOff)
-	arguments.GetString(&mode, restartcost.ModeKey)
-	pmpt.restartCost = restartcost.ParseMode(mode)
+	pmpt.restartCost = restartcost.ModeOf(arguments[restartcost.ModeKey])
+	gpu := string(restartcost.GPUResource)
+	arguments.GetString(&gpu, restartcost.GPUResourceKey)
 	pmpt.restartCostDefaults = restartcost.DefaultDefaults()
 	arguments.GetFloat64(&pmpt.restartCostDefaults.StartupSeconds, restartcost.StartupSecondsKey)
 	arguments.GetFloat64(&pmpt.restartCostDefaults.TerminationSeconds, restartcost.TerminationSecondsKey)
-	pmpt.book = restartcost.NewBook(ssn.Jobs, restartcost.GPUResource, pmpt.restartCostDefaults, time.Now())
+	pmpt.book = restartcost.NewBook(ssn.Jobs, v1.ResourceName(gpu), pmpt.restartCostDefaults, time.Now())
 	pmpt.ssn = ssn
 }
 
@@ -804,9 +804,10 @@ func (pmpt *Action) topologyAwarePreempt(
 		return false, fmt.Errorf("no candidate node for preemption")
 	}
 	if pmpt.restartCost == restartcost.ModeShadow {
+		// Nodes that tie on cost are not a different decision.
 		aware := selectCandidate(candidates, ssn, preemptor, pmpt.enableNodeOrderScoreInPreemption, pmpt.book.Selection)
-		metrics.RegisterRestartCostShadow(pmpt.Name(), aware.Name() != bestCandidate.Name(),
-			pmpt.book.Selection(bestCandidate.Victims()), pmpt.book.Selection(aware.Victims()))
+		baseline, awareCost := pmpt.book.Selection(bestCandidate.Victims()), pmpt.book.Selection(aware.Victims())
+		metrics.RegisterRestartCostShadow(pmpt.Name(), baseline != awareCost, baseline, awareCost)
 	}
 
 	if status := prepareCandidate(bestCandidate, preemptor.Pod, stmt, ssn); !status.IsSuccess() {
@@ -1169,11 +1170,20 @@ func SelectVictimsOnNode(
 
 	// Now we try to reprieve non-violating victims.
 	if cost != nil {
-		reprieveCostliestFirst(potentialVictims, cost, ssn.SameVictimPriority)
-	}
-	for _, p := range potentialVictims {
-		if _, err := reprievePod(p); err != nil {
+		fits := func() bool {
+			return ssn.SimulateAllocatableFn(ctx, state, currentQueue, preemptor) &&
+				preemptor.InitResreq.LessEqual(nodeInfo.FutureIdle(), api.Zero) &&
+				ssn.SimulatePredicateFn(ctx, state, preemptor, nodeInfo) == nil
+		}
+		var err error
+		if victims, err = reprieveGangs(potentialVictims, allVictims, cost, ssn.SameVictimPriority, addTask, removeTask, fits); err != nil {
 			return nil, api.AsStatus(err)
+		}
+	} else {
+		for _, p := range potentialVictims {
+			if _, err := reprievePod(p); err != nil {
+				return nil, api.AsStatus(err)
+			}
 		}
 	}
 
@@ -1182,6 +1192,69 @@ func SelectVictimsOnNode(
 	return victims, &api.Status{
 		Reason: "",
 	}
+}
+
+// reprieveGangs reprieves whole jobs, costliest first: a job keeps all its
+// removed members or none. An evicted job is charged anyway, so its other
+// eligible members on the node go too, at no extra cost, and the room they
+// free may reprieve cheaper jobs.
+func reprieveGangs(
+	potential, eligible []*api.TaskInfo,
+	cost func(*api.TaskInfo) float64,
+	same func(l, r *api.TaskInfo) bool,
+	add, remove func(*api.TaskInfo) error,
+	fits func() bool,
+) ([]*api.TaskInfo, error) {
+	gang := func(task *api.TaskInfo) string {
+		if task.Job == "" {
+			return string(task.UID)
+		}
+		return string(task.Job)
+	}
+	reprieveCostliestFirst(potential, cost, same)
+	removed := map[api.TaskID]bool{}
+	for _, task := range potential {
+		removed[task.UID] = true
+	}
+	var victims []*api.TaskInfo
+	decided := map[string]bool{}
+	for _, first := range potential {
+		key := gang(first)
+		if decided[key] {
+			continue
+		}
+		decided[key] = true
+		var members []*api.TaskInfo
+		for _, task := range potential {
+			if gang(task) == key {
+				members = append(members, task)
+			}
+		}
+		for _, member := range members {
+			if err := add(member); err != nil {
+				return nil, err
+			}
+		}
+		if fits() {
+			continue
+		}
+		for _, member := range members {
+			if err := remove(member); err != nil {
+				return nil, err
+			}
+		}
+		victims = append(victims, members...)
+		for _, task := range eligible {
+			if gang(task) == key && !removed[task.UID] {
+				if err := remove(task); err != nil {
+					return nil, err
+				}
+				removed[task.UID] = true
+				victims = append(victims, task)
+			}
+		}
+	}
+	return victims, nil
 }
 
 // reprieveCostliestFirst reorders each run of victims that rank equally

@@ -74,6 +74,8 @@ const (
 	StartupSecondsKey     = "restartCostStartupSeconds"
 	TerminationSecondsKey = "restartCostTerminationSeconds"
 	GateUnannouncedKey    = "gateUnannounced"
+	// GPUResourceKey names the resource preempt and reclaim count as GPUs.
+	GPUResourceKey = "restartCostGpuResource"
 	// GPUResource is the resource restart cost counts for preempt and reclaim.
 	GPUResource                  = v1.ResourceName("nvidia.com/gpu")
 	defaultStartupSeconds        = 300
@@ -93,6 +95,24 @@ const (
 	// ModeOn evicts the cheapest victims among equal priority.
 	ModeOn Mode = "on"
 )
+
+// ModeOf reads the configured restartCost argument. An unquoted YAML on/off
+// arrives as a bool, so true is ModeOn and false is ModeOff.
+func ModeOf(raw interface{}) Mode {
+	switch v := raw.(type) {
+	case nil:
+		return ModeOff
+	case bool:
+		if v {
+			return ModeOn
+		}
+		return ModeOff
+	case string:
+		return ParseMode(v)
+	}
+	klog.Warningf("restartCost: unknown mode %v, using %q", raw, ModeOff)
+	return ModeOff
+}
 
 // ParseMode reads a configured mode; anything unrecognised is ModeOff.
 func ParseMode(raw string) Mode {
@@ -177,17 +197,23 @@ func GPUSeconds(f Facts, now float64, d Defaults) float64 {
 }
 
 // ParsePod reads a pod's restart facts; GPUs is left to the caller.
-// started_at is status.startTime, falling back to creation; the grace period
-// defaults to Kubernetes' 30 s. Unparseable annotations, and a productive-at
-// before the start, are logged at V(4) and treated as absent.
-func ParsePod(pod *v1.Pod) Facts {
+// started_at is status.startTime, falling back to creation, and to now (age
+// 0) when neither is set; the grace period defaults to Kubernetes' 30 s.
+// Unparseable annotations, and a productive-at before the start, are logged
+// at V(4) and treated as absent.
+func ParsePod(pod *v1.Pod, now float64) Facts {
 	f := Facts{GraceSeconds: kubernetesDefaultGraceSecond}
 	if pod.Spec.TerminationGracePeriodSeconds != nil {
 		f.GraceSeconds = float64(*pod.Spec.TerminationGracePeriodSeconds)
 	}
-	f.StartedAt = float64(pod.CreationTimestamp.Unix())
-	if pod.Status.StartTime != nil {
+	switch {
+	case pod.Status.StartTime != nil:
 		f.StartedAt = float64(pod.Status.StartTime.Unix())
+	case !pod.CreationTimestamp.IsZero():
+		f.StartedAt = float64(pod.CreationTimestamp.Unix())
+	default:
+		klog.V(4).Infof("restartCost: pod %s/%s has no start or creation time, pricing it as just started", pod.Namespace, pod.Name)
+		f.StartedAt = now
 	}
 
 	p := parser{pod: pod, announced: &f.Announced}
@@ -258,12 +284,12 @@ var errBeforeStart = errors.New("before the pod started")
 // earliest start and productive time and the latest checkpoint win, and
 // declarations take the most expensive value (largest S, D and grace;
 // scratch over checkpoint over stateless). ok is false without members.
-func Gang(tasks []*api.TaskInfo, gpu v1.ResourceName) (f Facts, ok bool) {
+func Gang(tasks []*api.TaskInfo, gpu v1.ResourceName, now float64) (f Facts, ok bool) {
 	for _, task := range tasks {
 		if task.Pod == nil {
 			continue
 		}
-		m := ParsePod(task.Pod)
+		m := ParsePod(task.Pod, now)
 		m.GPUs = task.Resreq.Get(gpu) / gpuMilli
 		if !ok {
 			f, ok = m, true
@@ -319,16 +345,25 @@ type Book struct {
 
 	mu     sync.Mutex
 	prices map[api.JobID]Price
+	// released are the members already Releasing when the book opened: their
+	// jobs are being torn down already, so they add nothing.
+	released map[api.TaskID]bool
 }
 
 // NewBook returns a book over the session's jobs.
 func NewBook(jobs map[api.JobID]*api.JobInfo, gpu v1.ResourceName, defaults Defaults, now time.Time) *Book {
-	return &Book{jobs: jobs, gpu: gpu, defaults: defaults, now: float64(now.Unix()), prices: map[api.JobID]Price{}}
+	released := map[api.TaskID]bool{}
+	for _, job := range jobs {
+		for uid := range job.TaskStatusIndex[api.Releasing] {
+			released[uid] = true
+		}
+	}
+	return &Book{jobs: jobs, gpu: gpu, defaults: defaults, now: float64(now.Unix()), prices: map[api.JobID]Price{}, released: released}
 }
 
 // Of prices facts aggregated over an arbitrary member set.
 func (b *Book) Of(tasks []*api.TaskInfo) Price {
-	f, ok := Gang(tasks, b.gpu)
+	f, ok := Gang(tasks, b.gpu, b.now)
 	if !ok {
 		return Price{}
 	}
@@ -336,9 +371,9 @@ func (b *Book) Of(tasks []*api.TaskInfo) Price {
 }
 
 // Job prices the task's job from its running members; a task whose job is
-// not in the session is priced alone. Releasing members count as running:
-// an action marks its own victims Releasing as it evicts them, and their
-// job must not get cheaper mid-selection.
+// not in the session is priced alone. Members the action itself marks
+// Releasing as it evicts them still count, so a job does not get cheaper
+// mid-selection; members already Releasing when the book opened do not.
 func (b *Book) Job(task *api.TaskInfo) Price {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -351,7 +386,7 @@ func (b *Book) Job(task *api.TaskInfo) Price {
 	}
 	running := make([]*api.TaskInfo, 0, len(job.Tasks))
 	for _, member := range job.Tasks {
-		if member.Status == api.Running || member.Status == api.Releasing {
+		if member.Status == api.Running || (member.Status == api.Releasing && !b.released[member.UID]) {
 			running = append(running, member)
 		}
 	}
@@ -390,18 +425,11 @@ func (b *Book) Selection(victims []*api.TaskInfo) float64 {
 }
 
 // Shadow compares the victims two orderings would evict to fit need next to
-// idle: whether the covers differ, and the cost of each.
+// idle: the cost of each, and whether they differ in cost (equal-cost
+// choices are ties, not different decisions).
 func (b *Book) Shadow(baseline, costAware []*api.TaskInfo, need, idle *api.Resource) (differs bool, baselineCost, costAwareCost float64) {
-	base, aware := Cover(baseline, need, idle), Cover(costAware, need, idle)
-	chosen := map[api.TaskID]bool{}
-	for _, task := range base {
-		chosen[task.UID] = true
-	}
-	differs = len(base) != len(aware)
-	for i := 0; !differs && i < len(aware); i++ {
-		differs = !chosen[aware[i].UID]
-	}
-	return differs, b.Selection(base), b.Selection(aware)
+	baselineCost, costAwareCost = b.Selection(Cover(baseline, need, idle)), b.Selection(Cover(costAware, need, idle))
+	return baselineCost != costAwareCost, baselineCost, costAwareCost
 }
 
 // Cover returns the shortest prefix of ordered whose resources, added to
