@@ -21,7 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Decisions the restart-cost gates caught, by reason (restart_cost) and mode:
+// Decisions the eviction-cost gates caught, by reason (eviction_cost) and mode:
 // live (skipped) or dry_run (counted, not skipped).
 var (
 	gpuRepackSkipped = promauto.NewCounterVec(

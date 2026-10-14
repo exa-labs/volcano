@@ -22,7 +22,7 @@ import (
 )
 
 // Evictions by the action (preempt, reclaim, shuffle) and strategy that chose
-// them, and the restart cost they threw away. Costs are per gang: a job with
+// them, and the eviction cost they threw away. Costs are per gang: a job with
 // several evicted members is observed once.
 var (
 	evictionsTotal = promauto.NewCounterVec(
@@ -33,52 +33,52 @@ var (
 		}, []string{"action", "strategy"},
 	)
 
-	evictionRestartCost = promauto.NewHistogramVec(
+	evictionCost = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: VolcanoSubSystemName,
-			Name:      "eviction_restart_cost_gpu_seconds",
+			Name:      "eviction_cost_gpu_seconds",
 			Help:      "Estimated GPU-seconds of work lost per evicted job, by action and strategy.",
 			Buckets:   prometheus.ExponentialBuckets(60, 4, 11),
 		}, []string{"action", "strategy"},
 	)
 
-	restartCostShadowDecisions = promauto.NewCounterVec(
+	evictionCostShadowDecisions = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: VolcanoSubSystemName,
-			Name:      "restart_cost_shadow_decisions_total",
-			Help:      "Victim selections evaluated in restartCost shadow mode, by action and whether the cost-aware choice differed (same, different).",
+			Name:      "eviction_cost_shadow_decisions_total",
+			Help:      "Victim selections evaluated in evictionCost shadow mode, by action and whether the cost-aware choice differed (same, different).",
 		}, []string{"action", "outcome"},
 	)
 
-	restartCostShadowGpuSeconds = promauto.NewCounterVec(
+	evictionCostShadowGpuSeconds = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: VolcanoSubSystemName,
-			Name:      "restart_cost_shadow_gpu_seconds_total",
-			Help:      "Restart cost of shadow-mode victim selections, by action and choice: baseline (acted on) or cost_aware (what restartCost on would evict). The difference is the saving.",
+			Name:      "eviction_cost_shadow_gpu_seconds_total",
+			Help:      "Eviction cost of shadow-mode victim selections, by action and choice: baseline (acted on) or cost_aware (what evictionCost on would evict). The difference is the saving.",
 		}, []string{"action", "choice"},
 	)
 )
 
 // RegisterEvictions counts pods evicted by an action and observes the
-// restart cost of each evicted job.
+// eviction cost of each evicted job.
 func RegisterEvictions(action, strategy string, pods int, jobCosts []float64) {
 	if pods == 0 {
 		return
 	}
 	evictionsTotal.WithLabelValues(action, strategy).Add(float64(pods))
 	for _, cost := range jobCosts {
-		evictionRestartCost.WithLabelValues(action, strategy).Observe(cost)
+		evictionCost.WithLabelValues(action, strategy).Observe(cost)
 	}
 }
 
-// RegisterRestartCostShadow records one shadow-mode comparison between the
+// RegisterEvictionCostShadow records one shadow-mode comparison between the
 // victims an action evicted and the ones cost-aware ordering would evict.
-func RegisterRestartCostShadow(action string, differs bool, baseline, costAware float64) {
+func RegisterEvictionCostShadow(action string, differs bool, baseline, costAware float64) {
 	outcome := "same"
 	if differs {
 		outcome = "different"
 	}
-	restartCostShadowDecisions.WithLabelValues(action, outcome).Inc()
-	restartCostShadowGpuSeconds.WithLabelValues(action, "baseline").Add(baseline)
-	restartCostShadowGpuSeconds.WithLabelValues(action, "cost_aware").Add(costAware)
+	evictionCostShadowDecisions.WithLabelValues(action, outcome).Inc()
+	evictionCostShadowGpuSeconds.WithLabelValues(action, "baseline").Add(baseline)
+	evictionCostShadowGpuSeconds.WithLabelValues(action, "cost_aware").Add(costAware)
 }

@@ -1,5 +1,5 @@
 {
-  "description": "Restart cost in GPU-seconds. Times are Unix seconds; null is unknown. Shared by every implementation of the cost function.",
+  "description": "Eviction cost in GPU-seconds. Times are Unix seconds; null is unknown. Shared by every implementation of the cost function.",
   "vectors": [
     {
       "name": "unannounced, still starting",

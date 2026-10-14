@@ -151,12 +151,12 @@ type capacityUpgradeConf struct {
 	// default), a move only ever takes idle GPUs and restarts nothing but
 	// the mover.
 	MaxDisplacedPriority *int32 `mapstructure:"maxDisplacedPriority"`
-	// MaxRestartGpuSeconds, when set, skips a move whose restart cost (the
+	// MaxEvictionCostGpuSeconds, when set, skips a move whose eviction cost (the
 	// mover's gang plus every job it displaces) exceeds it, and evicts the
-	// cheapest displaced pods first (see restartCostGate). Unset (0), moves
+	// cheapest displaced pods first (see evictionCostGate). Unset (0), moves
 	// are planned and carried out as without it.
-	MaxRestartGpuSeconds float64         `mapstructure:"maxRestartGpuSeconds"`
-	RestartCost          restartCostGate `mapstructure:",squash"`
+	MaxEvictionCostGpuSeconds float64          `mapstructure:"maxEvictionCostGpuSeconds"`
+	EvictionCost              evictionCostGate `mapstructure:",squash"`
 }
 
 // displaces reports whether pods of the given priority are room to be made
@@ -176,7 +176,7 @@ func (c *capacityUpgradeConf) shielded(pod *v1.Pod) bool {
 }
 
 func newCapacityUpgradeConf() *capacityUpgradeConf {
-	conf := &capacityUpgradeConf{RestartCost: newRestartCostGate()}
+	conf := &capacityUpgradeConf{EvictionCost: newEvictionCostGate()}
 	_ = mapstructure.Decode(DefaultCapacityUpgradeConf, conf)
 	return conf
 }
@@ -338,7 +338,7 @@ var victimsFnForCapacityUpgradeMoves = func(tasks []*api.TaskInfo) []*api.TaskIn
 	}
 	steps := advanceCapacityUpgradeMoves(idx, Session.Nodes, Session.Jobs, conf, time.Now(), sessionPredicate())
 	victims := applyMoveSteps(steps, sessionStore{})
-	recordShuffleEvictions(CapacityUpgradeStrategy, conf.RestartCost.book(Session.Jobs, v1.ResourceName(conf.GpuResource), time.Now()), victims)
+	recordShuffleEvictions(CapacityUpgradeStrategy, conf.EvictionCost.book(Session.Jobs, v1.ResourceName(conf.GpuResource), time.Now()), victims)
 	return victims
 }
 
@@ -520,8 +520,8 @@ func planCapacityUpgrades(
 	})
 
 	ledger := newUpgradeLedger(nodes, running, conf, idx, gpu)
-	book := conf.RestartCost.book(jobs, gpu, now)
-	if conf.RestartCost.orders(conf.MaxRestartGpuSeconds) {
+	book := conf.EvictionCost.book(jobs, gpu, now)
+	if conf.EvictionCost.orders(conf.MaxEvictionCostGpuSeconds) {
 		ledger.cost = book.Cost
 	}
 	plans := make([]capacityUpgradePlan, 0)
@@ -536,7 +536,7 @@ func planCapacityUpgrades(
 		var placement *capacityUpgradePlacement
 		targetRank := 0
 		guard := newDemandGuard(demand, cand)
-		// overCap: a placement was found whose restart cost is over the
+		// overCap: a placement was found whose eviction cost is over the
 		// cap. Live, the next tier is tried, since another placement may
 		// displace less; dry run keeps the first placement.
 		overCap := false
@@ -549,10 +549,10 @@ func planCapacityUpgrades(
 			if placement == nil {
 				continue
 			}
-			if cost := conf.RestartCost.movePrice(book, cand.members, placement.displaced); conf.RestartCost.over(conf.MaxRestartGpuSeconds, cost.gated) {
+			if cost := conf.EvictionCost.movePrice(book, cand.members, placement.displaced); conf.EvictionCost.over(conf.MaxEvictionCostGpuSeconds, cost.gated) {
 				klog.V(3).Infof("capacityUpgrade: %s/%s placement on rank %d costs %.0f GPU-seconds, over the cap", cand.job.Namespace, cand.job.Name, rank, cost.gated)
 				overCap = true
-				if !conf.RestartCost.DryRun {
+				if !conf.EvictionCost.DryRun {
 					placement = nil
 					continue
 				}
@@ -560,8 +560,8 @@ func planCapacityUpgrades(
 			targetRank = rank
 			break
 		}
-		if overCap && (placement == nil || conf.RestartCost.DryRun) {
-			conf.RestartCost.count(capacityUpgradeSkipped)
+		if overCap && (placement == nil || conf.EvictionCost.DryRun) {
+			conf.EvictionCost.count(capacityUpgradeSkipped)
 		}
 		if placement == nil {
 			if guard != nil && guard.skipped > 0 {
@@ -769,7 +769,7 @@ type upgradeLedger struct {
 	// taken marks the displaceable pods an earlier plan in the pass relies
 	// on evicting, so two plans cannot count on the same pod.
 	taken map[types.UID]bool
-	// cost, once the restart-cost gate is in force, makes room with the
+	// cost, once the eviction-cost gate is in force, makes room with the
 	// cheapest displaceable pods of a priority.
 	cost func(*api.TaskInfo) float64
 }
@@ -958,7 +958,7 @@ func subClamped(r, rr *api.Resource) {
 // fit even with every queued pod gone. Pods go lowest priority first and,
 // within a priority, the smallest one that covers the GPU shortfall on its
 // own, else the largest, so as few pods and GPUs as possible are disturbed.
-// With a restart cost, only the cheapest pods of the priority are candidates.
+// With an eviction cost, only the cheapest pods of the priority are candidates.
 func (t *upgradeTarget) makeRoom(need *api.Resource, gpu v1.ResourceName) (displaced, rest []*api.TaskInfo, ok bool) {
 	idle := t.idle.Clone()
 	rest = append(rest, t.queue...)

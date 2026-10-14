@@ -26,7 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
-	"volcano.sh/volcano/pkg/scheduler/api/restartcost"
+	"volcano.sh/volcano/pkg/scheduler/api/evictioncost"
 )
 
 // startedHourAgo makes the pod's start time deterministic.
@@ -45,8 +45,8 @@ func repackFixture(t *testing.T) *fixture {
 	a := f.addNode(gpuNode("a-source", 8, nil))
 	b := f.addNode(gpuNode("b-source", 8, nil))
 	dest := f.addNode(gpuNode("dest", 8, nil))
-	startedHourAgo(f.placePod(t, a, gpuPod("costly", "a-source", 1, eligible(), map[string]string{restartcost.AnnotationResume: "scratch"}, true), 1, ""))
-	startedHourAgo(f.placePod(t, b, gpuPod("cheap", "b-source", 1, eligible(), map[string]string{restartcost.AnnotationResume: "stateless"}, true), 1, ""))
+	startedHourAgo(f.placePod(t, a, gpuPod("costly", "a-source", 1, eligible(), map[string]string{evictioncost.AnnotationResume: "scratch"}, true), 1, ""))
+	startedHourAgo(f.placePod(t, b, gpuPod("cheap", "b-source", 1, eligible(), map[string]string{evictioncost.AnnotationResume: "stateless"}, true), 1, ""))
 	f.placePod(t, dest, gpuPod("resident", "dest", 6, nil, nil, true), 1, "")
 	return f
 }
@@ -59,9 +59,9 @@ func sources(plans []plannedMove) []string {
 	return out
 }
 
-func TestGpuFragmentationRestartCostGate(t *testing.T) {
+func TestGpuFragmentationEvictionCostGate(t *testing.T) {
 	skipped := func(mode string) float64 {
-		return testutil.ToFloat64(gpuRepackSkipped.WithLabelValues("restart_cost", mode))
+		return testutil.ToFloat64(gpuRepackSkipped.WithLabelValues("eviction_cost", mode))
 	}
 	conf := func(params map[string]interface{}) *gpuFragmentationConf {
 		c := newGpuFragmentationConf()
@@ -79,7 +79,7 @@ func TestGpuFragmentationRestartCostGate(t *testing.T) {
 	}
 
 	// Dry run: same plan as the defaults, the costly drain counted.
-	dryRun := conf(map[string]interface{}{"maxRestartGpuSecondsPerGpu": 1000, "restartCostDryRun": true})
+	dryRun := conf(map[string]interface{}{"maxEvictionCostGpuSecondsPerGpu": 1000, "evictionCostDryRun": true})
 	if got := sources(repackFixture(t).plan(dryRun, nil)); len(got) != 1 || got[0] != "a-source" {
 		t.Fatalf("dry run: expected a-source drained, got %v", got)
 	}
@@ -88,13 +88,13 @@ func TestGpuFragmentationRestartCostGate(t *testing.T) {
 	}
 
 	// On: the cheap source drains first, the costly one is never reached.
-	on := conf(map[string]interface{}{"maxRestartGpuSecondsPerGpu": 1000})
+	on := conf(map[string]interface{}{"maxEvictionCostGpuSecondsPerGpu": 1000})
 	if got := sources(repackFixture(t).plan(on, nil)); len(got) != 1 || got[0] != "b-source" {
 		t.Fatalf("on: expected b-source drained, got %v", got)
 	}
 
 	// On, with the cheap drain over the cap too: nothing drains.
-	on.MaxRestartGpuSecondsPerGpu = 100
+	on.MaxEvictionCostGpuSecondsPerGpu = 100
 	liveBefore := skipped("live")
 	if got := repackFixture(t).plan(on, nil); len(got) != 0 {
 		t.Fatalf("on, low cap: expected no drain, got %v", sources(got))
@@ -112,28 +112,28 @@ func TestGpuFragmentationRestartCostGate(t *testing.T) {
 	if got := f.plan(on, nil); len(got) != 1 {
 		t.Fatalf("unannounced: expected the drain, got %v", sources(got))
 	}
-	on.RestartCost.GateUnannounced = true
+	on.EvictionCost.GateUnannounced = true
 	if got := f.plan(on, nil); len(got) != 0 {
 		t.Fatalf("gateUnannounced: expected no drain, got %v", sources(got))
 	}
 }
 
-func TestRestartCostGateDefaults(t *testing.T) {
-	for name, gate := range map[string]restartCostGate{
-		"gpuFragmentation": newGpuFragmentationConf().RestartCost,
-		"capacityUpgrade":  newCapacityUpgradeConf().RestartCost,
+func TestEvictionCostGateDefaults(t *testing.T) {
+	for name, gate := range map[string]evictionCostGate{
+		"gpuFragmentation": newGpuFragmentationConf().EvictionCost,
+		"capacityUpgrade":  newCapacityUpgradeConf().EvictionCost,
 	} {
-		if gate.DryRun || gate.GateUnannounced || gate.Defaults != restartcost.DefaultDefaults() {
+		if gate.DryRun || gate.GateUnannounced || gate.Defaults != evictioncost.DefaultDefaults() {
 			t.Errorf("%s: unexpected default gate %+v", name, gate)
 		}
 	}
-	if newGpuFragmentationConf().MaxRestartGpuSecondsPerGpu != 0 || newCapacityUpgradeConf().MaxRestartGpuSeconds != 0 {
-		t.Fatal("restart-cost caps must default to absent")
+	if newGpuFragmentationConf().MaxEvictionCostGpuSecondsPerGpu != 0 || newCapacityUpgradeConf().MaxEvictionCostGpuSeconds != 0 {
+		t.Fatal("eviction-cost caps must default to absent")
 	}
 	c := newCapacityUpgradeConf()
-	c.parse(map[string]interface{}{"maxRestartGpuSeconds": 5000, "restartCostStartupSeconds": 900, "gateUnannounced": true})
-	if c.MaxRestartGpuSeconds != 5000 || c.RestartCost.StartupSeconds != 900 || c.RestartCost.TerminationSeconds != 30 || !c.RestartCost.GateUnannounced {
-		t.Fatalf("unexpected parsed conf %+v", c.RestartCost)
+	c.parse(map[string]interface{}{"maxEvictionCostGpuSeconds": 5000, "evictionCostStartupSeconds": 900, "gateUnannounced": true})
+	if c.MaxEvictionCostGpuSeconds != 5000 || c.EvictionCost.StartupSeconds != 900 || c.EvictionCost.TerminationSeconds != 30 || !c.EvictionCost.GateUnannounced {
+		t.Fatalf("unexpected parsed conf %+v", c.EvictionCost)
 	}
 	if displacedCost(newCapacityUpgradeConf(), nil, testNow) != nil {
 		t.Fatal("displaced pods must keep name order by default")
@@ -152,7 +152,7 @@ func TestMoveDisplacesCheapestFillersFirst(t *testing.T) {
 		f.only(t, f.placeGroup(t, 1, nil, tierPod("resident-1", "reserved-1", "pg-resident-1", 2, -2, time.Hour)))
 		fillers := f.fillers(t, "reserved-1", 4, 1, -9)
 		for _, filler := range fillers[2:] {
-			filler.Pod.Annotations[restartcost.AnnotationResume] = restartcost.ResumeStateless
+			filler.Pod.Annotations[evictioncost.AnnotationResume] = evictioncost.ResumeStateless
 		}
 		store := newMemStore(f)
 		if plans := f.startOnly(t, conf, store); len(plans) != 1 || len(displacedNames(plans[0])) != 4 {
@@ -165,7 +165,7 @@ func TestMoveDisplacesCheapestFillersFirst(t *testing.T) {
 
 	byName := run(displacingConf(-9))
 	gated := displacingConf(-9)
-	gated.MaxRestartGpuSeconds = 1e9
+	gated.MaxEvictionCostGpuSeconds = 1e9
 	byCost := run(gated)
 	if len(byName) != 2 || byName[0] != "filler-reserved-1-1gpu-pri-9-0" || byName[1] != "filler-reserved-1-1gpu-pri-9-1" {
 		t.Fatalf("default: expected the first two fillers by name, got %v", byName)
@@ -177,26 +177,26 @@ func TestMoveDisplacesCheapestFillersFirst(t *testing.T) {
 
 // A move whose mover alone is over the cap is not started; in dry run it is
 // started and counted.
-func TestCapacityUpgradeRestartCostGate(t *testing.T) {
+func TestCapacityUpgradeEvictionCostGate(t *testing.T) {
 	plan := func(conf *capacityUpgradeConf) int {
 		f := newFixture(t)
 		f.addNode(tierNode("spot-1", "spot", "a"))
 		f.addNode(tierNode("reserved-1", "reserved", "a"))
 		mover := f.only(t, f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 4, -4, time.Hour)))
-		mover.Pod.Annotations[restartcost.AnnotationResume] = restartcost.ResumeScratch
+		mover.Pod.Annotations[evictioncost.AnnotationResume] = evictioncost.ResumeScratch
 		return len(f.startOnly(t, conf, newMemStore(f)))
 	}
 	skipped := func(mode string) float64 {
-		return testutil.ToFloat64(capacityUpgradeSkipped.WithLabelValues("restart_cost", mode))
+		return testutil.ToFloat64(capacityUpgradeSkipped.WithLabelValues("eviction_cost", mode))
 	}
 	// 4 GPUs x (30 + 3600) s is over a 10000 GPU-second cap.
 	conf := liveConf()
-	conf.MaxRestartGpuSeconds = 10000
+	conf.MaxEvictionCostGpuSeconds = 10000
 	live := skipped("live")
 	if got := plan(conf); got != 0 || skipped("live") != live+1 {
 		t.Fatalf("on: expected the move skipped and counted, got %d plans", got)
 	}
-	conf.RestartCost.DryRun = true
+	conf.EvictionCost.DryRun = true
 	dry := skipped("dry_run")
 	if got := plan(conf); got != 1 || skipped("dry_run") != dry+1 {
 		t.Fatalf("dry run: expected the move planned and counted, got %d plans", got)
@@ -215,10 +215,10 @@ func TestCapacityUpgradeTriesNextTierOverCap(t *testing.T) {
 	f.addNode(tierNode("reserved-1", "reserved", "a"))
 	f.only(t, f.placeGroup(t, 1, nil, tierPod("train", "ondemand-1", "pg-train", 4, -4, time.Hour)))
 	for _, filler := range f.fillers(t, "reserved-1", 8, 1, -9) {
-		filler.Pod.Annotations[restartcost.AnnotationResume] = restartcost.ResumeScratch
+		filler.Pod.Annotations[evictioncost.AnnotationResume] = evictioncost.ResumeScratch
 	}
 	conf := displacingConf(-9)
-	conf.MaxRestartGpuSeconds = 10000
+	conf.MaxEvictionCostGpuSeconds = 10000
 	plans := f.startOnly(t, conf, newMemStore(f))
 	if len(plans) != 1 || plans[0].target != "spot" || plans[0].displacedCount() != 0 {
 		t.Fatalf("expected one move to spot displacing nobody, got %+v", plans)
@@ -227,14 +227,14 @@ func TestCapacityUpgradeTriesNextTierOverCap(t *testing.T) {
 
 // A drain over the cap counts as skipped only if it could have happened.
 func TestGpuFragmentationSkipsCountOnlyFeasibleDrains(t *testing.T) {
-	skipped := func() float64 { return testutil.ToFloat64(gpuRepackSkipped.WithLabelValues("restart_cost", "live")) }
+	skipped := func() float64 { return testutil.ToFloat64(gpuRepackSkipped.WithLabelValues("eviction_cost", "live")) }
 	f := newFixture(t)
 	source := f.addNode(gpuNode("source", 8, nil))
 	dest := f.addNode(gpuNode("dest", 8, nil))
-	startedHourAgo(f.placePod(t, source, gpuPod("costly", "source", 1, eligible(), map[string]string{restartcost.AnnotationResume: "scratch"}, true), 1, ""))
+	startedHourAgo(f.placePod(t, source, gpuPod("costly", "source", 1, eligible(), map[string]string{evictioncost.AnnotationResume: "scratch"}, true), 1, ""))
 	f.placePod(t, dest, gpuPod("resident", "dest", 8, nil, nil, true), 1, "")
 	conf := newGpuFragmentationConf()
-	conf.MaxRestartGpuSecondsPerGpu = 100
+	conf.MaxEvictionCostGpuSecondsPerGpu = 100
 	before := skipped()
 	if got := f.plan(conf, nil); len(got) != 0 || skipped() != before {
 		t.Fatalf("infeasible drain: expected no drain and no skip, got %v and %v skips", sources(got), skipped()-before)
@@ -250,11 +250,11 @@ func TestMakeRoomDisplacesCheapestFillers(t *testing.T) {
 		f.addNode(tierNode("reserved-1", "reserved", "a"))
 		f.only(t, f.placeGroup(t, 1, nil, tierPod("train", "spot-1", "pg-train", 4, -4, time.Hour)))
 		for i, filler := range f.fillers(t, "reserved-1", 8, 1, -9) {
-			resume := restartcost.ResumeScratch
+			resume := evictioncost.ResumeScratch
 			if i >= 4 {
-				resume = restartcost.ResumeStateless
+				resume = evictioncost.ResumeStateless
 			}
-			filler.Pod.Annotations[restartcost.AnnotationResume] = resume
+			filler.Pod.Annotations[evictioncost.AnnotationResume] = resume
 		}
 		plans := f.startOnly(t, conf, newMemStore(f))
 		if len(plans) != 1 {
@@ -264,7 +264,7 @@ func TestMakeRoomDisplacesCheapestFillers(t *testing.T) {
 	}
 	filler := func(i int) string { return fmt.Sprintf("filler-reserved-1-1gpu-pri-9-%d", i) }
 	gated := displacingConf(-9)
-	gated.MaxRestartGpuSeconds = 1e9
+	gated.MaxEvictionCostGpuSeconds = 1e9
 	if got, want := plan(gated), []string{filler(4), filler(5), filler(6), filler(7)}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("gated: got %v, want %v", got, want)
 	}
@@ -279,15 +279,15 @@ func TestGpuFragmentationGatesAnnouncedShare(t *testing.T) {
 	f := newFixture(t)
 	source := f.addNode(gpuNode("source", 8, nil))
 	dest := f.addNode(gpuNode("dest", 8, nil))
-	startedHourAgo(f.placePod(t, source, gpuPod("cheap", "source", 1, eligible(), map[string]string{restartcost.AnnotationResume: "stateless"}, true), 1, ""))
+	startedHourAgo(f.placePod(t, source, gpuPod("cheap", "source", 1, eligible(), map[string]string{evictioncost.AnnotationResume: "stateless"}, true), 1, ""))
 	startedHourAgo(f.placePod(t, source, gpuPod("quiet", "source", 1, eligible(), nil, true), 1, ""))
 	f.placePod(t, dest, gpuPod("resident", "dest", 5, nil, nil, true), 1, "")
 	conf := newGpuFragmentationConf()
-	conf.MaxRestartGpuSecondsPerGpu = 1000
+	conf.MaxEvictionCostGpuSecondsPerGpu = 1000
 	if got := f.plan(conf, nil); len(got) != 2 {
 		t.Fatalf("expected both pods drained, got %v", sources(got))
 	}
-	conf.RestartCost.GateUnannounced = true
+	conf.EvictionCost.GateUnannounced = true
 	if got := f.plan(conf, nil); len(got) != 0 {
 		t.Fatalf("gateUnannounced: expected no drain, got %v", sources(got))
 	}

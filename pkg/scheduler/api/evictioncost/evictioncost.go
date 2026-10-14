@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package restartcost estimates the accelerator work an eviction throws
+// Package evictioncost estimates the accelerator work an eviction throws
 // away, in GPU-seconds, from facts workloads publish as pod annotations.
 //
 // Declared at launch:
@@ -35,7 +35,7 @@ limitations under the License.
 // GPUSeconds is the pure cost function; testdata/vectors.json pins it for
 // other implementations. ParsePod reads one pod, Gang aggregates members and
 // Book prices victims for one scheduling action.
-package restartcost
+package evictioncost
 
 import (
 	"errors"
@@ -70,13 +70,13 @@ const (
 
 // Scheduler configuration keys shared by every consumer.
 const (
-	ModeKey               = "restartCost"
-	StartupSecondsKey     = "restartCostStartupSeconds"
-	TerminationSecondsKey = "restartCostTerminationSeconds"
+	ModeKey               = "evictionCost"
+	StartupSecondsKey     = "evictionCostStartupSeconds"
+	TerminationSecondsKey = "evictionCostTerminationSeconds"
 	GateUnannouncedKey    = "gateUnannounced"
 	// GPUResourceKey names the resource preempt and reclaim count as GPUs.
-	GPUResourceKey = "restartCostGpuResource"
-	// GPUResource is the resource restart cost counts for preempt and reclaim.
+	GPUResourceKey = "evictionCostGpuResource"
+	// GPUResource is the resource eviction cost counts for preempt and reclaim.
 	GPUResource                  = v1.ResourceName("nvidia.com/gpu")
 	defaultStartupSeconds        = 300
 	defaultTerminationSeconds    = 30
@@ -84,11 +84,11 @@ const (
 	gpuMilli                     = 1000
 )
 
-// Mode selects how an action uses restart cost when choosing victims.
+// Mode selects how an action uses eviction cost when choosing victims.
 type Mode string
 
 const (
-	// ModeOff ignores restart cost.
+	// ModeOff ignores eviction cost.
 	ModeOff Mode = "off"
 	// ModeShadow chooses as ModeOff does and exports what ModeOn would save.
 	ModeShadow Mode = "shadow"
@@ -96,7 +96,7 @@ const (
 	ModeOn Mode = "on"
 )
 
-// ModeOf reads the configured restartCost argument. An unquoted YAML on/off
+// ModeOf reads the configured evictionCost argument. An unquoted YAML on/off
 // arrives as a bool, so true is ModeOn and false is ModeOff.
 func ModeOf(raw interface{}) Mode {
 	switch v := raw.(type) {
@@ -110,7 +110,7 @@ func ModeOf(raw interface{}) Mode {
 	case string:
 		return ParseMode(v)
 	}
-	klog.Warningf("restartCost: unknown mode %v, using %q", raw, ModeOff)
+	klog.Warningf("evictionCost: unknown mode %v, using %q", raw, ModeOff)
 	return ModeOff
 }
 
@@ -122,14 +122,14 @@ func ParseMode(raw string) Mode {
 	case "":
 		return ModeOff
 	}
-	klog.Warningf("restartCost: unknown mode %q, using %q", raw, ModeOff)
+	klog.Warningf("evictionCost: unknown mode %q, using %q", raw, ModeOff)
 	return ModeOff
 }
 
 // Defaults stand in for declarations a workload did not make.
 type Defaults struct {
-	StartupSeconds     float64 `json:"startup_s" mapstructure:"restartCostStartupSeconds"`
-	TerminationSeconds float64 `json:"termination_s" mapstructure:"restartCostTerminationSeconds"`
+	StartupSeconds     float64 `json:"startup_s" mapstructure:"evictionCostStartupSeconds"`
+	TerminationSeconds float64 `json:"termination_s" mapstructure:"evictionCostTerminationSeconds"`
 }
 
 // DefaultDefaults returns S = 300 s and D = 30 s.
@@ -212,7 +212,7 @@ func ParsePod(pod *v1.Pod, now float64) Facts {
 	case !pod.CreationTimestamp.IsZero():
 		f.StartedAt = float64(pod.CreationTimestamp.Unix())
 	default:
-		klog.V(4).Infof("restartCost: pod %s/%s has no start or creation time, pricing it as just started", pod.Namespace, pod.Name)
+		klog.V(4).Infof("evictionCost: pod %s/%s has no start or creation time, pricing it as just started", pod.Namespace, pod.Name)
 		f.StartedAt = now
 	}
 
@@ -264,7 +264,7 @@ func (p parser) value(key string, parse func(string) (float64, error)) *float64 
 }
 
 func (p parser) garbage(key, raw string) {
-	klog.V(4).Infof("restartCost: ignoring unparseable annotation %s=%q on pod %s/%s", key, raw, p.pod.Namespace, p.pod.Name)
+	klog.V(4).Infof("evictionCost: ignoring unparseable annotation %s=%q on pod %s/%s", key, raw, p.pod.Namespace, p.pod.Name)
 }
 
 // parseSeconds accepts a plain non-negative decimal integer.
@@ -328,7 +328,7 @@ func costlierResume(a, b string) string {
 	return a
 }
 
-// Price is a job's restart cost and whether any member announced facts.
+// Price is a job's eviction cost and whether any member announced facts.
 type Price struct {
 	GPUSeconds float64
 	Announced  bool

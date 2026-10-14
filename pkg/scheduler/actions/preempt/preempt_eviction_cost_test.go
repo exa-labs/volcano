@@ -26,7 +26,7 @@ import (
 
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/scheduler/api"
-	"volcano.sh/volcano/pkg/scheduler/api/restartcost"
+	"volcano.sh/volcano/pkg/scheduler/api/evictioncost"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/plugins/conformance"
@@ -60,9 +60,9 @@ func gpuNode(name string) *v1.Node {
 // Two one-GPU nodes, each full with one low-priority victim. The victim on
 // n1 started later, so today's latest-start-time tie-break picks n1; it has
 // an hour of work it cannot resume (1 x (30 + 3600) GPU-seconds). The one
-// on n2 checkpointed a minute ago (1 x (30 + 300 + 60)), so restartCost on
+// on n2 checkpointed a minute ago (1 x (30 + 300 + 60)), so evictionCost on
 // picks n2. Shadow acts like off.
-func TestTopologyAwarePreemptRestartCost(t *testing.T) {
+func TestTopologyAwarePreemptEvictionCost(t *testing.T) {
 	now := time.Now()
 	rfc := func(at time.Time) string { return at.UTC().Format(time.RFC3339) }
 	trueValue := true
@@ -91,9 +91,9 @@ func TestTopologyAwarePreemptRestartCost(t *testing.T) {
 				Pods: []*v1.Pod{
 					gpuPod("fresh", "n1", "pg-fresh", v1.PodRunning, now.Add(-time.Hour), nil),
 					gpuPod("checkpointed", "n2", "pg-ckpt", v1.PodRunning, now.Add(-2*time.Hour), map[string]string{
-						restartcost.AnnotationResume:         restartcost.ResumeCheckpoint,
-						restartcost.AnnotationProductiveAt:   rfc(now.Add(-2*time.Hour + 5*time.Minute)),
-						restartcost.AnnotationLastCheckpoint: rfc(now.Add(-time.Minute)),
+						evictioncost.AnnotationResume:         evictioncost.ResumeCheckpoint,
+						evictioncost.AnnotationProductiveAt:   rfc(now.Add(-2*time.Hour + 5*time.Minute)),
+						evictioncost.AnnotationLastCheckpoint: rfc(now.Add(-time.Minute)),
 					}),
 					gpuPod("preemptor", "", "pg-new", v1.PodPending, time.Time{}, nil),
 				},
@@ -109,7 +109,7 @@ func TestTopologyAwarePreemptRestartCost(t *testing.T) {
 				MaxCandidateNodesAbsoluteKey:        2,
 			}
 			if mode != "" {
-				args[restartcost.ModeKey] = mode
+				args[evictioncost.ModeKey] = mode
 			}
 			test.RegisterSession(tiers, []conf.Configuration{{Name: "preempt", Arguments: args}})
 			defer test.Close()
@@ -140,8 +140,8 @@ func TestReprieveChargesGangOnce(t *testing.T) {
 		}
 		return p
 	}
-	scratch := map[string]string{restartcost.AnnotationResume: restartcost.ResumeScratch}
-	stateless := map[string]string{restartcost.AnnotationResume: restartcost.ResumeStateless}
+	scratch := map[string]string{evictioncost.AnnotationResume: evictioncost.ResumeScratch}
+	stateless := map[string]string{evictioncost.AnnotationResume: evictioncost.ResumeStateless}
 	trueValue := true
 	tiers := []conf.Tier{{Plugins: []conf.PluginOption{
 		{Name: conformance.PluginName, EnabledPreemptable: &trueValue},
@@ -181,8 +181,8 @@ func TestReprieveChargesGangOnce(t *testing.T) {
 		EnableNodeOrderScoreInPreemptionKey: false,
 		MinCandidateNodesAbsoluteKey:        1,
 		MaxCandidateNodesAbsoluteKey:        1,
-		restartcost.ModeKey:                 true,
-		restartcost.GPUResourceKey:          gpuName,
+		evictioncost.ModeKey:                true,
+		evictioncost.GPUResourceKey:         gpuName,
 	}}})
 	defer test.Close()
 	test.Run([]framework.Action{New()})

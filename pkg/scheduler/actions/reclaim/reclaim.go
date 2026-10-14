@@ -29,7 +29,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
-	"volcano.sh/volcano/pkg/scheduler/api/restartcost"
+	"volcano.sh/volcano/pkg/scheduler/api/evictioncost"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
@@ -39,11 +39,11 @@ import (
 type Action struct {
 	enablePredicateErrorCache bool
 
-	// restartCost orders victims of equal priority by the work their
-	// eviction throws away (see restartcost); book prices them for one
+	// evictionCost orders victims of equal priority by the work their
+	// eviction throws away (see evictioncost); book prices them for one
 	// Execute.
-	restartCost restartcost.Mode
-	book        *restartcost.Book
+	evictionCost evictioncost.Mode
+	book         *evictioncost.Book
 }
 
 func New() *Action {
@@ -61,13 +61,13 @@ func (ra *Action) Initialize() {}
 func (ra *Action) parseArguments(ssn *framework.Session) {
 	arguments := framework.GetArgOfActionFromConf(ssn.Configurations, ra.Name())
 	arguments.GetBool(&ra.enablePredicateErrorCache, conf.EnablePredicateErrCacheKey)
-	ra.restartCost = restartcost.ModeOf(arguments[restartcost.ModeKey])
-	gpu := string(restartcost.GPUResource)
-	arguments.GetString(&gpu, restartcost.GPUResourceKey)
-	defaults := restartcost.DefaultDefaults()
-	arguments.GetFloat64(&defaults.StartupSeconds, restartcost.StartupSecondsKey)
-	arguments.GetFloat64(&defaults.TerminationSeconds, restartcost.TerminationSecondsKey)
-	ra.book = restartcost.NewBook(ssn.Jobs, v1.ResourceName(gpu), defaults, time.Now())
+	ra.evictionCost = evictioncost.ModeOf(arguments[evictioncost.ModeKey])
+	gpu := string(evictioncost.GPUResource)
+	arguments.GetString(&gpu, evictioncost.GPUResourceKey)
+	defaults := evictioncost.DefaultDefaults()
+	arguments.GetFloat64(&defaults.StartupSeconds, evictioncost.StartupSecondsKey)
+	arguments.GetFloat64(&defaults.TerminationSeconds, evictioncost.TerminationSecondsKey)
+	ra.book = evictioncost.NewBook(ssn.Jobs, v1.ResourceName(gpu), defaults, time.Now())
 }
 
 func (ra *Action) Execute(ssn *framework.Session) {
@@ -249,7 +249,7 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 		}
 
 		var cost func(*api.TaskInfo) float64
-		if ra.restartCost == restartcost.ModeOn {
+		if ra.evictionCost == evictioncost.ModeOn {
 			cost = ra.book.Cost
 		}
 		victimsQueue := ssn.BuildVictimsPriorityQueueByCost(victims, task, cost)
@@ -281,12 +281,12 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 		klog.V(3).Infof("Reclaimed <%v> for task <%s/%s> requested <%v>, and Node <%s> availableResources <%v>.", reclaimed, task.Namespace, task.Name, task.InitResreq, n.Name, availableResources)
 
 		if task.InitResreq.LessEqual(availableResources, api.Zero) {
-			if ra.restartCost == restartcost.ModeShadow {
+			if ra.evictionCost == evictioncost.ModeShadow {
 				differs, baseline, aware := ra.book.Shadow(
 					ssn.VictimsInOrder(victims, task, nil),
 					ssn.VictimsInOrder(victims, task, ra.book.Cost),
 					resreq, idleBefore)
-				metrics.RegisterRestartCostShadow(ra.Name(), differs, baseline, aware)
+				metrics.RegisterEvictionCostShadow(ra.Name(), differs, baseline, aware)
 			}
 			if err := stmt.Pipeline(task, n.Name, evictionOccurred); err != nil {
 				klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>",

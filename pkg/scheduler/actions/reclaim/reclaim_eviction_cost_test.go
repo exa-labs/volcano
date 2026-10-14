@@ -26,7 +26,7 @@ import (
 
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/scheduler/api"
-	"volcano.sh/volcano/pkg/scheduler/api/restartcost"
+	"volcano.sh/volcano/pkg/scheduler/api/evictioncost"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/plugins/conformance"
@@ -39,8 +39,8 @@ import (
 
 // q2 overuses a two-GPU node with two equal-priority jobs. Today's order
 // evicts the younger job (pg-y), which has an hour of work it cannot resume;
-// pg-x is stateless, so restartCost on evicts pg-x. Shadow acts like off.
-func TestReclaimRestartCostVictimOrder(t *testing.T) {
+// pg-x is stateless, so evictionCost on evicts pg-x. Shadow acts like off.
+func TestReclaimEvictionCostVictimOrder(t *testing.T) {
 	started := metav1.NewTime(time.Now().Add(-time.Hour))
 	gpuPod := func(name, node, group string, phase v1.PodPhase, annotations map[string]string) *v1.Pod {
 		pod := util.BuildPod("c1", name, node, phase,
@@ -83,7 +83,7 @@ func TestReclaimRestartCostVictimOrder(t *testing.T) {
 					util.BuildPodGroupWithPrio("pg-new", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupInqueue, "low-priority"),
 				},
 				Pods: []*v1.Pod{
-					gpuPod("x", "n1", "pg-x", v1.PodRunning, map[string]string{restartcost.AnnotationResume: restartcost.ResumeStateless}),
+					gpuPod("x", "n1", "pg-x", v1.PodRunning, map[string]string{evictioncost.AnnotationResume: evictioncost.ResumeStateless}),
 					gpuPod("y", "n1", "pg-y", v1.PodRunning, nil),
 					gpuPod("preemptor", "", "pg-new", v1.PodPending, nil),
 				},
@@ -95,7 +95,7 @@ func TestReclaimRestartCostVictimOrder(t *testing.T) {
 			}
 			var config []conf.Configuration
 			if mode != "" {
-				config = []conf.Configuration{{Name: "reclaim", Arguments: map[string]interface{}{restartcost.ModeKey: mode}}}
+				config = []conf.Configuration{{Name: "reclaim", Arguments: map[string]interface{}{evictioncost.ModeKey: mode}}}
 			}
 			test.RegisterSession(tiers, config)
 			defer test.Close()

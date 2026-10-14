@@ -45,7 +45,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
-	"volcano.sh/volcano/pkg/scheduler/api/restartcost"
+	"volcano.sh/volcano/pkg/scheduler/api/evictioncost"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
@@ -97,11 +97,11 @@ type Action struct {
 	preemptionBackoffSeconds      int
 	preemptionMaxBackoffSeconds   int
 
-	// restartCost chooses victims by the work their eviction throws away
-	// (see restartcost); book prices them for one Execute.
-	restartCost         restartcost.Mode
-	restartCostDefaults restartcost.Defaults
-	book                *restartcost.Book
+	// evictionCost chooses victims by the work their eviction throws away
+	// (see evictioncost); book prices them for one Execute.
+	evictionCost         evictioncost.Mode
+	evictionCostDefaults evictioncost.Defaults
+	book                 *evictioncost.Book
 
 	// backoff persists across sessions: the action is registered once and
 	// Execute is called on the same instance every scheduling cycle.
@@ -146,29 +146,29 @@ func (pmpt *Action) parseArguments(ssn *framework.Session) {
 		time.Duration(pmpt.preemptionBackoffSeconds)*time.Second,
 		time.Duration(pmpt.preemptionMaxBackoffSeconds)*time.Second,
 	)
-	pmpt.restartCost = restartcost.ModeOf(arguments[restartcost.ModeKey])
-	gpu := string(restartcost.GPUResource)
-	arguments.GetString(&gpu, restartcost.GPUResourceKey)
-	pmpt.restartCostDefaults = restartcost.DefaultDefaults()
-	arguments.GetFloat64(&pmpt.restartCostDefaults.StartupSeconds, restartcost.StartupSecondsKey)
-	arguments.GetFloat64(&pmpt.restartCostDefaults.TerminationSeconds, restartcost.TerminationSecondsKey)
-	pmpt.book = restartcost.NewBook(ssn.Jobs, v1.ResourceName(gpu), pmpt.restartCostDefaults, time.Now())
+	pmpt.evictionCost = evictioncost.ModeOf(arguments[evictioncost.ModeKey])
+	gpu := string(evictioncost.GPUResource)
+	arguments.GetString(&gpu, evictioncost.GPUResourceKey)
+	pmpt.evictionCostDefaults = evictioncost.DefaultDefaults()
+	arguments.GetFloat64(&pmpt.evictionCostDefaults.StartupSeconds, evictioncost.StartupSecondsKey)
+	arguments.GetFloat64(&pmpt.evictionCostDefaults.TerminationSeconds, evictioncost.TerminationSecondsKey)
+	pmpt.book = evictioncost.NewBook(ssn.Jobs, v1.ResourceName(gpu), pmpt.evictionCostDefaults, time.Now())
 	pmpt.ssn = ssn
 }
 
-// victimCost orders victims by restart cost when restartCost is on; nil
+// victimCost orders victims by eviction cost when evictionCost is on; nil
 // keeps today's order.
 func (pmpt *Action) victimCost() func(*api.TaskInfo) float64 {
-	if pmpt.restartCost != restartcost.ModeOn {
+	if pmpt.evictionCost != evictioncost.ModeOn {
 		return nil
 	}
 	return pmpt.book.Cost
 }
 
-// nodeCost scores candidate nodes by their victims' restart cost when
-// restartCost is on; nil keeps today's scoring.
+// nodeCost scores candidate nodes by their victims' eviction cost when
+// evictionCost is on; nil keeps today's scoring.
 func (pmpt *Action) nodeCost() func([]*api.TaskInfo) float64 {
-	if pmpt.restartCost != restartcost.ModeOn {
+	if pmpt.evictionCost != evictioncost.ModeOn {
 		return nil
 	}
 	return pmpt.book.Selection
@@ -629,12 +629,12 @@ func (pmpt *Action) normalPreempt(
 
 			// Ignore pipeline error, will be corrected in next scheduling loop.
 			assigned = true
-			if pmpt.restartCost == restartcost.ModeShadow {
+			if pmpt.evictionCost == evictioncost.ModeShadow {
 				differs, baseline, aware := pmpt.book.Shadow(
 					ssn.VictimsInOrder(victims, preemptor, nil),
 					ssn.VictimsInOrder(victims, preemptor, pmpt.book.Cost),
 					preemptor.InitResreq, idleBefore)
-				metrics.RegisterRestartCostShadow(pmpt.Name(), differs, baseline, aware)
+				metrics.RegisterEvictionCostShadow(pmpt.Name(), differs, baseline, aware)
 			}
 
 			break
@@ -803,11 +803,11 @@ func (pmpt *Action) topologyAwarePreempt(
 	if bestCandidate == nil || len(bestCandidate.Name()) == 0 {
 		return false, fmt.Errorf("no candidate node for preemption")
 	}
-	if pmpt.restartCost == restartcost.ModeShadow {
+	if pmpt.evictionCost == evictioncost.ModeShadow {
 		// Nodes that tie on cost are not a different decision.
 		aware := selectCandidate(candidates, ssn, preemptor, pmpt.enableNodeOrderScoreInPreemption, pmpt.book.Selection)
 		baseline, awareCost := pmpt.book.Selection(bestCandidate.Victims()), pmpt.book.Selection(aware.Victims())
-		metrics.RegisterRestartCostShadow(pmpt.Name(), baseline != awareCost, baseline, awareCost)
+		metrics.RegisterEvictionCostShadow(pmpt.Name(), baseline != awareCost, baseline, awareCost)
 	}
 
 	if status := prepareCandidate(bestCandidate, preemptor.Pod, stmt, ssn); !status.IsSuccess() {
@@ -1279,7 +1279,7 @@ func SelectCandidate(candidates []*candidate, ssn *framework.Session, preemptor 
 	return selectCandidate(candidates, ssn, preemptor, enableNodeOrderScore, nil)
 }
 
-// selectCandidate is SelectCandidate with an optional total restart cost of
+// selectCandidate is SelectCandidate with an optional total eviction cost of
 // a node's victims as a scoring criterion (see defaultPreemptionScoreFuncs).
 func selectCandidate(candidates []*candidate, ssn *framework.Session, preemptor *api.TaskInfo, enableNodeOrderScore bool, cost func([]*api.TaskInfo) float64) *candidate {
 	if len(candidates) == 0 {
@@ -1328,7 +1328,7 @@ func OrderedScoreFuncs(
 
 // orderedScoreFuncs places the node-order score right after the leading
 // criteria: the highest victim priority, then (given a cost) the victims'
-// total restart cost.
+// total eviction cost.
 func orderedScoreFuncs(
 	ssn *framework.Session,
 	preemptor *api.TaskInfo,
@@ -1355,7 +1355,7 @@ func orderedScoreFuncs(
 }
 
 // defaultPreemptionScoreFuncs returns the default ordered candidate-node
-// scoring functions. Given a cost, the lowest total restart cost of the
+// scoring functions. Given a cost, the lowest total eviction cost of the
 // victims follows the highest victim priority and replaces the latest start
 // time, which only approximated it.
 func defaultPreemptionScoreFuncs(nodesToVictims map[string][]*api.TaskInfo, cost func([]*api.TaskInfo) float64) []func(node string) int64 {
@@ -1393,13 +1393,13 @@ func defaultPreemptionScoreFuncs(nodesToVictims map[string][]*api.TaskInfo, cost
 	}
 
 	if cost != nil {
-		minRestartCostScoreFunc := func(node string) int64 {
+		minEvictionCostScoreFunc := func(node string) int64 {
 			// The cheaper the victims' restart, the higher the score.
 			return -int64(math.Round(cost(nodesToVictims[node])))
 		}
 		return []func(string) int64{
 			minHighestPriorityScoreFunc,
-			minRestartCostScoreFunc,
+			minEvictionCostScoreFunc,
 			minSumPrioritiesScoreFunc,
 			minNumPodsScoreFunc,
 		}
