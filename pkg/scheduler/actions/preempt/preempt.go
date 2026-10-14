@@ -45,6 +45,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/api/evictioncost"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
@@ -96,6 +97,12 @@ type Action struct {
 	preemptionBackoffSeconds      int
 	preemptionMaxBackoffSeconds   int
 
+	// evictionCost chooses victims by the work their eviction throws away
+	// (see evictioncost); book prices them for one Execute.
+	evictionCost         evictioncost.Mode
+	evictionCostDefaults evictioncost.Defaults
+	book                 *evictioncost.Book
+
 	// backoff persists across sessions: the action is registered once and
 	// Execute is called on the same instance every scheduling cycle.
 	backoff *preemptBackoff
@@ -139,7 +146,43 @@ func (pmpt *Action) parseArguments(ssn *framework.Session) {
 		time.Duration(pmpt.preemptionBackoffSeconds)*time.Second,
 		time.Duration(pmpt.preemptionMaxBackoffSeconds)*time.Second,
 	)
+	pmpt.evictionCost = evictioncost.ModeOf(arguments[evictioncost.ModeKey])
+	gpu := string(evictioncost.GPUResource)
+	arguments.GetString(&gpu, evictioncost.GPUResourceKey)
+	pmpt.evictionCostDefaults = evictioncost.DefaultDefaults()
+	arguments.GetFloat64(&pmpt.evictionCostDefaults.StartupSeconds, evictioncost.StartupSecondsKey)
+	arguments.GetFloat64(&pmpt.evictionCostDefaults.TerminationSeconds, evictioncost.TerminationSecondsKey)
+	pmpt.book = evictioncost.NewBook(ssn.Jobs, v1.ResourceName(gpu), pmpt.evictionCostDefaults, time.Now())
 	pmpt.ssn = ssn
+}
+
+// victimCost orders victims by eviction cost when evictionCost is on; nil
+// keeps today's order.
+func (pmpt *Action) victimCost() func(*api.TaskInfo) float64 {
+	if pmpt.evictionCost != evictioncost.ModeOn {
+		return nil
+	}
+	return pmpt.book.Cost
+}
+
+// nodeCost scores candidate nodes by their victims' eviction cost when
+// evictionCost is on; nil keeps today's scoring.
+func (pmpt *Action) nodeCost() func([]*api.TaskInfo) float64 {
+	if pmpt.evictionCost != evictioncost.ModeOn {
+		return nil
+	}
+	return pmpt.book.Selection
+}
+
+// commit commits the statement and records its evictions.
+func (pmpt *Action) commit(stmt *framework.Statement) {
+	stmt.Commit()
+	evicted := stmt.EvictedTasks()
+	strategy := "normal"
+	if pmpt.enableTopologyAwarePreemption {
+		strategy = "topology_aware"
+	}
+	metrics.RegisterEvictions(pmpt.Name(), strategy, len(evicted), pmpt.book.GangCosts(evicted))
 }
 
 func (pmpt *Action) Execute(ssn *framework.Session) {
@@ -268,7 +311,7 @@ func (pmpt *Action) Execute(ssn *framework.Session) {
 				if err != nil {
 					klog.V(3).Infof("Preemptor <%s/%s> failed to preempt Task , err: %s", preemptor.Namespace, preemptor.Name, err)
 				}
-				stmt.Commit()
+				pmpt.commit(stmt)
 
 				// If no preemption, next job.
 				if !assigned {
@@ -348,7 +391,7 @@ func (pmpt *Action) preemptForJob(
 		stmt := framework.NewStatement(ssn)
 		assigned = pmpt.preemptJobTasks(ssn, stmt, job, preemptorTasks[job.UID], jobPredicateHelper(predicateHelpers, job.UID), excludedNodes)
 		if ssn.JobPipelined(job) {
-			stmt.Commit()
+			pmpt.commit(stmt)
 			return assigned, true
 		}
 
@@ -534,9 +577,10 @@ func (pmpt *Action) normalPreempt(
 			continue
 		}
 
-		victimsQueue := ssn.BuildVictimsPriorityQueue(victims, preemptor)
+		victimsQueue := ssn.BuildVictimsPriorityQueueByCost(victims, preemptor, pmpt.victimCost())
 		// Preempt victims for tasks, pick lowest priority task first.
 		preempted := api.EmptyResource()
+		idleBefore := node.FutureIdle()
 
 		for !victimsQueue.Empty() {
 			// If reclaimed enough resources, break loop to avoid Sub panic.
@@ -585,6 +629,13 @@ func (pmpt *Action) normalPreempt(
 
 			// Ignore pipeline error, will be corrected in next scheduling loop.
 			assigned = true
+			if pmpt.evictionCost == evictioncost.ModeShadow {
+				differs, baseline, aware := pmpt.book.Shadow(
+					ssn.VictimsInOrder(victims, preemptor, nil),
+					ssn.VictimsInOrder(victims, preemptor, pmpt.book.Cost),
+					preemptor.InitResreq, idleBefore)
+				metrics.RegisterEvictionCostShadow(pmpt.Name(), differs, baseline, aware)
+			}
 
 			break
 		}
@@ -748,9 +799,15 @@ func (pmpt *Action) topologyAwarePreempt(
 	}
 
 	// Find the best candidate.
-	bestCandidate := SelectCandidate(candidates, ssn, preemptor, pmpt.enableNodeOrderScoreInPreemption)
+	bestCandidate := selectCandidate(candidates, ssn, preemptor, pmpt.enableNodeOrderScoreInPreemption, pmpt.nodeCost())
 	if bestCandidate == nil || len(bestCandidate.Name()) == 0 {
 		return false, fmt.Errorf("no candidate node for preemption")
+	}
+	if pmpt.evictionCost == evictioncost.ModeShadow {
+		// Nodes that tie on cost are not a different decision.
+		aware := selectCandidate(candidates, ssn, preemptor, pmpt.enableNodeOrderScoreInPreemption, pmpt.book.Selection)
+		baseline, awareCost := pmpt.book.Selection(bestCandidate.Victims()), pmpt.book.Selection(aware.Victims())
+		metrics.RegisterEvictionCostShadow(pmpt.Name(), baseline != awareCost, baseline, awareCost)
 	}
 
 	if status := prepareCandidate(bestCandidate, preemptor.Pod, stmt, ssn); !status.IsSuccess() {
@@ -890,7 +947,7 @@ func (pmpt *Action) DryRunPreemption(preemptor *api.TaskInfo, potentialNodes []*
 		nodeInfoCopy := node.Clone()
 		stateCopy := state.Clone()
 
-		victims, status := SelectVictimsOnNode(ctx, stateCopy, preemptor, currentQueue, nodeInfoCopy, pmpt.ssn, filter, stmt)
+		victims, status := SelectVictimsOnNode(ctx, stateCopy, preemptor, currentQueue, nodeInfoCopy, pmpt.ssn, filter, stmt, pmpt.victimCost())
 		if status.IsSuccess() && len(victims) != 0 {
 			c := &candidate{
 				victims: victims,
@@ -986,7 +1043,8 @@ func (cl *candidateList) get() []*candidate {
 }
 
 // SelectVictimsOnNode finds minimum set of pods on the given node that should be preempted in order to make enough room
-// for "pod" to be scheduled.
+// for "pod" to be scheduled. A non-nil cost evicts the cheapest of equal-priority victims first and reprieves the
+// costliest first.
 func SelectVictimsOnNode(
 	ctx context.Context,
 	state fwk.CycleState,
@@ -996,6 +1054,7 @@ func SelectVictimsOnNode(
 	ssn *framework.Session,
 	filter func(*api.TaskInfo) bool,
 	stmt *framework.Statement,
+	cost func(*api.TaskInfo) float64,
 ) ([]*api.TaskInfo, *api.Status) {
 	var potentialVictims []*api.TaskInfo
 
@@ -1048,7 +1107,7 @@ func SelectVictimsOnNode(
 	// reprieve higher priority pods first.
 	sort.Slice(allVictims, func(i, j int) bool { return k8sutil.MoreImportantPod(allVictims[i].Pod, allVictims[j].Pod) })
 
-	victimsQueue := ssn.BuildVictimsPriorityQueue(allVictims, preemptor)
+	victimsQueue := ssn.BuildVictimsPriorityQueueByCost(allVictims, preemptor, cost)
 
 	for !victimsQueue.Empty() {
 		task := victimsQueue.Pop().(*api.TaskInfo)
@@ -1110,9 +1169,25 @@ func SelectVictimsOnNode(
 	}
 
 	// Now we try to reprieve non-violating victims.
-	for _, p := range potentialVictims {
-		if _, err := reprievePod(p); err != nil {
+	if cost != nil {
+		fits := func() bool {
+			return ssn.SimulateAllocatableFn(ctx, state, currentQueue, preemptor) &&
+				preemptor.InitResreq.LessEqual(nodeInfo.FutureIdle(), api.Zero) &&
+				ssn.SimulatePredicateFn(ctx, state, preemptor, nodeInfo) == nil
+		}
+		whole := func(task *api.TaskInfo) bool {
+			job, ok := ssn.Jobs[task.Job]
+			return ok && job.MinAvailable > 1
+		}
+		var err error
+		if victims, err = reprieveGangs(potentialVictims, allVictims, cost, ssn.SameVictimPriority, whole, addTask, removeTask, fits); err != nil {
 			return nil, api.AsStatus(err)
+		}
+	} else {
+		for _, p := range potentialVictims {
+			if _, err := reprievePod(p); err != nil {
+				return nil, api.AsStatus(err)
+			}
 		}
 	}
 
@@ -1123,9 +1198,118 @@ func SelectVictimsOnNode(
 	}
 }
 
+// reprieveGangs reprieves jobs, costliest first: a job keeps all its removed
+// members or is charged. A charged job pays the same whatever it loses, so
+// its other eligible members on the node are removed too, and the room they
+// free may reprieve cheaper jobs. Members of a gang (whole) go with it;
+// members of a charged job that can run alone are then reprieved one by one
+// with the room left over, since keeping them costs nothing more.
+func reprieveGangs(
+	potential, eligible []*api.TaskInfo,
+	cost func(*api.TaskInfo) float64,
+	same func(l, r *api.TaskInfo) bool,
+	whole func(*api.TaskInfo) bool,
+	add, remove func(*api.TaskInfo) error,
+	fits func() bool,
+) ([]*api.TaskInfo, error) {
+	gang := func(task *api.TaskInfo) string {
+		if task.Job == "" {
+			return string(task.UID)
+		}
+		return string(task.Job)
+	}
+	reprieveCostliestFirst(potential, cost, same)
+	removed := map[api.TaskID]bool{}
+	for _, task := range potential {
+		removed[task.UID] = true
+	}
+	var victims, alone []*api.TaskInfo
+	decided := map[string]bool{}
+	for _, first := range potential {
+		key := gang(first)
+		if decided[key] {
+			continue
+		}
+		decided[key] = true
+		var members []*api.TaskInfo
+		for _, task := range potential {
+			if gang(task) == key {
+				members = append(members, task)
+			}
+		}
+		for _, member := range members {
+			if err := add(member); err != nil {
+				return nil, err
+			}
+		}
+		if fits() {
+			continue
+		}
+		for _, member := range members {
+			if err := remove(member); err != nil {
+				return nil, err
+			}
+		}
+		var extras []*api.TaskInfo
+		for _, task := range eligible {
+			if gang(task) == key && !removed[task.UID] {
+				if err := remove(task); err != nil {
+					return nil, err
+				}
+				removed[task.UID] = true
+				extras = append(extras, task)
+			}
+		}
+		if whole(first) {
+			victims = append(victims, members...)
+			victims = append(victims, extras...)
+		} else {
+			// Members the victim order did not pick come back first, so the
+			// ones it picked are the ones left out.
+			alone = append(alone, extras...)
+			alone = append(alone, members...)
+		}
+	}
+	for _, task := range alone {
+		if err := add(task); err != nil {
+			return nil, err
+		}
+		if fits() {
+			continue
+		}
+		if err := remove(task); err != nil {
+			return nil, err
+		}
+		victims = append(victims, task)
+	}
+	return victims, nil
+}
+
+// reprieveCostliestFirst reorders each run of victims that rank equally
+// before cost (same), as the cost-ordered victim queue emits them, costliest
+// first, so the reprieve keeps the expensive ones and the cheap ones are
+// evicted.
+func reprieveCostliestFirst(victims []*api.TaskInfo, cost func(*api.TaskInfo) float64, same func(l, r *api.TaskInfo) bool) {
+	for start := 0; start < len(victims); {
+		end := start + 1
+		for end < len(victims) && same(victims[end], victims[start]) {
+			end++
+		}
+		run := victims[start:end]
+		sort.SliceStable(run, func(i, j int) bool { return cost(run[i]) > cost(run[j]) })
+		start = end
+	}
+}
+
 // SelectCandidate chooses the best-fit candidate from given <candidates> and return it.
 // NOTE: This method is exported for easier testing in default preemption.
 func SelectCandidate(candidates []*candidate, ssn *framework.Session, preemptor *api.TaskInfo, enableNodeOrderScore bool) *candidate {
+	return selectCandidate(candidates, ssn, preemptor, enableNodeOrderScore, nil)
+}
+
+// selectCandidate is SelectCandidate with an optional total eviction cost of
+// a node's victims as a scoring criterion (see defaultPreemptionScoreFuncs).
+func selectCandidate(candidates []*candidate, ssn *framework.Session, preemptor *api.TaskInfo, enableNodeOrderScore bool, cost func([]*api.TaskInfo) float64) *candidate {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -1134,7 +1318,7 @@ func SelectCandidate(candidates []*candidate, ssn *framework.Session, preemptor 
 	}
 
 	victimsMap := CandidatesToVictimsMap(candidates)
-	scoreFuncs := OrderedScoreFuncs(ssn, preemptor, victimsMap, enableNodeOrderScore)
+	scoreFuncs := orderedScoreFuncs(ssn, preemptor, victimsMap, enableNodeOrderScore, cost)
 	candidateNode := pickOneNodeForPreemption(victimsMap, scoreFuncs)
 
 	// Same as candidatesToVictimsMap, this logic is not applicable for out-of-tree
@@ -1167,18 +1351,42 @@ func OrderedScoreFuncs(
 	nodesToVictims map[string][]*api.TaskInfo,
 	enableNodeOrderScore bool,
 ) []func(node string) int64 {
+	return orderedScoreFuncs(ssn, preemptor, nodesToVictims, enableNodeOrderScore, nil)
+}
+
+// orderedScoreFuncs places the node-order score right after the leading
+// criteria: the highest victim priority, then (given a cost) the victims'
+// total eviction cost.
+func orderedScoreFuncs(
+	ssn *framework.Session,
+	preemptor *api.TaskInfo,
+	nodesToVictims map[string][]*api.TaskInfo,
+	enableNodeOrderScore bool,
+	cost func([]*api.TaskInfo) float64,
+) []func(node string) int64 {
+	defaults := defaultPreemptionScoreFuncs(nodesToVictims, cost)
 	if !enableNodeOrderScore {
-		return nil
+		if cost == nil {
+			return nil
+		}
+		return defaults
 	}
 
-	defaults := defaultPreemptionScoreFuncs(nodesToVictims)
+	lead := 1
+	if cost != nil {
+		lead = 2
+	}
 	nodeOrderScore := nodeOrderScoreFunc(ssn, preemptor, nodesToVictims)
-	return append([]func(node string) int64{defaults[0], nodeOrderScore}, defaults[1:]...)
+	funcs := append([]func(node string) int64{}, defaults[:lead]...)
+	funcs = append(funcs, nodeOrderScore)
+	return append(funcs, defaults[lead:]...)
 }
 
 // defaultPreemptionScoreFuncs returns the default ordered candidate-node
-// scoring functions.
-func defaultPreemptionScoreFuncs(nodesToVictims map[string][]*api.TaskInfo) []func(node string) int64 {
+// scoring functions. Given a cost, the lowest total eviction cost of the
+// victims follows the highest victim priority and replaces the latest start
+// time, which only approximated it.
+func defaultPreemptionScoreFuncs(nodesToVictims map[string][]*api.TaskInfo, cost func([]*api.TaskInfo) float64) []func(node string) int64 {
 	minHighestPriorityScoreFunc := func(node string) int64 {
 		// highestPodPriority is the highest priority among the victims on this node.
 		highestPodPriority := PodPriority(nodesToVictims[node][0].Pod)
@@ -1210,6 +1418,19 @@ func defaultPreemptionScoreFuncs(nodesToVictims map[string][]*api.TaskInfo) []fu
 		}
 		// The bigger the earliestStartTimeOnNode, the higher the score.
 		return earliestStartTimeOnNode.UnixNano()
+	}
+
+	if cost != nil {
+		minEvictionCostScoreFunc := func(node string) int64 {
+			// The cheaper the victims' restart, the higher the score.
+			return -int64(math.Round(cost(nodesToVictims[node])))
+		}
+		return []func(string) int64{
+			minHighestPriorityScoreFunc,
+			minEvictionCostScoreFunc,
+			minSumPrioritiesScoreFunc,
+			minNumPodsScoreFunc,
+		}
 	}
 
 	return []func(string) int64{
@@ -1294,7 +1515,7 @@ func pickOneNodeForPreemption(nodesToVictims map[string][]*api.TaskInfo, scoreFu
 	}
 
 	if len(scoreFuncs) == 0 {
-		scoreFuncs = defaultPreemptionScoreFuncs(nodesToVictims)
+		scoreFuncs = defaultPreemptionScoreFuncs(nodesToVictims, nil)
 	}
 
 	for _, f := range scoreFuncs {

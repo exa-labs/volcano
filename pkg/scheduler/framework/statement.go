@@ -68,6 +68,17 @@ func (s *Statement) Operations() []operation {
 	return s.operations
 }
 
+// EvictedTasks returns the tasks the statement evicts, in order.
+func (s *Statement) EvictedTasks() []*api.TaskInfo {
+	var tasks []*api.TaskInfo
+	for _, op := range s.operations {
+		if op.name == Evict {
+			tasks = append(tasks, op.task)
+		}
+	}
+	return tasks
+}
+
 // Evict the pod
 func (s *Statement) Evict(reclaimee *api.TaskInfo, reason string) error {
 	// Update status in session

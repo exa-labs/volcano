@@ -105,10 +105,16 @@ type gpuFragmentationConf struct {
 	// without an explicit priority count as 0, so the default (-1) restricts
 	// repacking to negative-priority (interruptible) workloads.
 	MaxVictimPriority int32 `mapstructure:"maxVictimPriority"`
+	// MaxEvictionCostGpuSecondsPerGpu, when set, skips a drain whose victims'
+	// eviction cost per GPU freed exceeds it and drains the cheapest of
+	// equally full sources first (see evictionCostGate). Unset (0), sources
+	// are ordered and drained as without it.
+	MaxEvictionCostGpuSecondsPerGpu float64          `mapstructure:"maxEvictionCostGpuSecondsPerGpu"`
+	EvictionCost                    evictionCostGate `mapstructure:",squash"`
 }
 
 func newGpuFragmentationConf() *gpuFragmentationConf {
-	conf := &gpuFragmentationConf{}
+	conf := &gpuFragmentationConf{EvictionCost: newEvictionCostGate()}
 	_ = mapstructure.Decode(DefaultGpuFragmentationConf, conf)
 	return conf
 }
@@ -205,6 +211,7 @@ var victimsFnForGpuFragmentation = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 		drain.observe("live", evicted)
 		gpuRepackLastDrain.WithLabelValues(drain.pool).SetToCurrentTime()
 	}
+	recordShuffleEvictions(GpuFragmentationStrategy, conf.EvictionCost.book(Session.Jobs, v1.ResourceName(conf.GpuResource), time.Now()), victims)
 	return victims
 }
 
@@ -319,6 +326,8 @@ func planGpuFragmentationDrains(
 
 	drains := make([]gpuFragmentationDrain, 0)
 	planned := 0
+	book := conf.EvictionCost.book(jobs, gpu, now)
+	byCost := conf.EvictionCost.orders(conf.MaxEvictionCostGpuSecondsPerGpu)
 	for _, pool := range poolNames {
 		if conf.MaxVictims > 0 && planned >= conf.MaxVictims {
 			break
@@ -327,6 +336,8 @@ func planGpuFragmentationDrains(
 		type drainable struct {
 			source  *api.NodeInfo
 			victims []*api.TaskInfo
+			// price is the victims' eviction cost per GPU freed.
+			price price
 		}
 		sources := make([]drainable, 0, len(members))
 		for _, member := range members {
@@ -337,12 +348,15 @@ func planGpuFragmentationDrains(
 			if len(victims) == 0 {
 				continue
 			}
-			sources = append(sources, drainable{source: member, victims: victims})
+			sources = append(sources, drainable{source: member, victims: victims, price: conf.EvictionCost.drainPrice(book, member, victims, gpu)})
 		}
 		sort.SliceStable(sources, func(i, j int) bool {
 			ui, uj := gpuFullness(sources[i].source, gpu), gpuFullness(sources[j].source, gpu)
 			if ui != uj {
 				return ui < uj
+			}
+			if byCost && sources[i].price.total != sources[j].price.total {
+				return sources[i].price.total < sources[j].price.total
 			}
 			pi, pj := maxVictimPriority(sources[i].victims), maxVictimPriority(sources[j].victims)
 			if pi != pj {
@@ -364,9 +378,20 @@ func planGpuFragmentationDrains(
 			if ledger.touched(source.Name) {
 				continue
 			}
+			overCap := conf.EvictionCost.over(conf.MaxEvictionCostGpuSecondsPerGpu, cand.price.gated)
+			if overCap && !conf.EvictionCost.DryRun {
+				// Count the skip only if the drain could have happened.
+				if len(simulateDrain(members, source, victims, gpu, ledger.clone(), predicate)) > 0 {
+					conf.EvictionCost.count(gpuRepackSkipped)
+				}
+				continue
+			}
 			moves := simulateDrain(members, source, victims, gpu, ledger, predicate)
 			if len(moves) == 0 {
 				continue
+			}
+			if overCap {
+				conf.EvictionCost.count(gpuRepackSkipped)
 			}
 			drains = append(drains, gpuFragmentationDrain{
 				pool:   pool,
