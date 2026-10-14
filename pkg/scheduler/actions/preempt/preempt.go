@@ -630,11 +630,12 @@ func (pmpt *Action) normalPreempt(
 			// Ignore pipeline error, will be corrected in next scheduling loop.
 			assigned = true
 			if pmpt.evictionCost == evictioncost.ModeShadow {
-				differs, baseline, aware := pmpt.book.Shadow(
+				shadow := pmpt.book.Shadow(
 					ssn.VictimsInOrder(victims, preemptor, nil),
 					ssn.VictimsInOrder(victims, preemptor, pmpt.book.Cost),
 					preemptor.InitResreq, idleBefore)
-				metrics.RegisterEvictionCostShadow(pmpt.Name(), differs, baseline, aware)
+				metrics.RegisterEvictionCostShadow(pmpt.Name(), shadow.Differs(), shadow.Baseline.GPUSeconds, shadow.CostAware.GPUSeconds)
+				pmpt.book.LogShadow(pmpt.Name(), "normal", preemptor, shadow)
 			}
 
 			break
@@ -806,8 +807,12 @@ func (pmpt *Action) topologyAwarePreempt(
 	if pmpt.evictionCost == evictioncost.ModeShadow {
 		// Nodes that tie on cost are not a different decision.
 		aware := selectCandidate(candidates, ssn, preemptor, pmpt.enableNodeOrderScoreInPreemption, pmpt.book.Selection)
-		baseline, awareCost := pmpt.book.Selection(bestCandidate.Victims()), pmpt.book.Selection(aware.Victims())
-		metrics.RegisterEvictionCostShadow(pmpt.Name(), baseline != awareCost, baseline, awareCost)
+		shadow := evictioncost.ShadowResult{
+			Baseline:  pmpt.book.Side(bestCandidate.Victims(), bestCandidate.Name()),
+			CostAware: pmpt.book.Side(aware.Victims(), aware.Name()),
+		}
+		metrics.RegisterEvictionCostShadow(pmpt.Name(), shadow.Differs(), shadow.Baseline.GPUSeconds, shadow.CostAware.GPUSeconds)
+		pmpt.book.LogShadow(pmpt.Name(), "topology_aware", preemptor, shadow)
 	}
 
 	if status := prepareCandidate(bestCandidate, preemptor.Pod, stmt, ssn); !status.IsSuccess() {

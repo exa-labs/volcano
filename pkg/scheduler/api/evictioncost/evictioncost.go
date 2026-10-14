@@ -425,11 +425,12 @@ func (b *Book) Selection(victims []*api.TaskInfo) float64 {
 }
 
 // Shadow compares the victims two orderings would evict to fit need next to
-// idle: the cost of each, and whether they differ in cost (equal-cost
-// choices are ties, not different decisions).
-func (b *Book) Shadow(baseline, costAware []*api.TaskInfo, need, idle *api.Resource) (differs bool, baselineCost, costAwareCost float64) {
-	baselineCost, costAwareCost = b.Selection(Cover(baseline, need, idle)), b.Selection(Cover(costAware, need, idle))
-	return baselineCost != costAwareCost, baselineCost, costAwareCost
+// idle: the shortest prefix of each that fits (see Cover) and its cost.
+func (b *Book) Shadow(baseline, costAware []*api.TaskInfo, need, idle *api.Resource) ShadowResult {
+	return ShadowResult{
+		Baseline:  b.Side(Cover(baseline, need, idle), ""),
+		CostAware: b.Side(Cover(costAware, need, idle), ""),
+	}
 }
 
 // Cover returns the shortest prefix of ordered whose resources, added to
