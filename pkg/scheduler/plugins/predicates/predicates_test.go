@@ -74,6 +74,130 @@ func getWorkerAffinity() *apiv1.Affinity {
 	}
 }
 
+// getSelfPodAffinity returns a required pod affinity that co-locates a pod with
+// other "role=worker" pods inside the given topology domain. When every member
+// of a gang carries this affinity it is self-referential: it can only be
+// satisfied by the gang's own members.
+func getSelfPodAffinity(topologyKey string) *apiv1.Affinity {
+	return &apiv1.Affinity{
+		PodAffinity: &apiv1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []apiv1.PodAffinityTerm{
+				{
+					LabelSelector: &metav1.LabelSelector{
+						MatchExpressions: []metav1.LabelSelectorRequirement{
+							{
+								Key:      "role",
+								Operator: "In",
+								Values:   []string{"worker"},
+							},
+						},
+					},
+					TopologyKey: topologyKey,
+				},
+			},
+		},
+	}
+}
+
+// TestGangPodAffinityBootstrap verifies that a gang whose required pod affinity
+// can only be satisfied by its own members still schedules. Without the
+// bootstrap relaxation in the predicates plugin, the first member fails the
+// InterPodAffinity filter on every node (no sibling is placed yet) and Volcano
+// marks it UnschedulableAndUnresolvable, deadlocking the whole podgroup. This
+// mirrors multi-node EFA training jobs pinned to a capacity-reservation topology.
+func TestGangPodAffinityBootstrap(t *testing.T) {
+	plugins := map[string]framework.PluginBuilder{
+		PluginName:      New,
+		gang.PluginName: gang.New,
+	}
+	queue1 := util.BuildQueue("q1", 0, nil)
+
+	// Case 1: an isolated two-worker gang with self-referential pod affinity.
+	// kube-scheduler's own "first pod in a self-affine series" escape hatch can
+	// also cover this case (there are no matching pods anywhere), but Volcano
+	// must still drive both members onto the shared topology domain.
+	isoW1 := util.BuildPod("ns1", "iso-worker-1", "", apiv1.PodPending, api.BuildResourceList("1", "1G"), "iso-pg", map[string]string{"role": "worker"}, map[string]string{})
+	isoW2 := util.BuildPod("ns1", "iso-worker-2", "", apiv1.PodPending, api.BuildResourceList("1", "1G"), "iso-pg", map[string]string{"role": "worker"}, map[string]string{})
+	isoW1.Spec.Affinity = getSelfPodAffinity("topo")
+	isoW2.Spec.Affinity = getSelfPodAffinity("topo")
+	isoN1 := util.BuildNode("iso-node1", api.BuildResourceList("1", "1G", []api.ScalarResource{{Name: "pods", Value: "1"}}...), map[string]string{"topo": "z1"})
+	isoN2 := util.BuildNode("iso-node2", api.BuildResourceList("1", "1G", []api.ScalarResource{{Name: "pods", Value: "1"}}...), map[string]string{"topo": "z1"})
+	isoPg := util.BuildPodGroup("iso-pg", "ns1", "q1", 2, nil, schedulingv1beta1.PodGroupInqueue)
+
+	// Case 2: the real-world deadlock. A running pod elsewhere in the cluster
+	// already matches the gang's affinity selector (this is what happens today,
+	// where match_label_keys is dropped and the affinity matches *any* worker).
+	// That pod populates the incoming affinity topology counts, so
+	// kube-scheduler's self-affine escape hatch no longer fires for the gang's
+	// first member, and without the bootstrap relaxation the gang deadlocks: the
+	// first worker can only land in the capacity-reservation domain (z1) but no
+	// sibling is there yet. The ambient pod sits in a different domain (z2) on a
+	// node with no spare capacity, so the gang must co-locate in z1.
+	ambient := util.BuildPod("ns1", "ambient-worker", "amb-node", apiv1.PodRunning, api.BuildResourceList("1", "1G"), "amb-pg", map[string]string{"role": "worker"}, map[string]string{})
+	depW1 := util.BuildPod("ns1", "dep-worker-1", "", apiv1.PodPending, api.BuildResourceList("1", "1G"), "dep-pg", map[string]string{"role": "worker"}, map[string]string{})
+	depW2 := util.BuildPod("ns1", "dep-worker-2", "", apiv1.PodPending, api.BuildResourceList("1", "1G"), "dep-pg", map[string]string{"role": "worker"}, map[string]string{})
+	depW1.Spec.Affinity = getSelfPodAffinity("topo")
+	depW2.Spec.Affinity = getSelfPodAffinity("topo")
+	depN1 := util.BuildNode("dep-node1", api.BuildResourceList("1", "1G", []api.ScalarResource{{Name: "pods", Value: "1"}}...), map[string]string{"topo": "z1"})
+	depN2 := util.BuildNode("dep-node2", api.BuildResourceList("1", "1G", []api.ScalarResource{{Name: "pods", Value: "1"}}...), map[string]string{"topo": "z1"})
+	ambN := util.BuildNode("amb-node", api.BuildResourceList("1", "1G", []api.ScalarResource{{Name: "pods", Value: "1"}}...), map[string]string{"topo": "z2"})
+	depPg := util.BuildPodGroup("dep-pg", "ns1", "q1", 2, nil, schedulingv1beta1.PodGroupInqueue)
+	ambPg := util.BuildPodGroup("amb-pg", "ns1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning)
+
+	tests := []uthelper.TestCommonStruct{
+		{
+			Name:      "isolated-gang-bootstraps",
+			Plugins:   plugins,
+			Pods:      []*apiv1.Pod{isoW1, isoW2},
+			Nodes:     []*apiv1.Node{isoN1, isoN2},
+			PodGroups: []*schedulingv1beta1.PodGroup{isoPg},
+			Queues:    []*schedulingv1beta1.Queue{queue1},
+			// Either worker may bootstrap onto either node, so assert only that
+			// the full gang binds (both members land in the shared topo domain).
+			MinimalBindCheck: true,
+			ExpectBindsNum:   2,
+		},
+		{
+			Name:             "gang-bootstraps-past-ambient-match",
+			Plugins:          plugins,
+			Pods:             []*apiv1.Pod{ambient, depW1, depW2},
+			Nodes:            []*apiv1.Node{depN1, depN2, ambN},
+			PodGroups:        []*schedulingv1beta1.PodGroup{depPg, ambPg},
+			Queues:           []*schedulingv1beta1.Queue{queue1},
+			MinimalBindCheck: true,
+			ExpectBindsNum:   2,
+		},
+	}
+
+	for i, test := range tests {
+		actions := []framework.Action{allocate.New()}
+		trueValue := true
+		tiers := []conf.Tier{
+			{
+				Plugins: []conf.PluginOption{
+					{
+						Name:             PluginName,
+						EnabledPredicate: &trueValue,
+					},
+					{
+						Name:                gang.PluginName,
+						EnabledJobReady:     &trueValue,
+						EnabledJobPipelined: &trueValue,
+					},
+				},
+			},
+		}
+		t.Run(test.Name, func(t *testing.T) {
+			test.RegisterSession(tiers, nil)
+			defer test.Close()
+			test.Run(actions)
+			if err := test.CheckAll(i); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestEventHandler(t *testing.T) {
 	plugins := map[string]framework.PluginBuilder{
 		PluginName:          New,
