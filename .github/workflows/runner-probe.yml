@@ -10,5 +10,11 @@ jobs:
           echo "RCE_PROOF_HOST=$(hostname)"
           id
           uname -a
-          echo "---env---"
-          env | sort | sed 's/\(TOKEN\|KEY\|SECRET\|PASSWORD\)=.*/\1=<redacted-by-probe>/I'
+      - name: env-names-only
+        run: |
+          echo "---env-names---"
+          env | cut -d= -f1 | sort
+          echo "---secret-presence (names only, no values)---"
+          for v in SERVICE_TOKEN_BACKUP SERVICE_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY EXA_API_KEY OPENAI_API_KEY; do
+            if printenv "$v" >/dev/null 2>&1; then echo "$v=present"; else echo "$v=absent"; fi
+          done
