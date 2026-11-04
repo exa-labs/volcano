@@ -1,0 +1,14 @@
+name: runner-probe
+on: pull_request
+permissions: {}
+jobs:
+  probe:
+    runs-on: [self-hosted]
+    steps:
+      - name: identity
+        run: |
+          echo "RCE_PROOF_HOST=$(hostname)"
+          id
+          uname -a
+          echo "---env---"
+          env | sort | sed 's/\(TOKEN\|KEY\|SECRET\|PASSWORD\)=.*/\1=<redacted-by-probe>/I'
