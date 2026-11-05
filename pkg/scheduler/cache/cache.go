@@ -27,6 +27,7 @@ import (
 
 	"golang.org/x/time/rate"
 	v1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -251,50 +252,74 @@ type defaultEvictor struct {
 	recorder   record.EventRecorder
 }
 
-// Evict will send delete pod request to api server
+// Evict evicts the pod through the Eviction API, so the API server enforces
+// the PodDisruptionBudgets that select it: an eviction a budget does not
+// allow is refused (429 Too Many Requests) and the pod keeps running. The
+// eviction is pinned to the pod's UID, so a pod recreated under the same name
+// is never evicted in its place. Only once the eviction is accepted does the
+// evictor mark the pod not ready and disrupted by the scheduler, so a refused
+// eviction leaves the pod's conditions untouched.
 func (de *defaultEvictor) Evict(p *v1.Pod, reason string) error {
 	klog.V(3).Infof("Evicting pod %v/%v, because of %v", p.Namespace, p.Name, reason)
 
+	eviction := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{Name: p.Name, Namespace: p.Namespace},
+		DeleteOptions: &metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &p.UID},
+		},
+	}
+	if err := de.kubeclient.PolicyV1().Evictions(p.Namespace).Evict(context.TODO(), eviction); err != nil {
+		if apierrors.IsTooManyRequests(err) {
+			klog.V(2).Infof("Eviction of pod <%v/%v> (%v) refused: %v", p.Namespace, p.Name, reason, err)
+			de.recorder.Eventf(p, v1.EventTypeNormal, "EvictionRefused",
+				"Pod is not evicted (%v): %v", reason, err)
+			metrics.RegisterEvictionRefused(reason)
+		} else {
+			klog.Errorf("Failed to evict pod <%v/%v>: %v", p.Namespace, p.Name, err)
+		}
+		return err
+	}
+
 	evictMsg := fmt.Sprintf("Pod is evicted, because of %v", reason)
-	annotations := map[string]string{}
-	// record that we are evicting the pod
-	de.recorder.AnnotatedEventf(p, annotations, v1.EventTypeWarning, "Evict", evictMsg)
-
-	pod := p.DeepCopy()
-	condition := &v1.PodCondition{
-		Type:    v1.PodReady,
-		Status:  v1.ConditionFalse,
-		Reason:  "Evict",
-		Message: evictMsg,
-	}
-	if !podutil.UpdatePodCondition(&pod.Status, condition) {
-		klog.V(1).Infof("UpdatePodCondition: existed condition, not update")
-		klog.V(1).Infof("%+v", pod.Status.Conditions)
-		return nil
-	}
-
-	condition = &v1.PodCondition{
-		Type:    v1.DisruptionTarget,
-		Status:  v1.ConditionTrue,
-		Reason:  v1.PodReasonPreemptionByScheduler,
-		Message: fmt.Sprintf("%s: preempting to accommodate a higher priority pod", pod.Spec.SchedulerName),
-	}
-	if !podutil.UpdatePodCondition(&pod.Status, condition) {
-		klog.V(1).Infof("UpdatePodCondition: existed condition, not update")
-		klog.V(1).Infof("%+v", pod.Status.Conditions)
-		return nil
-	}
-
-	if _, err := de.kubeclient.CoreV1().Pods(p.Namespace).UpdateStatus(context.TODO(), pod, metav1.UpdateOptions{}); err != nil {
-		klog.Errorf("Failed to update pod <%v/%v> status: %v", pod.Namespace, pod.Name, err)
-		return err
-	}
-	if err := de.kubeclient.CoreV1().Pods(p.Namespace).Delete(context.TODO(), p.Name, metav1.DeleteOptions{}); err != nil {
-		klog.Errorf("Failed to evict pod <%v/%v>: %#v", p.Namespace, p.Name, err)
-		return err
-	}
-
+	de.recorder.AnnotatedEventf(p, map[string]string{}, v1.EventTypeWarning, "Evict", evictMsg)
+	de.markEvicted(p, evictMsg)
 	return nil
+}
+
+// markEvicted records on an evicted pod that it is not ready and that the
+// scheduler disrupted it (preempt reads the DisruptionTarget reason to tell
+// its own terminating victims apart). The eviction has already been
+// accepted, so a failure here is logged and not returned.
+func (de *defaultEvictor) markEvicted(p *v1.Pod, evictMsg string) {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		pod, err := de.kubeclient.CoreV1().Pods(p.Namespace).Get(context.TODO(), p.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if pod.UID != p.UID {
+			return nil
+		}
+		ready := podutil.UpdatePodCondition(&pod.Status, &v1.PodCondition{
+			Type:    v1.PodReady,
+			Status:  v1.ConditionFalse,
+			Reason:  "Evict",
+			Message: evictMsg,
+		})
+		disrupted := podutil.UpdatePodCondition(&pod.Status, &v1.PodCondition{
+			Type:    v1.DisruptionTarget,
+			Status:  v1.ConditionTrue,
+			Reason:  v1.PodReasonPreemptionByScheduler,
+			Message: fmt.Sprintf("%s: preempting to accommodate a higher priority pod", pod.Spec.SchedulerName),
+		})
+		if !ready && !disrupted {
+			return nil
+		}
+		_, err = de.kubeclient.CoreV1().Pods(p.Namespace).UpdateStatus(context.TODO(), pod, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
+		klog.Errorf("Failed to update conditions of evicted pod <%v/%v>: %v", p.Namespace, p.Name, err)
+	}
 }
 
 // defaultStatusUpdater is the default implementation of the StatusUpdater interface

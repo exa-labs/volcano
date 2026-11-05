@@ -141,6 +141,14 @@ var (
 		},
 	)
 
+	evictionsRefused = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: VolcanoSubSystemName,
+			Name:      "evictions_refused_total",
+			Help:      "Number of evictions the API server refused because a PodDisruptionBudget did not allow them, by eviction reason",
+		}, []string{"reason"},
+	)
+
 	unscheduleTaskCount = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Subsystem: VolcanoSubSystemName,
@@ -225,6 +233,13 @@ func RegisterPreemptionAttempts() {
 // RegisterPreemptionBackoffSkip records a starving job skipped by preemption backoff
 func RegisterPreemptionBackoffSkip() {
 	preemptionBackoffSkips.Inc()
+}
+
+// RegisterEvictionRefused records an eviction the API server refused under a
+// PodDisruptionBudget; reason is the scheduler's eviction reason (preempt,
+// reclaim, shuffle, ...).
+func RegisterEvictionRefused(reason string) {
+	evictionsRefused.WithLabelValues(reason).Inc()
 }
 
 // UpdateUnscheduleTaskCount records total number of unscheduleable tasks

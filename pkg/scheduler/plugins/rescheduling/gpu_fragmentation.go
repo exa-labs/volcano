@@ -155,7 +155,7 @@ var victimsFnForGpuFragmentation = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 	// victims) with a pod deep-copy per call.
 	probes := make(map[types.UID]*api.TaskInfo)
 	preFailed := make(map[types.UID]error)
-	drains := planGpuFragmentationDrains(Session.Nodes, Session.Jobs, running, conf, time.Now(), func(task *api.TaskInfo, node *api.NodeInfo) error {
+	drains := planGpuFragmentationDrains(Session.Nodes, Session.Jobs, running, conf, time.Now(), sessionDisruptionBudgets(), func(task *api.TaskInfo, node *api.NodeInfo) error {
 		uid := task.Pod.UID
 		if err, ok := preFailed[uid]; ok {
 			return err
@@ -292,13 +292,17 @@ func probeTask(task *api.TaskInfo) *api.TaskInfo {
 // ledger and never reuse a node already drained or filled by an earlier
 // drain, so the plans compose without double-booking. Equally-utilized nodes
 // tie-break toward the one running lower-priority victims, then fewer
-// victims, so the cheapest-to-disrupt workload moves.
+// victims, so the cheapest-to-disrupt workload moves. A source whose victims
+// their PodDisruptionBudgets do not allow evicting together is passed over,
+// and each planned drain spends the budgets it evicts from (budgets may be
+// nil).
 func planGpuFragmentationDrains(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
 	running map[types.UID]*api.TaskInfo,
 	conf *gpuFragmentationConf,
 	now time.Time,
+	budgets *disruptionBudgets,
 	predicate func(*api.TaskInfo, *api.NodeInfo) error,
 ) []gpuFragmentationDrain {
 	gpu := v1.ResourceName(conf.GpuResource)
@@ -378,6 +382,9 @@ func planGpuFragmentationDrains(
 			if ledger.touched(source.Name) {
 				continue
 			}
+			if !budgets.allows(victims) {
+				continue
+			}
 			overCap := conf.EvictionCost.over(conf.MaxEvictionCostGpuSecondsPerGpu, cand.price.gated)
 			caught := func(moves []gpuFragmentationMove, outcome string) {
 				conf.EvictionCost.count(gpuRepackSkipped)
@@ -409,6 +416,7 @@ func planGpuFragmentationDrains(
 				moves:  moves,
 				gain:   source.Used.Get(gpu),
 			})
+			budgets.take(victims)
 			planned += len(moves)
 		}
 	}

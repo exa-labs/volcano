@@ -530,7 +530,10 @@ type moveStep struct {
 
 // advanceCapacityUpgradeMoves derives this session's actions from the moves
 // in flight. It is pure: it mutates idx to the desired end state and returns
-// the steps that realise it, in order.
+// the steps that realise it, in order. Every eviction a step carries fits
+// the pods' PodDisruptionBudgets (budgets may be nil): a move whose movers
+// their budgets protect waits, held, until the budgets allow the eviction or
+// the hold expires.
 func advanceCapacityUpgradeMoves(
 	idx *capacityUpgradeIndex,
 	nodes map[string]*api.NodeInfo,
@@ -538,6 +541,7 @@ func advanceCapacityUpgradeMoves(
 	conf *capacityUpgradeConf,
 	now time.Time,
 	predicate capacityUpgradePredicate,
+	budgets *disruptionBudgets,
 ) []moveStep {
 	gpu := v1.ResourceName(conf.GpuResource)
 	ttl := time.Duration(conf.HoldTTLSeconds) * time.Second
@@ -606,7 +610,10 @@ func advanceCapacityUpgradeMoves(
 			// eviction did not take). Only pods created after the eviction
 			// count: a sibling of the mover that already ran on the target
 			// carries the same identity but is not the successor.
-			step.movers = append(step.movers, movers...)
+			if budgets.allows(movers) {
+				budgets.take(movers)
+				step.movers = append(step.movers, movers...)
+			}
 			claimed := 0
 			successors := map[api.JobID]*api.JobInfo{}
 			for _, node := range hold.Nodes {
@@ -666,7 +673,7 @@ func advanceCapacityUpgradeMoves(
 			continue
 		}
 		if !targetsIdle(idx, move, nodes, movers, gpu) {
-			if displaced := displacedToEvict(idx, move, nodes, jobs, movers, gpu, displacedCost(conf, jobs, now)); len(displaced) > 0 && moversFit(move, nodes, movers, predicate) {
+			if displaced := budgets.admit(displacedToEvict(idx, move, nodes, jobs, movers, gpu, displacedCost(conf, jobs, now))); len(displaced) > 0 && moversFit(move, nodes, movers, predicate) {
 				step.displaced = displaced
 				step.outcome, step.reason = "displacing", "making room on held capacity"
 				steps = append(steps, step)
@@ -676,6 +683,11 @@ func advanceCapacityUpgradeMoves(
 		if !moversFit(move, nodes, movers, predicate) {
 			continue
 		}
+		if !budgets.allows(movers) {
+			klog.V(2).Infof("capacityUpgrade: move %s waits: a PodDisruptionBudget protects its movers", id)
+			continue
+		}
+		budgets.take(movers)
 
 		evictedStamp := now.UTC().Format(time.RFC3339)
 		deadline := now.Add(ttl).UTC().Format(time.RFC3339)
