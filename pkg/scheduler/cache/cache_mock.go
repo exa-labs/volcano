@@ -91,6 +91,9 @@ func checkAndSetDefaultInterface(sc *SchedulerCache) {
 			recorder:   sc.Recorder,
 		}
 	}
+	if sc.evictionBackoff == nil {
+		sc.evictionBackoff = newEvictionBackoff()
+	}
 	if sc.StatusUpdater == nil {
 		sc.StatusUpdater = &defaultStatusUpdater{
 			kubeclient: sc.kubeClient,

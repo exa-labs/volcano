@@ -155,6 +155,10 @@ type SchedulerCache struct {
 
 	NamespaceCollection map[string]*schedulingapi.NamespaceCollection
 
+	// evictionBackoff holds pods whose eviction failed out of victim
+	// selection for a bounded interval.
+	evictionBackoff *evictionBackoff
+
 	errTasks        workqueue.TypedRateLimitingInterface[string]
 	nodeQueue       workqueue.TypedRateLimitingInterface[string]
 	DeletedJobs     workqueue.TypedRateLimitingInterface[string]
@@ -268,15 +272,23 @@ func (de *defaultEvictor) Evict(p *v1.Pod, reason string) error {
 			Preconditions: &metav1.Preconditions{UID: &p.UID},
 		},
 	}
+	// Every outcome but an accepted eviction leaves the pod as it is: there is
+	// no fallback to deleting it. The caller holds a refused pod out of victim
+	// selection for a while (evictionBackoff).
 	if err := de.kubeclient.PolicyV1().Evictions(p.Namespace).Evict(context.TODO(), eviction); err != nil {
-		if apierrors.IsTooManyRequests(err) {
+		switch {
+		case apierrors.IsNotFound(err):
+			// Already gone: nothing is left to evict.
+			klog.V(3).Infof("Pod <%v/%v> (%v) was gone before its eviction", p.Namespace, p.Name, reason)
+			return nil
+		case apierrors.IsTooManyRequests(err):
 			klog.V(2).Infof("Eviction of pod <%v/%v> (%v) refused: %v", p.Namespace, p.Name, reason, err)
 			de.recorder.Eventf(p, v1.EventTypeNormal, "EvictionRefused",
 				"Pod is not evicted (%v): %v", reason, err)
-			metrics.RegisterEvictionRefused(reason)
-		} else {
-			klog.Errorf("Failed to evict pod <%v/%v>: %v", p.Namespace, p.Name, err)
+		default:
+			klog.Errorf("Failed to evict pod <%v/%v> (%v), leaving it running: %v", p.Namespace, p.Name, reason, err)
 		}
+		metrics.RegisterEvictionRefused(reason, evictionOutcome(err))
 		return err
 	}
 
@@ -284,6 +296,23 @@ func (de *defaultEvictor) Evict(p *v1.Pod, reason string) error {
 	de.recorder.AnnotatedEventf(p, map[string]string{}, v1.EventTypeWarning, "Evict", evictMsg)
 	de.markEvicted(p, evictMsg)
 	return nil
+}
+
+// evictionOutcome names why the API server did not evict a pod, for
+// volcano_evictions_refused_total: budget (429, a PodDisruptionBudget does
+// not allow it), conflict (409, the pod's UID no longer matches), forbidden
+// (403, the scheduler may not create pods/eviction), or error.
+func evictionOutcome(err error) string {
+	switch {
+	case apierrors.IsTooManyRequests(err):
+		return "budget"
+	case apierrors.IsConflict(err):
+		return "conflict"
+	case apierrors.IsForbidden(err):
+		return "forbidden"
+	default:
+		return "error"
+	}
 }
 
 // markEvicted records on an evicted pod that it is not ready and that the
@@ -610,6 +639,7 @@ func newSchedulerCache(config *rest.Config, schedulerNames []string, defaultQueu
 		kubeclient: sc.kubeClient,
 		recorder:   sc.Recorder,
 	}
+	sc.evictionBackoff = newEvictionBackoff()
 
 	sc.StatusUpdater = &defaultStatusUpdater{
 		kubeclient: sc.kubeClient,
@@ -935,8 +965,13 @@ func (sc *SchedulerCache) Evict(taskInfo *schedulingapi.TaskInfo, reason string)
 	go func() {
 		err := sc.Evictor.Evict(p, reason)
 		if err != nil {
+			held := sc.evictionBackoff.failed(task.UID)
+			klog.V(2).Infof("Task <%s/%s> is not a victim for %v after its eviction failed: %v",
+				task.Namespace, task.Name, held, err)
 			sc.resyncTask(task)
+			return
 		}
+		sc.evictionBackoff.forget(task.UID)
 	}()
 
 	podgroup := &vcv1beta1.PodGroup{}
@@ -1466,6 +1501,8 @@ func (sc *SchedulerCache) Snapshot() *schedulingapi.ClusterInfo {
 
 	copy(snapshot.NodeList, sc.NodeList)
 	snapshot.NodesInShard = sc.InUseNodesInShard.Clone()
+	snapshot.EvictionBackoff = sc.evictionBackoff.active()
+	metrics.UpdateEvictionBackoffPods(snapshot.EvictionBackoff.Len())
 	for _, value := range sc.Nodes {
 		value.RefreshNumaSchedulerInfoByCrd()
 	}

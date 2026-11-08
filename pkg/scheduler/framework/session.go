@@ -160,6 +160,11 @@ type Session struct {
 	cycleStatesMap sync.Map
 
 	NodesInShard sets.Set[string]
+
+	// evictionBackoff holds the tasks whose eviction failed recently (the
+	// cache's evictionBackoff): Preemptable, Reclaimable and VictimTasks never
+	// offer them as victims.
+	evictionBackoff sets.Set[api.TaskID]
 }
 
 func openSession(cache cache.Cache) *Session {
@@ -274,6 +279,7 @@ func openSession(cache cache.Cache) *Session {
 	}
 
 	ssn.NodesInShard = snapshot.NodesInShard
+	ssn.evictionBackoff = snapshot.EvictionBackoff
 
 	klog.V(3).Infof("Open Session %v with <%d> Job and <%d> Queues. HyperNodesReadyToSchedule: %v",
 		ssn.UID, len(ssn.Jobs), len(ssn.Queues), ssn.HyperNodesReadyToSchedule)

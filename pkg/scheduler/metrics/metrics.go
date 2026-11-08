@@ -145,8 +145,16 @@ var (
 		prometheus.CounterOpts{
 			Subsystem: VolcanoSubSystemName,
 			Name:      "evictions_refused_total",
-			Help:      "Number of evictions the API server refused because a PodDisruptionBudget did not allow them, by eviction reason",
-		}, []string{"reason"},
+			Help:      "Number of evictions the API server did not carry out, by eviction reason and outcome (budget, conflict, forbidden, error); the pod keeps running",
+		}, []string{"reason", "outcome"},
+	)
+
+	evictionBackoffPods = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Subsystem: VolcanoSubSystemName,
+			Name:      "eviction_backoff_pods",
+			Help:      "Number of pods held out of victim selection after a failed eviction, at the last session",
+		},
 	)
 
 	unscheduleTaskCount = promauto.NewGaugeVec(
@@ -235,11 +243,17 @@ func RegisterPreemptionBackoffSkip() {
 	preemptionBackoffSkips.Inc()
 }
 
-// RegisterEvictionRefused records an eviction the API server refused under a
-// PodDisruptionBudget; reason is the scheduler's eviction reason (preempt,
-// reclaim, shuffle, ...).
-func RegisterEvictionRefused(reason string) {
-	evictionsRefused.WithLabelValues(reason).Inc()
+// RegisterEvictionRefused records an eviction the API server did not carry
+// out; reason is the scheduler's eviction reason (preempt, reclaim, shuffle,
+// ...) and outcome why (budget, conflict, forbidden, error).
+func RegisterEvictionRefused(reason, outcome string) {
+	evictionsRefused.WithLabelValues(reason, outcome).Inc()
+}
+
+// UpdateEvictionBackoffPods records how many pods are held out of victim
+// selection after a failed eviction.
+func UpdateEvictionBackoffPods(count int) {
+	evictionBackoffPods.Set(float64(count))
 }
 
 // UpdateUnscheduleTaskCount records total number of unscheduleable tasks
