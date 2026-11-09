@@ -76,6 +76,8 @@ type fixture struct {
 	// demand is the pending-demand guard capacityUpgrade plans with (nil:
 	// no pending work is considered).
 	demand pendingDemand
+	// budgets are the PodDisruptionBudgets the planners consult (nil: none).
+	budgets *disruptionBudgets
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -120,7 +122,7 @@ type plannedMove struct {
 }
 
 func (f *fixture) plan(conf *gpuFragmentationConf, predicate func(*api.TaskInfo, *api.NodeInfo) error) []plannedMove {
-	drains := planGpuFragmentationDrains(f.nodes, f.jobs, f.running, conf, time.Now(), predicate)
+	drains := planGpuFragmentationDrains(f.nodes, f.jobs, f.running, conf, time.Now(), f.budgets, predicate)
 	plans := make([]plannedMove, 0)
 	for _, drain := range drains {
 		for _, move := range drain.moves {

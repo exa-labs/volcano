@@ -237,7 +237,7 @@ func (f *fixture) index() *capacityUpgradeIndex {
 }
 
 func (f *fixture) planUpgrades(conf *capacityUpgradeConf, predicate capacityUpgradePredicate) []capacityUpgradePlan {
-	return planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), testNow, predicate, f.demand)
+	return planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, f.index(), testNow, predicate, f.demand, f.budgets)
 }
 
 // memStore is a capacityUpgradeStore that applies node writes to the
@@ -327,7 +327,7 @@ func liveConf() *capacityUpgradeConf {
 // plans.
 func (f *fixture) startOnly(t *testing.T, conf *capacityUpgradeConf, store *memStore) []capacityUpgradePlan {
 	idx := f.index()
-	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, testNow, nil, f.demand)
+	plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, conf, idx, testNow, nil, f.demand, f.budgets)
 	for _, plan := range plans {
 		if err := startCapacityUpgradeMove(plan, idx, conf, store); err != nil {
 			t.Fatalf("startCapacityUpgradeMove: %v", err)
@@ -339,7 +339,7 @@ func (f *fixture) startOnly(t *testing.T, conf *capacityUpgradeConf, store *memS
 // advance runs one session's maintenance at the given time and applies it,
 // returning the steps and the movers the session would evict.
 func (f *fixture) advance(conf *capacityUpgradeConf, store *memStore, now time.Time, predicate capacityUpgradePredicate) ([]moveStep, []*api.TaskInfo) {
-	steps := advanceCapacityUpgradeMoves(f.index(), f.nodes, f.jobs, conf, now, predicate)
+	steps := advanceCapacityUpgradeMoves(f.index(), f.nodes, f.jobs, conf, now, predicate, f.budgets)
 	return steps, applyMoveSteps(steps, store)
 }
 
@@ -1079,7 +1079,7 @@ func TestStartMoveRollsBackOnWriteFailure(t *testing.T) {
 	}
 	start := func(f *fixture, store *memStore) error {
 		idx := f.index()
-		plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil, f.demand)
+		plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil, f.demand, f.budgets)
 		if len(plans) != 1 {
 			t.Fatalf("expected 1 plan, got %d", len(plans))
 		}
@@ -1552,7 +1552,7 @@ func TestMalformedAnnotationIsClearedAndTrustsNothing(t *testing.T) {
 		t.Fatalf("expected reserved-2 malformed and contributing nothing, got %+v", idx)
 	}
 	// The malformed node is not a planning target either.
-	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil, f.demand); len(plans) != 1 || plans[0].nodes["reserved-2"] == 0 {
+	if plans := planCapacityUpgrades(f.nodes, f.jobs, f.running, liveConf(), idx, testNow, nil, f.demand, f.budgets); len(plans) != 1 || plans[0].nodes["reserved-2"] == 0 {
 		// Planning still works; a malformed node just has no holds to net out.
 		t.Logf("plans: %+v", plans)
 	}

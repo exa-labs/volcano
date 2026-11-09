@@ -23,6 +23,7 @@ package framework
 import (
 	"context"
 
+	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
@@ -211,6 +212,10 @@ func (ssn *Session) AddHyperNodeGradientForSubJobFn(name string, fn api.HyperNod
 // Reclaimable invoke reclaimable function of the plugins
 func (ssn *Session) Reclaimable(reclaimer *api.TaskInfo, reclaimees []*api.TaskInfo) []*api.TaskInfo {
 	var victims []*api.TaskInfo
+	reclaimees = ssn.withoutEvictionBackoff(reclaimees)
+	if len(reclaimees) == 0 {
+		return nil
+	}
 
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
@@ -260,6 +265,10 @@ func (ssn *Session) Reclaimable(reclaimer *api.TaskInfo, reclaimees []*api.TaskI
 // Preemptable invoke preemptable function of the plugins
 func (ssn *Session) Preemptable(preemptor *api.TaskInfo, preemptees []*api.TaskInfo) []*api.TaskInfo {
 	var victims []*api.TaskInfo
+	preemptees = ssn.withoutEvictionBackoff(preemptees)
+	if len(preemptees) == 0 {
+		return nil
+	}
 
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
@@ -605,6 +614,10 @@ func (ssn *Session) VictimTasks(tasks []*api.TaskInfo) map[*api.TaskInfo]bool {
 			for _, fn := range fns {
 				victimTasks := fn(tasks)
 				for _, victim := range victimTasks {
+					if ssn.evictionBackoff.Has(victim.UID) {
+						klog.V(4).Infof("Task <%s/%s> is not a victim: its last eviction failed", victim.Namespace, victim.Name)
+						continue
+					}
 					victimSet[victim] = true
 				}
 			}
@@ -614,6 +627,24 @@ func (ssn *Session) VictimTasks(tasks []*api.TaskInfo) map[*api.TaskInfo]bool {
 		}
 	}
 	return victimSet
+}
+
+// withoutEvictionBackoff drops the tasks whose eviction failed recently, so no
+// action chooses them as victims again until their backoff ends: a refused
+// eviction is never retried every session, and never turned into a delete.
+func (ssn *Session) withoutEvictionBackoff(tasks []*api.TaskInfo) []*api.TaskInfo {
+	if ssn.evictionBackoff.Len() == 0 {
+		return tasks
+	}
+	eligible := make([]*api.TaskInfo, 0, len(tasks))
+	for _, task := range tasks {
+		if ssn.evictionBackoff.Has(task.UID) {
+			klog.V(4).Infof("Task <%s/%s> is not a victim: its last eviction failed", task.Namespace, task.Name)
+			continue
+		}
+		eligible = append(eligible, task)
+	}
+	return eligible
 }
 
 // ReservedNodes invoke ReservedNodes function of the plugins

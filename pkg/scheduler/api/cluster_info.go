@@ -41,6 +41,9 @@ type ClusterInfo struct {
 	NodeList                  []string
 	CSINodesStatus            map[string]*CSINodeStatusInfo
 	NodesInShard              sets.Set[string]
+	// EvictionBackoff holds the tasks whose eviction failed recently; no
+	// action may choose them as victims this session.
+	EvictionBackoff sets.Set[TaskID]
 }
 
 func (ci ClusterInfo) String() string {

@@ -337,7 +337,7 @@ var victimsFnForCapacityUpgradeMoves = func(tasks []*api.TaskInfo) []*api.TaskIn
 	if len(idx.moves) == 0 && len(idx.malformed) == 0 && len(idx.drains) == 0 {
 		return nil
 	}
-	steps := advanceCapacityUpgradeMoves(idx, Session.Nodes, Session.Jobs, conf, time.Now(), sessionPredicate())
+	steps := advanceCapacityUpgradeMoves(idx, Session.Nodes, Session.Jobs, conf, time.Now(), sessionPredicate(), sessionDisruptionBudgets())
 	victims := applyMoveSteps(steps, sessionStore{})
 	recordShuffleEvictions(CapacityUpgradeStrategy, conf.EvictionCost.book(Session.Jobs, v1.ResourceName(conf.GpuResource), time.Now()), victims)
 	return victims
@@ -368,7 +368,7 @@ var victimsFnForCapacityUpgrade = func(tasks []*api.TaskInfo) []*api.TaskInfo {
 
 	idx := capacityUpgradeSessionIndex()
 	predicate := sessionPredicate()
-	plans := planCapacityUpgrades(Session.Nodes, Session.Jobs, running, conf, idx, time.Now(), predicate, sessionDemand(v1.ResourceName(conf.GpuResource), predicate))
+	plans := planCapacityUpgrades(Session.Nodes, Session.Jobs, running, conf, idx, time.Now(), predicate, sessionDemand(v1.ResourceName(conf.GpuResource), predicate), sessionDisruptionBudgets())
 
 	for _, plan := range plans {
 		pg := plan.job.PodGroup
@@ -470,7 +470,9 @@ func stampCapacityUpgradeMover(plan capacityUpgradePlan, store capacityUpgradeSt
 // pass and seeded with the holds in flight, so two plans cannot claim the
 // same capacity or count on displacing the same pod. Target nodes that
 // pending demand would reclaim from the group are passed over (demand may
-// be nil).
+// be nil). A PodGroup whose movers, together with the pods its placement
+// displaces, their PodDisruptionBudgets do not allow evicting is not moved,
+// and each plan spends the budgets it evicts from (budgets may be nil).
 func planCapacityUpgrades(
 	nodes map[string]*api.NodeInfo,
 	jobs map[api.JobID]*api.JobInfo,
@@ -480,6 +482,7 @@ func planCapacityUpgrades(
 	now time.Time,
 	predicate capacityUpgradePredicate,
 	demand pendingDemand,
+	budgets *disruptionBudgets,
 ) []capacityUpgradePlan {
 	gpu := v1.ResourceName(conf.GpuResource)
 	ranker := conf.ranker()
@@ -520,7 +523,7 @@ func planCapacityUpgrades(
 		return candidates[i].job.UID < candidates[j].job.UID
 	})
 
-	ledger := newUpgradeLedger(nodes, running, conf, idx, gpu)
+	ledger := newUpgradeLedger(nodes, running, conf, idx, gpu, budgets)
 	book := conf.EvictionCost.book(jobs, gpu, now)
 	if conf.EvictionCost.orders(conf.MaxEvictionCostGpuSeconds) {
 		ledger.cost = book.Cost
@@ -532,6 +535,9 @@ func planCapacityUpgrades(
 			continue
 		}
 		if !cand.gang && conf.MaxPodMoves > 0 && pods+len(cand.members) > conf.MaxPodMoves {
+			continue
+		}
+		if !budgets.allows(cand.members) {
 			continue
 		}
 		var placement *capacityUpgradePlacement
@@ -590,6 +596,9 @@ func planCapacityUpgrades(
 				},
 			})
 		}
+		if placement != nil && !budgets.allows(placementEvictions(cand.members, placement)) {
+			placement = nil
+		}
 		if placement == nil {
 			if guard != nil && guard.skipped > 0 {
 				klog.V(3).Infof("capacityUpgrade: %s/%s not moved: %d target node(s) spoken for by pending work",
@@ -598,6 +607,7 @@ func planCapacityUpgrades(
 			continue
 		}
 		ledger.commit(placement)
+		budgets.take(placementEvictions(cand.members, placement))
 		plan := capacityUpgradePlan{
 			job:       cand.job,
 			members:   cand.members,
@@ -622,6 +632,21 @@ func planCapacityUpgrades(
 		}
 	}
 	return plans
+}
+
+// placementEvictions lists every pod a move evicts: its movers, then the
+// pods its placement displaces, node by node in name order.
+func placementEvictions(members []*api.TaskInfo, placement *capacityUpgradePlacement) []*api.TaskInfo {
+	evictions := append([]*api.TaskInfo{}, members...)
+	names := make([]string, 0, len(placement.displaced))
+	for name := range placement.displaced {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		evictions = append(evictions, placement.displaced[name]...)
+	}
+	return evictions
 }
 
 // capacityUpgradeCandidate is a PodGroup eligible for a move.
@@ -803,8 +828,8 @@ type upgradeLedger struct {
 
 // newUpgradeLedger seeds the ledger from the session: each node's idle
 // resources net of the GPUs held by moves in flight, and its displaceable
-// pods.
-func newUpgradeLedger(nodes map[string]*api.NodeInfo, running map[types.UID]*api.TaskInfo, conf *capacityUpgradeConf, idx *capacityUpgradeIndex, gpu v1.ResourceName) *upgradeLedger {
+// pods, less those a PodDisruptionBudget protects.
+func newUpgradeLedger(nodes map[string]*api.NodeInfo, running map[types.UID]*api.TaskInfo, conf *capacityUpgradeConf, idx *capacityUpgradeIndex, gpu v1.ResourceName, budgets *disruptionBudgets) *upgradeLedger {
 	ledger := &upgradeLedger{
 		idle:         make(map[string]*api.Resource, len(nodes)),
 		displaceable: make(map[string][]*api.TaskInfo),
@@ -816,8 +841,15 @@ func newUpgradeLedger(nodes map[string]*api.NodeInfo, running map[types.UID]*api
 			idle.SetScalar(gpu, max(idle.Get(gpu)-outstanding, 0))
 		}
 		ledger.idle[node.Name] = idle
-		if pods := displaceablePods(node, running, conf, idx, gpu); len(pods) > 0 {
-			ledger.displaceable[node.Name] = pods
+		pods := displaceablePods(node, running, conf, idx, gpu)
+		unprotected := pods[:0:0]
+		for _, pod := range pods {
+			if !budgets.protects(pod) {
+				unprotected = append(unprotected, pod)
+			}
+		}
+		if len(unprotected) > 0 {
+			ledger.displaceable[node.Name] = unprotected
 		}
 	}
 	return ledger

@@ -366,6 +366,7 @@ func (sc *SchedulerCache) deleteTask(ti *schedulingapi.TaskInfo) error {
 // Assumes that lock is already acquired.
 func (sc *SchedulerCache) deletePod(pod *v1.Pod) error {
 	pi := schedulingapi.NewTaskInfo(pod)
+	sc.evictionBackoff.forget(pi.UID)
 
 	// Delete the Task in cache to handle Binding status.
 	task := pi
