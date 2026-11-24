@@ -354,20 +354,21 @@ func TestPreempt(t *testing.T) {
 }
 
 const (
-	nominatedNodeCase = "task nominated to a node that passes predicates still preempts for its gang"
-	retryCase         = "retry gang placement when the first task lands in a domain its siblings cannot join"
-	drainingNodeCase  = "retry gang placement when the first task fits a draining node its siblings cannot join"
+	nominatedNodeCase   = "task nominated to a node that passes predicates still preempts for its gang"
+	retryCase           = "retry gang placement when the first task lands in a domain its siblings cannot join"
+	drainingNodeCase    = "retry gang placement when the first task fits a draining node its siblings cannot join"
+	idlePlusPreemptCase = "allocate discarded gang attempt does not poison preempt with affinity fit errors"
 )
 
 // allocateFirstCases run allocate before preempt, as in production, so that
 // allocate's side effects (predicate cycle state, per-node fit errors, a
 // discarded pipelining) are in place when preempt looks at the job.
-var allocateFirstCases = sets.New(nominatedNodeCase, drainingNodeCase)
+var allocateFirstCases = sets.New(nominatedNodeCase, drainingNodeCase, idlePlusPreemptCase)
 
 // exhaustiveCandidateCases predicate every node instead of a random sample,
 // as production does, so that a retry's outcome depends only on the exclusion
 // list and not on which nodes the sample happened to skip.
-var exhaustiveCandidateCases = sets.New(retryCase, drainingNodeCase)
+var exhaustiveCandidateCases = sets.New(retryCase, drainingNodeCase, idlePlusPreemptCase)
 
 func TestTopologyAwarePreempt(t *testing.T) {
 	plugins := map[string]framework.PluginBuilder{
@@ -812,6 +813,41 @@ func TestTopologyAwarePreempt(t *testing.T) {
 			},
 			ExpectTaskStatusNums: map[api.JobID]map[api.TaskStatus]int{
 				"c1/pg3": {api.Pipelined: 2},
+			},
+		},
+		{
+			Name: idlePlusPreemptCase,
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg2", "c1", "q1", 0, nil, schedulingv1beta1.PodGroupInqueue, "medium-priority"),
+				util.BuildPodGroupWithPrio("pg3", "c1", "q1", 3, map[string]int32{"worker": 3}, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			// n1 (zone a, 2G) is empty and scores higher under binpack than n2/n3/n4 (zone b, 4G).
+			// n2 and n3 are empty and n4 runs a preemptable victim. allocate tries zone a (where
+			// preemptor2 fails InterPodAffinity with UnschedulableAndUnresolvable on empty n2/n3),
+			// then zone b (only 2 empty nodes for a 3-worker gang), and discards. preempt must
+			// still see empty n2/n3 for preemptor2 and evict only preemptee4 on n4.
+			Pods: []*v1.Pod{
+				util.BuildPodWithPriority("c1", "preemptee4", "n4", v1.PodRunning, api.BuildResourceList("2", "2G"), "pg2", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string), &mediumPrio.Value),
+				buildGangWorker("c1", "preemptor1", api.BuildResourceList("2", "2G"), "pg3", "zone"),
+				buildGangWorker("c1", "preemptor2", api.BuildResourceList("2", "2G"), "pg3", "zone"),
+				buildGangWorker("c1", "preemptor3", api.BuildResourceList("2", "2G"), "pg3", "zone"),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "a"}),
+				util.BuildNode("n2", api.BuildResourceList("2", "4G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "b"}),
+				util.BuildNode("n3", api.BuildResourceList("2", "4G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "b"}),
+				util.BuildNode("n4", api.BuildResourceList("2", "4G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "b"}),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, nil),
+			},
+			ExpectEvictNum: 1,
+			ExpectEvicted:  []string{"c1/preemptee4"},
+			ExpectPipeLined: map[string][]string{
+				"c1/pg3": {"n2", "n3", "n4"},
+			},
+			ExpectTaskStatusNums: map[api.JobID]map[api.TaskStatus]int{
+				"c1/pg3": {api.Pipelined: 3},
 			},
 		},
 	}

@@ -117,7 +117,7 @@ func New() *Action {
 		minCandidateNodesPercentage:      10,
 		minCandidateNodesAbsolute:        1,
 		maxCandidateNodesAbsolute:        100,
-		gangPlacementRetries:             2,
+		gangPlacementRetries:             16,
 		preemptionBackoffSeconds:         0,
 		preemptionMaxBackoffSeconds:      60,
 		backoff:                          newPreemptBackoff(),
@@ -140,6 +140,9 @@ func (pmpt *Action) parseArguments(ssn *framework.Session) {
 	arguments.GetInt(&pmpt.minCandidateNodesAbsolute, MinCandidateNodesAbsoluteKey)
 	arguments.GetInt(&pmpt.maxCandidateNodesAbsolute, MaxCandidateNodesAbsoluteKey)
 	arguments.GetInt(&pmpt.gangPlacementRetries, GangPlacementRetriesKey)
+	if pmpt.gangPlacementRetries < 0 {
+		pmpt.gangPlacementRetries = 0
+	}
 	arguments.GetInt(&pmpt.preemptionBackoffSeconds, PreemptionBackoffSecondsKey)
 	arguments.GetInt(&pmpt.preemptionMaxBackoffSeconds, PreemptionMaxBackoffSecondsKey)
 	pmpt.backoff.configure(
@@ -347,16 +350,19 @@ func jobPredicateHelper(helpers map[api.JobID]util.PredicateHelper, jobID api.Jo
 	return helper
 }
 
-// pipelinedNodes returns the nodes hosting the job's pipelined tasks, skipping
-// tasks listed in ignore (those pipelined by an earlier, committed statement).
-func pipelinedNodes(job *api.JobInfo, ignore sets.Set[api.TaskID]) sets.Set[string] {
+// pipelinedAttempt returns the nodes and tasks pipelined during the current
+// attempt, skipping tasks listed in ignore (those pipelined by an earlier,
+// committed statement).
+func pipelinedAttempt(job *api.JobInfo, ignore sets.Set[api.TaskID]) (sets.Set[string], []*api.TaskInfo) {
 	nodes := sets.New[string]()
+	var tasks []*api.TaskInfo
 	for uid, task := range job.TaskStatusIndex[api.Pipelined] {
 		if !ignore.Has(uid) {
 			nodes.Insert(task.NodeName)
+			tasks = append(tasks, task)
 		}
 	}
-	return nodes
+	return nodes, tasks
 }
 
 // preemptForJob runs preemption transactions for a starving job until one
@@ -395,7 +401,7 @@ func (pmpt *Action) preemptForJob(
 			return assigned, true
 		}
 
-		chosen := pipelinedNodes(job, committedTasks)
+		chosen, placedTasks := pipelinedAttempt(job, committedTasks)
 		stmt.Discard()
 
 		if attempt >= pmpt.gangPlacementRetries || chosen.Len() == 0 {
@@ -405,9 +411,16 @@ func (pmpt *Action) preemptForJob(
 			return false, false
 		}
 
-		klog.V(3).Infof("Job <%s/%s> not pipelined after placing tasks on %v, retrying preemption without those nodes",
-			job.Namespace, job.Name, sets.List(chosen))
-		excludedNodes = excludedNodes.Union(chosen)
+		gangTasks := make([]*api.TaskInfo, 0, len(job.TaskStatusIndex[api.Pending]))
+		for _, task := range job.TaskStatusIndex[api.Pending] {
+			if !task.SchGated {
+				gangTasks = append(gangTasks, task)
+			}
+		}
+		excluded := util.ExpandExcludedGangNodes(ssn.NodeList, chosen, placedTasks, gangTasks)
+		klog.V(3).Infof("Job <%s/%s> not pipelined after placing tasks on %v, retrying preemption without %d dead-end nodes",
+			job.Namespace, job.Name, sets.List(chosen), excluded.Len())
+		excludedNodes = excludedNodes.Union(excluded)
 		predicateHelpers[job.UID] = util.NewPredicateHelper()
 		preemptorTasks[job.UID] = pendingPreemptorTasks(ssn, job)
 	}
