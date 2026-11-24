@@ -329,5 +329,43 @@ func TestAllocateGangPlacementRetries(t *testing.T) {
 			unresolvable := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(task)
 			assert.Len(t, unresolvable, 2, "task %s should not have healthy nodes hidden by rolled-back fit errors", task.Name)
 		}
+		assert.NotEmpty(t, job.JobFitErrors, "pending job should retain a diagnostic fit error summary")
+	})
+
+	t.Run("does not prune viable rack in same zone when one member adds a narrower affinity key", func(t *testing.T) {
+		// Both workers require zone affinity, and w1 also requires rack affinity.
+		// n1 is alone in (zone=a, rack=r1) and scores higher under binpack than
+		// n2/n3 in (zone=a, rack=r2). Failing on n1 must exclude only n1, not
+		// the entire zone, so retry binds both workers onto n2 and n3.
+		test := &uthelper.TestCommonStruct{
+			Name:    "failed rack and viable rack in same zone",
+			Plugins: plugins,
+			PodGroups: []*schedulingv1.PodGroup{
+				util.BuildPodGroup("pg1", "c1", "q1", 2, map[string]int32{"worker": 2}, schedulingv1.PodGroupInqueue),
+			},
+			Pods: []*v1.Pod{
+				buildAffinityGangWorker("c1", "w0", api.BuildResourceList("2", "1G"), "pg1", "zone"),
+				buildAffinityGangWorker("c1", "w1", api.BuildResourceList("2", "1G"), "pg1", "zone", "rack"),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "a", "rack": "r1", "capacity-type": "spot"}),
+				util.BuildNode("n2", api.BuildResourceList("2", "4G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "a", "rack": "r2", "capacity-type": "spot"}),
+				util.BuildNode("n3", api.BuildResourceList("2", "4G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"zone": "a", "rack": "r2", "capacity-type": "spot"}),
+			},
+			Queues: []*schedulingv1.Queue{
+				util.BuildQueue("q1", 1, nil),
+			},
+			ExpectBindsNum:   2,
+			MinimalBindCheck: true,
+		}
+		ssn := test.RegisterSession(tiers, nil)
+		defer test.Close()
+		test.Run([]framework.Action{New()})
+		if err := test.CheckAll(0); err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range ssn.Jobs["c1/pg1"].Tasks {
+			assert.Contains(t, []string{"n2", "n3"}, task.NodeName)
+		}
 	})
 }

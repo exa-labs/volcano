@@ -17,6 +17,8 @@ limitations under the License.
 package util
 
 import (
+	"maps"
+	"reflect"
 	"slices"
 
 	v1 "k8s.io/api/core/v1"
@@ -31,13 +33,14 @@ import (
 // after a gang placement attempt placed tasks on chosen without reaching
 // minAvailable.
 //
-// It always includes chosen. When every task in gangTasks shares the same
-// resource request and task role, and every gang task carries required
-// pod-affinity terms matching the placed tasks on the same topology keys whose
-// label values agree across chosen, it also excludes every other node in
-// allNodes sharing that topology tuple. No reordering inside an exhausted
-// homogeneous affinity domain can satisfy minAvailable, so excluding the whole
-// domain prevents spending retries on remaining nodes in the same dead end.
+// It always includes chosen. When every task in gangTasks shares the exact same
+// resource request, role, node selector, and affinity constraints (with no pod
+// anti-affinity or topology spread constraints), and every required pod
+// affinity term matches all placed tasks on topology keys whose values agree
+// across chosen, it also excludes every other node in allNodes sharing that
+// topology tuple. Because no narrower affinity, anti-affinity, or per-task
+// constraint can subdivide that domain, no reordering inside it can satisfy
+// minAvailable. Otherwise it falls back to chosen only.
 func ExpandExcludedGangNodes(
 	allNodes []*api.NodeInfo,
 	chosen sets.Set[string],
@@ -49,11 +52,11 @@ func ExpandExcludedGangNodes(
 		return excluded
 	}
 
-	if !tasksHomogeneous(placedTasks, gangTasks) {
+	if !tasksHomogeneousForDomainPruning(placedTasks, gangTasks) {
 		return excluded
 	}
 
-	topologyKeys := sharedSelfAffinityTopologyKeys(placedTasks, gangTasks)
+	topologyKeys := exactSelfAffinityTopologyKeys(placedTasks[0].Pod, placedTasks, gangTasks)
 	if len(topologyKeys) == 0 {
 		return excluded
 	}
@@ -74,9 +77,18 @@ func ExpandExcludedGangNodes(
 	return excluded
 }
 
-func tasksHomogeneous(placedTasks, gangTasks []*api.TaskInfo) bool {
+func tasksHomogeneousForDomainPruning(placedTasks, gangTasks []*api.TaskInfo) bool {
 	anchor := placedTasks[0]
 	if anchor == nil || anchor.Pod == nil || anchor.InitResreq == nil {
+		return false
+	}
+	if len(anchor.Pod.Spec.TopologySpreadConstraints) > 0 {
+		return false
+	}
+	if anchor.Pod.Spec.Affinity == nil || anchor.Pod.Spec.Affinity.PodAffinity == nil {
+		return false
+	}
+	if anchor.Pod.Spec.Affinity.PodAntiAffinity != nil {
 		return false
 	}
 	for _, group := range [][]*api.TaskInfo{placedTasks, gangTasks} {
@@ -90,62 +102,51 @@ func tasksHomogeneous(placedTasks, gangTasks []*api.TaskInfo) bool {
 			if !t.InitResreq.Equal(anchor.InitResreq, api.Zero) {
 				return false
 			}
+			if len(t.Pod.Spec.TopologySpreadConstraints) > 0 {
+				return false
+			}
+			if !maps.Equal(t.Pod.Spec.NodeSelector, anchor.Pod.Spec.NodeSelector) {
+				return false
+			}
+			if !reflect.DeepEqual(t.Pod.Spec.Affinity, anchor.Pod.Spec.Affinity) {
+				return false
+			}
 		}
 	}
 	return true
 }
 
-// sharedSelfAffinityTopologyKeys returns topology keys required by every task
-// in gangTasks via a required pod affinity term whose selector matches all
-// placedTasks.
-func sharedSelfAffinityTopologyKeys(placedTasks, gangTasks []*api.TaskInfo) []string {
-	var common sets.Set[string]
-	for i, task := range gangTasks {
-		keys := taskSelfAffinityTopologyKeys(task.Pod, placedTasks)
-		if keys.Len() == 0 {
-			return nil
-		}
-		if i == 0 {
-			common = keys
-		} else {
-			common = common.Intersection(keys)
-		}
-		if common.Len() == 0 {
-			return nil
-		}
-	}
-	return sets.List(common)
-}
-
-func taskSelfAffinityTopologyKeys(pod *v1.Pod, placedTasks []*api.TaskInfo) sets.Set[string] {
-	if pod == nil || pod.Spec.Affinity == nil || pod.Spec.Affinity.PodAffinity == nil {
+// exactSelfAffinityTopologyKeys returns the topology keys of pod's required pod
+// affinity terms if and only if every required term is self-matching across all
+// placedTasks and gangTasks. Any non-self or namespace-selector term aborts
+// domain expansion so a narrower external constraint cannot be pruned over.
+func exactSelfAffinityTopologyKeys(pod *v1.Pod, placedTasks, gangTasks []*api.TaskInfo) []string {
+	terms := pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if len(terms) == 0 {
 		return nil
 	}
 	keys := sets.New[string]()
-	for _, term := range pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+	for _, term := range terms {
 		if term.TopologyKey == "" || term.LabelSelector == nil || term.NamespaceSelector != nil {
-			continue
+			return nil
 		}
 		sel, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
 		if err != nil {
-			continue
+			return nil
 		}
-		matchesAll := true
-		for _, pt := range placedTasks {
-			if len(term.Namespaces) > 0 && !slices.Contains(term.Namespaces, pt.Namespace) {
-				matchesAll = false
-				break
+		for _, group := range [][]*api.TaskInfo{placedTasks, gangTasks} {
+			for _, t := range group {
+				if len(term.Namespaces) > 0 && !slices.Contains(term.Namespaces, t.Namespace) {
+					return nil
+				}
+				if !sel.Matches(labels.Set(t.Pod.Labels)) {
+					return nil
+				}
 			}
-			if !sel.Matches(labels.Set(pt.Pod.Labels)) {
-				matchesAll = false
-				break
-			}
 		}
-		if matchesAll {
-			keys.Insert(term.TopologyKey)
-		}
+		keys.Insert(term.TopologyKey)
 	}
-	return keys
+	return sets.List(keys)
 }
 
 func sharedDomainValues(allNodes []*api.NodeInfo, chosen sets.Set[string], topologyKeys []string) (map[string]string, bool) {

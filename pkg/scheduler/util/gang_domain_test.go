@@ -55,11 +55,11 @@ func buildLabeledNodeInfo(name string, nodeLabels map[string]string) *api.NodeIn
 
 func TestExpandExcludedGangNodes(t *testing.T) {
 	allNodes := []*api.NodeInfo{
-		buildLabeledNodeInfo("n1", map[string]string{"zone": "a", "gpu": "type1"}),
-		buildLabeledNodeInfo("n2", map[string]string{"zone": "a", "gpu": "type1"}),
-		buildLabeledNodeInfo("n3", map[string]string{"zone": "a", "gpu": "type2"}),
-		buildLabeledNodeInfo("n4", map[string]string{"zone": "b", "gpu": "type1"}),
-		buildLabeledNodeInfo("n5", map[string]string{"zone": "b", "gpu": "type2"}),
+		buildLabeledNodeInfo("n1", map[string]string{"zone": "a", "gpu": "type1", "rack": "r1"}),
+		buildLabeledNodeInfo("n2", map[string]string{"zone": "a", "gpu": "type1", "rack": "r2"}),
+		buildLabeledNodeInfo("n3", map[string]string{"zone": "a", "gpu": "type2", "rack": "r2"}),
+		buildLabeledNodeInfo("n4", map[string]string{"zone": "b", "gpu": "type1", "rack": "r3"}),
+		buildLabeledNodeInfo("n5", map[string]string{"zone": "b", "gpu": "type2", "rack": "r3"}),
 	}
 
 	t.Run("expands homogeneous multi-key affinity domain", func(t *testing.T) {
@@ -68,6 +68,32 @@ func TestExpandExcludedGangNodes(t *testing.T) {
 
 		got := ExpandExcludedGangNodes(allNodes, sets.New("n1"), []*api.TaskInfo{t1}, []*api.TaskInfo{t1, t2})
 		assert.Equal(t, sets.New("n1", "n2"), got)
+	})
+
+	t.Run("does not expand when a member carries an extra narrower affinity term", func(t *testing.T) {
+		t1 := buildAffinityTask("w0", "worker", api.BuildResourceList("4", "8Gi"), "pg1", "zone")
+		t2 := buildAffinityTask("w1", "worker", api.BuildResourceList("4", "8Gi"), "pg1", "zone", "rack")
+
+		got := ExpandExcludedGangNodes(allNodes, sets.New("n1"), []*api.TaskInfo{t1}, []*api.TaskInfo{t1, t2})
+		assert.Equal(t, sets.New("n1"), got)
+	})
+
+	t.Run("does not expand when a non-self required affinity term is present", func(t *testing.T) {
+		t1 := buildAffinityTask("w0", "worker", api.BuildResourceList("4", "8Gi"), "pg1", "zone")
+		t2 := buildAffinityTask("w1", "worker", api.BuildResourceList("4", "8Gi"), "pg1", "zone")
+		extTerm := v1.PodAffinityTerm{
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "cache"}},
+			TopologyKey:   "rack",
+		}
+		t1.Pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(
+			t1.Pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution, extTerm,
+		)
+		t2.Pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(
+			t2.Pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution, extTerm,
+		)
+
+		got := ExpandExcludedGangNodes(allNodes, sets.New("n1"), []*api.TaskInfo{t1}, []*api.TaskInfo{t1, t2})
+		assert.Equal(t, sets.New("n1"), got)
 	})
 
 	t.Run("does not expand heterogeneous resource requests", func(t *testing.T) {
