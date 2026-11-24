@@ -91,10 +91,20 @@ func (w *SubJobWorksheet) Clone() *SubJobWorksheet {
 	}
 }
 
+const (
+	// GangPlacementRetriesKey bounds how many times a gang's allocation attempt
+	// is retried with dead-end nodes excluded when the subJob could not reach
+	// minAvailable as a whole. 0 disables retries.
+	GangPlacementRetriesKey = "gangPlacementRetries"
+
+	defaultGangPlacementRetries = 16
+)
+
 type Action struct {
 	session *framework.Session
 	// configured flag for error cache
 	enablePredicateErrorCache bool
+	gangPlacementRetries      int
 
 	recorder *Recorder
 }
@@ -102,6 +112,7 @@ type Action struct {
 func New() *Action {
 	return &Action{
 		enablePredicateErrorCache: true, // default to enable it
+		gangPlacementRetries:      defaultGangPlacementRetries,
 	}
 }
 
@@ -114,6 +125,10 @@ func (alloc *Action) Initialize() {}
 func (alloc *Action) parseArguments(ssn *framework.Session) {
 	arguments := framework.GetArgOfActionFromConf(ssn.Configurations, alloc.Name())
 	arguments.GetBool(&alloc.enablePredicateErrorCache, conf.EnablePredicateErrCacheKey)
+	arguments.GetInt(&alloc.gangPlacementRetries, GangPlacementRetriesKey)
+	if alloc.gangPlacementRetries < 0 {
+		alloc.gangPlacementRetries = 0
+	}
 }
 
 func (alloc *Action) Execute(ssn *framework.Session) {
@@ -449,6 +464,7 @@ func (alloc *Action) allocateForSubJob(subJob *api.SubJobInfo, subJobWorksheet *
 	klog.V(3).InfoS("Try to allocate resource for subJob", "job", subJob.Job,
 		"subJob", subJob.UID, "allocatedHyperNode", subJob.AllocatedHyperNode, "taskNum", subJobWorksheet.tasks.Len())
 
+	retriesRemaining := alloc.gangPlacementRetries
 	hyperNodeGradients := ssn.HyperNodeGradientForSubJobFn(subJob, hyperNodeForJob)
 	for gradient, hyperNodes := range hyperNodeGradients {
 		stmtBackup := make(map[string]*framework.Statement)         // backup the statement after the subJob is allocated to a hyperNode
@@ -461,7 +477,7 @@ func (alloc *Action) allocateForSubJob(subJob *api.SubJobInfo, subJobWorksheet *
 
 			klog.V(3).InfoS("Try to allocate resource for tasks in subJob", "job", subJob.Job,
 				"subJob", subJob.UID, "taskNum", subJobWorksheetCopy.tasks.Len(), "hyperNode", hyperNode.Name)
-			stmt := alloc.allocateResourcesForTasks(subJob, subJobWorksheetCopy.tasks, hyperNode.Name)
+			stmt := alloc.allocateResourcesForTasksWithBudget(subJob, subJobWorksheetCopy.tasks, hyperNode.Name, &retriesRemaining)
 
 			if stmt != nil && len(stmt.Operations()) > 0 {
 				stmtBackup[hyperNode.Name] = framework.SaveOperations(stmt)  // backup successful solution
@@ -551,20 +567,136 @@ func (alloc *Action) selectBestHyperNodeForSubJob(stmts map[string]*framework.St
 }
 
 func (alloc *Action) allocateResourcesForTasks(subJob *api.SubJobInfo, tasks *util.PriorityQueue, hyperNode string) *framework.Statement {
+	retriesRemaining := alloc.gangPlacementRetries
+	return alloc.allocateResourcesForTasksWithBudget(subJob, tasks, hyperNode, &retriesRemaining)
+}
+
+func (alloc *Action) allocateResourcesForTasksWithBudget(subJob *api.SubJobInfo, tasks *util.PriorityQueue, hyperNode string, retriesRemaining *int) *framework.Statement {
 	ssn := alloc.session
 
 	job := ssn.Jobs[subJob.Job]
-	queue := ssn.Queues[job.Queue]
 	nodes, exist := ssn.RealNodesList[hyperNode]
 	if !exist || len(nodes) == 0 {
 		klog.V(4).InfoS("There is no node in hyperNode", "job", job.UID, "hyperNode", hyperNode)
 		return nil
 	}
 
+	// Fast path: when retries are disabled or the subJob has already met
+	// minAvailable (so this turn only allocates additional tasks one at a time),
+	// run in place without cloning the task heap.
+	if *retriesRemaining <= 0 || ssn.SubJobReady(job, subJob) {
+		stmt, allocatedHyperNode, chosen, _ := alloc.allocateTasksAttempt(subJob, tasks, nodes, hyperNode, nil)
+		if ssn.SubJobReady(job, subJob) {
+			klog.V(3).InfoS("SubJob ready, return statement", "job", job.UID, "subJob", subJob.UID)
+			if subJob.IsSoftTopologyMode() {
+				subJob.AllocatedHyperNode = allocatedHyperNode
+			}
+			return stmt
+		} else if ssn.SubJobPipelined(job, subJob) {
+			klog.V(3).InfoS("SubJob pipelined, return statement", "job", job.UID, "subJob", subJob.UID)
+			return stmt
+		}
+		stmt.Discard()
+		if chosen.Len() > 0 {
+			preserveSubJobFitErrorSummary(job, subJob)
+			job.ResetSubJobFitErr(subJob.UID)
+		}
+		return nil
+	}
+
+	initialTasks := tasks.Clone()
+	var gangTasks []*api.TaskInfo
+	excludedNodes := sets.New[string]()
+	var lastFitErr string
+
+	for attempt := 0; ; attempt++ {
+		attemptTasks := initialTasks.Clone()
+		stmt, allocatedHyperNode, chosen, placedTasks := alloc.allocateTasksAttempt(subJob, attemptTasks, nodes, hyperNode, excludedNodes)
+
+		if ssn.SubJobReady(job, subJob) {
+			klog.V(3).InfoS("SubJob ready, return statement", "job", job.UID, "subJob", subJob.UID)
+			if subJob.IsSoftTopologyMode() {
+				subJob.AllocatedHyperNode = allocatedHyperNode
+			}
+			*tasks = *attemptTasks
+			return stmt
+		} else if ssn.SubJobPipelined(job, subJob) {
+			klog.V(3).InfoS("SubJob pipelined, return statement", "job", job.UID, "subJob", subJob.UID)
+			*tasks = *attemptTasks
+			return stmt
+		}
+
+		stmt.Discard()
+
+		if summary := subJobFitErrorSummary(job, subJob); summary != "" {
+			lastFitErr = summary
+		}
+
+		if chosen.Len() == 0 {
+			if attempt > 0 {
+				clearSubJobLastTxContexts(subJob)
+				if job.JobFitErrors == "" && lastFitErr != "" {
+					job.JobFitErrors = lastFitErr
+				}
+				job.ResetSubJobFitErr(subJob.UID)
+			}
+			return nil
+		}
+
+		// Discard rolled back tentative placements that shaped predicate errors
+		// (for example, InterPodAffinity returning UnschedulableAndUnresolvable
+		// for healthy nodes outside the abandoned anchor domain). Preserve a
+		// human-readable summary on the job if retries stop, then clear stale
+		// per-task fit errors so retries and later actions (preempt/reclaim) do
+		// not filter out viable domains via FilterOutUnschedulableAndUnresolvableNodesForTask.
+		if *retriesRemaining <= 0 {
+			if job.JobFitErrors == "" && lastFitErr != "" {
+				job.JobFitErrors = lastFitErr
+			}
+			job.ResetSubJobFitErr(subJob.UID)
+			clearSubJobLastTxContexts(subJob)
+			return nil
+		}
+		job.ResetSubJobFitErr(subJob.UID)
+		*retriesRemaining--
+
+		if gangTasks == nil {
+			gangTasks = snapshotQueueTasks(initialTasks)
+		}
+		excluded := util.ExpandExcludedGangNodes(nodes, chosen, placedTasks, gangTasks)
+		klog.V(3).InfoS("SubJob not ready after placing tasks, retrying allocation without dead-end nodes",
+			"job", job.UID, "subJob", subJob.UID, "attempt", attempt, "chosen", sets.List(chosen), "excludedCount", excluded.Len())
+		excludedNodes = excludedNodes.Union(excluded)
+	}
+}
+
+func (alloc *Action) allocateTasksAttempt(
+	subJob *api.SubJobInfo,
+	tasks *util.PriorityQueue,
+	allNodes []*api.NodeInfo,
+	hyperNode string,
+	excludedNodes sets.Set[string],
+) (*framework.Statement, string, sets.Set[string], []*api.TaskInfo) {
+	ssn := alloc.session
+	job := ssn.Jobs[subJob.Job]
+	queue := ssn.Queues[job.Queue]
+
+	nodes := allNodes
+	if excludedNodes.Len() > 0 {
+		nodes = slices.DeleteFunc(slices.Clone(allNodes), func(n *api.NodeInfo) bool {
+			return excludedNodes.Has(n.Name)
+		})
+	}
+
 	stmt := framework.NewStatement(ssn)
 	ph := util.NewPredicateHelper()
-
 	allocatedHyperNode := subJob.AllocatedHyperNode
+	chosen := sets.New[string]()
+	var placedTasks []*api.TaskInfo
+
+	if len(nodes) == 0 {
+		return stmt, allocatedHyperNode, chosen, placedTasks
+	}
 
 	for !tasks.Empty() {
 		task := tasks.Pop().(*api.TaskInfo)
@@ -600,7 +732,7 @@ func (alloc *Action) allocateResourcesForTasks(subJob *api.SubJobInfo, tasks *ut
 
 		// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
 		// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
-		if len(task.Pod.Status.NominatedNodeName) > 0 {
+		if len(task.Pod.Status.NominatedNodeName) > 0 && !excludedNodes.Has(task.Pod.Status.NominatedNodeName) {
 			if nominatedNodeInfo, ok := ssn.Nodes[task.Pod.Status.NominatedNodeName]; ok && task.InitResreq.LessEqual(nominatedNodeInfo.FutureIdle(), api.Zero) {
 				predicateNodes, fitErrors = ph.PredicateNodes(task, []*api.NodeInfo{nominatedNodeInfo}, alloc.predicate, alloc.enablePredicateErrorCache, ssn.NodesInShard)
 			}
@@ -641,9 +773,14 @@ func (alloc *Action) allocateResourcesForTasks(subJob *api.SubJobInfo, tasks *ut
 			continue
 		}
 
+		prevOps := len(stmt.Operations())
 		if err := alloc.allocateResourcesForTask(stmt, task, bestNode, job); err != nil {
 			klog.ErrorS(err, "Allocate resources for task fail", "task", task.Name)
 			continue
+		}
+		if len(stmt.Operations()) > prevOps {
+			chosen.Insert(bestNode.Name)
+			placedTasks = append(placedTasks, task)
 		}
 
 		if subJob.WithNetworkTopology() {
@@ -655,19 +792,40 @@ func (alloc *Action) allocateResourcesForTasks(subJob *api.SubJobInfo, tasks *ut
 		}
 	}
 
-	if ssn.SubJobReady(job, subJob) {
-		klog.V(3).InfoS("SubJob ready, return statement", "job", job.UID, "subJob", subJob.UID)
-		if subJob.IsSoftTopologyMode() {
-			subJob.AllocatedHyperNode = allocatedHyperNode
-		}
-		return stmt
-	} else if ssn.SubJobPipelined(job, subJob) {
-		klog.V(3).InfoS("SubJob pipelined, return statement", "job", job.UID, "subJob", subJob.UID)
-		return stmt
-	}
+	return stmt, allocatedHyperNode, chosen, placedTasks
+}
 
-	stmt.Discard()
-	return nil
+func snapshotQueueTasks(q *util.PriorityQueue) []*api.TaskInfo {
+	raw := q.Items()
+	tasks := make([]*api.TaskInfo, 0, len(raw))
+	for _, it := range raw {
+		tasks = append(tasks, it.(*api.TaskInfo))
+	}
+	return tasks
+}
+
+func preserveSubJobFitErrorSummary(job *api.JobInfo, subJob *api.SubJobInfo) {
+	if job.JobFitErrors != "" {
+		return
+	}
+	if summary := subJobFitErrorSummary(job, subJob); summary != "" {
+		job.JobFitErrors = summary
+	}
+}
+
+func subJobFitErrorSummary(job *api.JobInfo, subJob *api.SubJobInfo) string {
+	for tid, fe := range job.NodesFitErrors {
+		if job.TaskToSubJob[tid] == subJob.UID && fe != nil {
+			return fe.Error()
+		}
+	}
+	return ""
+}
+
+func clearSubJobLastTxContexts(subJob *api.SubJobInfo) {
+	for _, task := range subJob.TaskStatusIndex[api.Pending] {
+		task.ClearLastTxContext()
+	}
 }
 
 func updateJobTier(hyperNodeTierNameMap api.HyperNodeTierNameMap, job *api.JobInfo) {

@@ -70,6 +70,13 @@ func (q *PriorityQueue) Len() int {
 	return q.queue.Len()
 }
 
+// Items returns an unordered snapshot of the elements currently in the queue.
+func (q *PriorityQueue) Items() []interface{} {
+	items := make([]interface{}, len(q.queue.items))
+	copy(items, q.queue.items)
+	return items
+}
+
 func (q *PriorityQueue) Clone() *PriorityQueue {
 	items := make([]interface{}, len(q.queue.items), cap(q.queue.items))
 	copy(items, q.queue.items)
